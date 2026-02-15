@@ -349,6 +349,9 @@ class TelegramChannel(BaseChannel):
         user_id_str = str(user.id)
         is_admin = user_id_str in self.config.admins or (user.username and user.username in self.config.admins)
         
+        # Check if chat is in allowed_chats (everyone in allowed chats can use bot)
+        chat_allowed = str_chat_id in self.config.allowed_chats or str(chat_id) in self.config.allowed_chats
+        
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
@@ -361,7 +364,8 @@ class TelegramChannel(BaseChannel):
                 "username": user.username,
                 "first_name": user.first_name,
                 "is_group": message.chat.type != "private",
-                "is_admin": is_admin
+                "is_admin": is_admin,
+                "chat_allowed": chat_allowed
             }
         )
     

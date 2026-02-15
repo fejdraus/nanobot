@@ -22,7 +22,8 @@ class TelegramConfig(BaseModel):
     """Telegram channel configuration."""
     enabled: bool = False
     token: str = ""  # Bot token from @BotFather
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames (for DMs)
+    allowed_chats: list[str] = Field(default_factory=list)  # Allowed group/chat IDs (everyone in these chats can use bot)
     admins: list[str] = Field(default_factory=list)  # Admin user IDs with full server access (read/write/exec)
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     mention: TelegramMentionConfig = Field(default_factory=TelegramMentionConfig)  # Mention requirements

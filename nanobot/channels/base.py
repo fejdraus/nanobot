@@ -107,7 +107,10 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
         """
-        if not self.is_allowed(sender_id):
+        # Check if chat is in allowed_chats (bypass user check)
+        chat_allowed = metadata.get("chat_allowed", False) if metadata else False
+        
+        if not chat_allowed and not self.is_allowed(sender_id):
             logger.warning(
                 f"Access denied for sender {sender_id} on channel {self.name}. "
                 f"Add them to allowFrom list in config to grant access."
