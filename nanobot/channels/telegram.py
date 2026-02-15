@@ -243,6 +243,9 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = message.chat_id
         
+        # DEBUG: Log every incoming message
+        logger.info(f"[RAW] Message received: chat_id={chat_id}, chat_type={message.chat.type}, user={user.id}, text={message.text[:30] if message.text else 'no text'}...")
+        
         # Check if mention is required in groups
         is_group = message.chat.type != "private"
         if is_group and self.config.mention.require_in_groups:
@@ -264,7 +267,7 @@ class TelegramChannel(BaseChannel):
                         break
             
             if not bot_mentioned:
-                logger.debug(f"Ignoring group message without mention from {user.id}")
+                logger.info(f"Ignoring group message without @{self._bot_username} mention from {user.id} in chat {chat_id}")
                 return
         
         # Use stable numeric ID, but keep username for allowlist compatibility
@@ -338,7 +341,7 @@ class TelegramChannel(BaseChannel):
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         
-        logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
+        logger.info(f"Telegram message from {sender_id} in chat {chat_id}: {content[:50]}...")
         
         str_chat_id = str(chat_id)
         
