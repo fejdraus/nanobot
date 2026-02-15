@@ -18,6 +18,44 @@
 
 📏 Real-time line count: **3,663 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
+## 🍴 Fork Features (fejdraus/nanobot)
+
+This fork adds several features for **group chat management** and **access control**:
+
+### 🔐 Access Control
+- **`admins`** — List of admin user IDs with full server access (read/write/exec tools)
+- **`allowedChats`** — List of chat IDs where everyone can use the bot (bypass allowFrom check)
+- Non-admins can still use brain, memory_search, web_search, but NOT filesystem/exec tools
+
+### 👥 Group Chat Features  
+- **`mention.requireInGroups`** — Bot only responds when @mentioned in groups (default: `true`)
+- Privacy-respecting: ignores messages without explicit mention
+
+### ✨ Other Improvements
+- Wildcard `"*"` support in `allowFrom`
+- Verbose logging for debugging group messages
+- GitHub Copilot provider support
+
+### Configuration Example
+```json
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "YOUR_BOT_TOKEN",
+      "allowFrom": ["123456789"],
+      "allowedChats": ["-1001234567890"],
+      "admins": ["123456789"],
+      "mention": {
+        "requireInGroups": true
+      }
+    }
+  }
+}
+```
+
+---
+
 ## 📢 News
 
 - **2026-02-14** 🔌 nanobot now supports MCP! See [MCP section](#mcp-model-context-protocol) for details.
