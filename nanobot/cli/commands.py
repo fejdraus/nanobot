@@ -874,5 +874,118 @@ def status():
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 
+# ============================================================================
+# Auth Commands
+# ============================================================================
+
+auth_app = typer.Typer(help="Manage authentication")
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("github-copilot")
+def auth_github_copilot(
+    reset: bool = typer.Option(False, "--reset", "-r", help="Force re-authentication"),
+):
+    """Authenticate with GitHub Copilot.
+    
+    Uses OAuth device flow — you'll get a code to enter at github.com/login/device
+    Token is proactively refreshed 5 minutes before expiry (like OpenClaw).
+    """
+    import os
+    import shutil
+    from nanobot.providers.github_copilot_token import get_token_manager
+    
+    mgr = get_token_manager()
+    
+    # Reset if requested
+    if reset:
+        if os.path.exists(mgr.token_dir):
+            shutil.rmtree(mgr.token_dir)
+            console.print("[yellow]Cleared existing tokens[/yellow]")
+        os.makedirs(mgr.token_dir, exist_ok=True)
+    
+    # Check existing token with 5-minute buffer
+    if mgr.is_token_usable():
+        from datetime import datetime
+        info = mgr.get_token_info()
+        exp = datetime.fromtimestamp(info.get("expires_at", 0))
+        console.print("[green]✓[/green] GitHub Copilot already authenticated")
+        console.print(f"  Token dir: {mgr.token_dir}")
+        console.print(f"  Expires: {exp}")
+        return
+    
+    # Check if token exists but expiring soon
+    needs_refresh, seconds_left = mgr.needs_refresh()
+    if needs_refresh and seconds_left > 0:
+        console.print(f"[yellow]Token expires in {seconds_left}s, refreshing...[/yellow]")
+        try:
+            mgr.refresh()
+            console.print("[green]✓[/green] Token refreshed")
+            return
+        except Exception as e:
+            console.print(f"[yellow]Refresh failed, need re-auth: {e}[/yellow]")
+    
+    console.print("[bold]GitHub Copilot Authentication[/bold]\n")
+    console.print("Starting OAuth device flow...\n")
+    
+    try:
+        from litellm.llms.github_copilot.authenticator import Authenticator
+        auth = Authenticator()
+        
+        # This will print the device code and URL
+        access_token = auth.get_access_token()
+        console.print("\n[green]✓[/green] Got access token")
+        
+        # Get API key
+        api_key = auth.get_api_key()
+        console.print("[green]✓[/green] Got API key")
+        console.print(f"\n[green]Authentication successful![/green]")
+        console.print(f"Token stored in: {mgr.token_dir}")
+        
+    except Exception as e:
+        console.print(f"[red]Authentication failed: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@auth_app.command("status")
+def auth_status():
+    """Show authentication status for all providers."""
+    import os
+    from datetime import datetime
+    from nanobot.providers.github_copilot_token import get_token_manager, REFRESH_THRESHOLD_SECONDS
+    
+    console.print("[bold]Authentication Status[/bold]\n")
+    
+    # GitHub Copilot
+    mgr = get_token_manager()
+    
+    if os.path.exists(mgr.api_key_file):
+        try:
+            info = mgr.get_token_info()
+            exp = datetime.fromtimestamp(info.get("expires_at", 0))
+            now = datetime.now()
+            seconds_left = (exp - now).total_seconds()
+            
+            if mgr.is_token_usable():
+                # Token valid with 5-minute buffer
+                hours_left = int(seconds_left // 3600)
+                mins_left = int((seconds_left % 3600) // 60)
+                console.print(f"GitHub Copilot: [green]✓ authenticated[/green]")
+                console.print(f"  Expires: {exp} ({hours_left}h {mins_left}m remaining)")
+                console.print(f"  Proactive refresh: {REFRESH_THRESHOLD_SECONDS}s before expiry")
+            elif seconds_left > 0:
+                console.print(f"GitHub Copilot: [yellow]⚠ expiring soon[/yellow]")
+                console.print(f"  Expires: {exp} ({int(seconds_left)}s remaining)")
+                console.print(f"  Will auto-refresh on next request")
+            else:
+                console.print(f"GitHub Copilot: [red]✗ token expired[/red]")
+                console.print(f"  Run: nanobot auth github-copilot --reset")
+        except Exception as e:
+            console.print(f"GitHub Copilot: [red]✗ error reading token: {e}[/red]")
+    else:
+        console.print(f"GitHub Copilot: [dim]not configured[/dim]")
+        console.print(f"  Run: nanobot auth github-copilot")
+
+
 if __name__ == "__main__":
     app()

@@ -154,6 +154,11 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
         
         try:
+            # Proactively refresh GitHub Copilot token if needed (like OpenClaw)
+            if "github_copilot" in model:
+                from nanobot.providers.github_copilot_token import ensure_copilot_token
+                ensure_copilot_token()
+            
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:

@@ -192,6 +192,7 @@ class ProvidersConfig(BaseModel):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # GitHub Copilot (no API key needed)
 
 
 class GatewayConfig(BaseModel):

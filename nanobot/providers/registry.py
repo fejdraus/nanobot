@@ -295,6 +295,27 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # === GitHub Copilot (uses litellm's built-in authenticator) =============
+    # Token stored in ~/.config/litellm/github_copilot/api-key.json
+    # No API key needed in config — litellm handles OAuth automatically.
+
+    ProviderSpec(
+        name="github_copilot",
+        keywords=("github_copilot", "copilot"),
+        env_key="GITHUB_COPILOT_API_KEY",  # Not actually used, litellm handles auth
+        display_name="GitHub Copilot",
+        litellm_prefix="github_copilot",    # gpt-4o → github_copilot/gpt-4o
+        skip_prefixes=("github_copilot/",),
+        env_extras=(),
+        is_gateway=True,                    # Can route to multiple models
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # === Auxiliary (not a primary LLM provider) ============================
 
     # Groq: mainly used for Whisper voice transcription, also usable for LLM.
