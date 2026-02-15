@@ -345,6 +345,10 @@ class TelegramChannel(BaseChannel):
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
         
+        # Check if user is admin
+        user_id_str = str(user.id)
+        is_admin = user_id_str in self.config.admins or (user.username and user.username in self.config.admins)
+        
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
@@ -356,7 +360,8 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "is_admin": is_admin
             }
         )
     

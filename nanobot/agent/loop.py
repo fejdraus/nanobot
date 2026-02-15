@@ -9,6 +9,12 @@ from typing import Any
 
 from loguru import logger
 
+# Tools restricted to admin users only (server access)
+ADMIN_ONLY_TOOLS = frozenset({
+    "read_file", "write_file", "edit_file", "list_dir",  # filesystem
+    "exec",  # shell commands
+})
+
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -88,6 +94,7 @@ class AgentLoop:
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
+        self._current_is_admin = True  # Default to admin for CLI/system messages
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -193,7 +200,14 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # Check admin permissions for restricted tools
+                    if tool_call.name in ADMIN_ONLY_TOOLS and not self._current_is_admin:
+                        result = f"⛔ Access denied: '{tool_call.name}' requires admin privileges. Contact an admin if you need server access."
+                        logger.warning(f"Non-admin user attempted to use restricted tool: {tool_call.name}")
+                    else:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -289,6 +303,9 @@ class AgentLoop:
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
+        # Set admin status from metadata (default True for backwards compatibility)
+        self._current_is_admin = msg.metadata.get("is_admin", True) if msg.metadata else True
+        
         self._set_tool_context(msg.channel, msg.chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
