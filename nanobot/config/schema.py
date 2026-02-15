@@ -15,7 +15,7 @@ class WhatsAppConfig(BaseModel):
 
 class TelegramMentionConfig(BaseModel):
     """Telegram mention behavior configuration."""
-    require_in_groups: bool = False  # If true, only respond when @mentioned in groups
+    require_in_groups: bool = True  # Only respond when @mentioned in groups (safer default)
 
 
 class TelegramConfig(BaseModel):
