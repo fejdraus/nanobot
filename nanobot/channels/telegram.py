@@ -106,6 +106,7 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._bot_username: str | None = None  # Bot's @username for mention detection
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -145,6 +146,7 @@ class TelegramChannel(BaseChannel):
         
         # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
+        self._bot_username = bot_info.username
         logger.info(f"Telegram bot @{bot_info.username} connected")
         
         try:
@@ -240,6 +242,30 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
+        
+        # Check if mention is required in groups
+        is_group = message.chat.type != "private"
+        if is_group and self.config.mention.require_in_groups:
+            # Check if bot is mentioned
+            text = message.text or message.caption or ""
+            bot_mentioned = False
+            
+            # Check @username mention
+            if self._bot_username and f"@{self._bot_username}" in text:
+                bot_mentioned = True
+            
+            # Check entities for mention
+            entities = message.entities or message.caption_entities or []
+            for entity in entities:
+                if entity.type == "mention" and self._bot_username:
+                    mention_text = text[entity.offset:entity.offset + entity.length]
+                    if mention_text.lower() == f"@{self._bot_username.lower()}":
+                        bot_mentioned = True
+                        break
+            
+            if not bot_mentioned:
+                logger.debug(f"Ignoring group message without mention from {user.id}")
+                return
         
         # Use stable numeric ID, but keep username for allowlist compatibility
         sender_id = str(user.id)

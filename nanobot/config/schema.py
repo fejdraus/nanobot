@@ -13,12 +13,18 @@ class WhatsAppConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
+class TelegramMentionConfig(BaseModel):
+    """Telegram mention behavior configuration."""
+    require_in_groups: bool = False  # If true, only respond when @mentioned in groups
+
+
 class TelegramConfig(BaseModel):
     """Telegram channel configuration."""
     enabled: bool = False
     token: str = ""  # Bot token from @BotFather
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+    mention: TelegramMentionConfig = Field(default_factory=TelegramMentionConfig)  # Mention requirements
 
 
 class FeishuConfig(BaseModel):
