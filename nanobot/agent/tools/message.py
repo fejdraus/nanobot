@@ -1,5 +1,6 @@
 """Message tool for sending messages to users."""
 
+import json
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
@@ -49,25 +50,19 @@ class MessageTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "The message content to send"
-                },
+                "content": {"type": "string", "description": "The message content to send"},
                 "channel": {
                     "type": "string",
-                    "description": "Optional: target channel (telegram, discord, etc.)"
+                    "description": "Optional: target channel (telegram, discord, etc.)",
                 },
-                "chat_id": {
-                    "type": "string",
-                    "description": "Optional: target chat/user ID"
-                },
+                "chat_id": {"type": "string", "description": "Optional: target chat/user ID"},
                 "media": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional: list of file paths to attach (images, audio, documents)"
-                }
+                    "description": "Optional: list of file paths to attach (images, audio, documents)",
+                },
             },
-            "required": ["content"]
+            "required": ["content"],
         }
 
     async def execute(
@@ -76,12 +71,20 @@ class MessageTool(Tool):
         channel: str | None = None,
         chat_id: str | None = None,
         message_id: str | None = None,
-        media: list[str] | None = None,
-        **kwargs: Any
+        media: list[str] | str | None = None,
+        **kwargs: Any,
     ) -> str:
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
         message_id = message_id or self._default_message_id
+
+        # Handle media as string (model sometimes sends JSON string instead of array)
+        if isinstance(media, str):
+            try:
+                media = json.loads(media)
+            except json.JSONDecodeError:
+                # Single file path as string
+                media = [media] if media else []
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -89,14 +92,17 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        # Ensure media is a list
+        media_list: list[str] = media if isinstance(media, list) else []
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            media=media or [],
+            media=media_list,
             metadata={
                 "message_id": message_id,
-            }
+            },
         )
 
         try:
@@ -105,7 +111,7 @@ class MessageTool(Tool):
                 return "OK"
             await self._send_callback(msg)
             self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
+            media_info = f" with {len(media_list)} attachments" if media_list else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
