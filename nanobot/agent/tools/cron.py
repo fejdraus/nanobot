@@ -42,9 +42,13 @@ class CronTool(Tool):
                     "type": "string",
                     "description": "Reminder message (for add)"
                 },
+                "delay_seconds": {
+                    "type": "integer",
+                    "description": "One-time timer: fire once after N seconds (e.g. 300 for 5 min). Use for 'remind me in X minutes'"
+                },
                 "every_seconds": {
                     "type": "integer",
-                    "description": "Interval in seconds (for recurring tasks)"
+                    "description": "Recurring: repeat every N seconds. Use ONLY for 'remind me every X hours'"
                 },
                 "cron_expr": {
                     "type": "string",
@@ -70,6 +74,7 @@ class CronTool(Tool):
         self,
         action: str,
         message: str = "",
+        delay_seconds: int | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -78,7 +83,7 @@ class CronTool(Tool):
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(message, delay_seconds, every_seconds, cron_expr, tz, at)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -88,6 +93,7 @@ class CronTool(Tool):
     def _add_job(
         self,
         message: str,
+        delay_seconds: int | None,
         every_seconds: int | None,
         cron_expr: str | None,
         tz: str | None,
@@ -108,7 +114,12 @@ class CronTool(Tool):
         
         # Build schedule
         delete_after = False
-        if every_seconds:
+        if delay_seconds:
+            import time
+            at_ms = int((time.time() + delay_seconds) * 1000)
+            schedule = CronSchedule(kind="at", at_ms=at_ms)
+            delete_after = True
+        elif every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
@@ -119,12 +130,15 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either every_seconds, cron_expr, or at is required"
+            return "Error: either delay_seconds, every_seconds, cron_expr, or at is required"
+        
+        # Instruct LLM to send notification, not process as new request
+        notification_message = f"Отправь пользователю сообщение: «{message}» (это напоминание, НЕ создавай новый таймер)"
         
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
-            message=message,
+            message=notification_message,
             deliver=True,
             channel=self._channel,
             to=self._chat_id,

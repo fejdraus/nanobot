@@ -100,6 +100,9 @@ class MessageTool(Tool):
         )
 
         try:
+            # Prevent infinite message loops
+            if self._sent_in_turn:
+                return "OK"
             await self._send_callback(msg)
             self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
