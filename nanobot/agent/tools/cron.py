@@ -130,7 +130,9 @@ class CronTool(Tool):
             return "Error: either delay_seconds, every_seconds, cron_expr, or at is required"
 
         # Instruct LLM to send notification, not process as new request
-        notification_message = f"Отправь пользователю сообщение: «{message}» (это напоминание, НЕ создавай новый таймер)"
+        notification_message = (
+            f"[НАПОМИНАНИЕ СРАБОТАЛО] Время пришло! Напомни пользователю: {message}"
+        )
 
         job = self._cron.add_job(
             name=message[:30],
