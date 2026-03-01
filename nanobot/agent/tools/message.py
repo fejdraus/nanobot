@@ -110,7 +110,9 @@ class MessageTool(Tool):
             if self._sent_in_turn:
                 return "OK"
             await self._send_callback(msg)
-            self._sent_in_turn = True
+            # Only suppress loop response for same-channel sends (upstream logic)
+            if channel == self._default_channel and chat_id == self._default_chat_id:
+                self._sent_in_turn = True
             media_info = f" with {len(media_list)} attachments" if media_list else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
