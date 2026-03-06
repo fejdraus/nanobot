@@ -26,20 +26,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query"
-                    },
+                    "query": {"type": "string", "description": "Search query"},
                     "count": {
-                        "type": "integer",
-                        "description": "Number of results (1-10)",
-                        "minimum": 1,
-                        "maximum": 10,
-                        "default": 5
-                    }
+                        "type": ["integer", "string"],
+                        "description": "Number of results (1-10), default 5",
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+            },
         )
     ]
 
@@ -49,27 +43,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute a tool."""
     if name != "web_search":
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
-    
+
     query = arguments.get("query", "")
-    count = min(max(arguments.get("count", 5), 1), 10)
-    
+
+    # Handle count as string or integer
+    count_raw = arguments.get("count", 5)
+    try:
+        count = min(max(int(count_raw), 1), 10)
+    except (ValueError, TypeError):
+        count = 5
+
     if not query:
         return [TextContent(type="text", text="Error: query is required")]
-    
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                SEARXNG_URL,
-                params={"q": query, "format": "json"}
-            )
+            response = await client.get(SEARXNG_URL, params={"q": query, "format": "json"})
             response.raise_for_status()
             data = response.json()
-        
+
         results = data.get("results", [])[:count]
-        
+
         if not results:
             return [TextContent(type="text", text=f"No results for: {query}")]
-        
+
         lines = [f"Results for: {query}\n"]
         for i, item in enumerate(results, 1):
             title = item.get("title", "No title")
@@ -80,9 +77,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             if snippet:
                 lines.append(f"   {snippet[:200]}")
             lines.append("")
-        
+
         return [TextContent(type="text", text="\n".join(lines))]
-    
+
     except httpx.HTTPError as e:
         return [TextContent(type="text", text=f"HTTP error: {e}")]
     except Exception as e:
@@ -97,4 +94,5 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())
