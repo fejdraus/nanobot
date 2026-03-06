@@ -64,7 +64,7 @@ class Tool(ABC):
         # Allow string for array type (model sometimes sends JSON string)
         if t == "array" and isinstance(val, str):
             return []  # Will be parsed in execute()
-        if t in self._TYPE_MAP and not isinstance(val, self._TYPE_MAP[t]):
+        if isinstance(t, str) and t in self._TYPE_MAP and not isinstance(val, self._TYPE_MAP[t]):
             return [f"{label} should be {t}"]
 
         errors = []
