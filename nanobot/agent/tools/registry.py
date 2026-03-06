@@ -25,6 +25,9 @@ class ToolRegistry:
 
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
+        # Handle common model hallucination: proxy_ prefix
+        if name.startswith("proxy_") and name not in self._tools:
+            name = name[6:]  # Remove "proxy_" prefix
         return self._tools.get(name)
 
     def has(self, name: str) -> bool:
