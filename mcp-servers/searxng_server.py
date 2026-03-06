@@ -28,7 +28,6 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
                     "count": {
-                        "type": ["integer", "string"],
                         "description": "Number of results (1-10), default 5",
                     },
                 },
