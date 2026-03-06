@@ -42,7 +42,7 @@ class ToolRegistry:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
-        tool = self._tools.get(name)
+        tool = self.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
 
