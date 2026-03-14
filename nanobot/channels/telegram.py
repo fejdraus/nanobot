@@ -392,14 +392,10 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
-            is_progress = msg.metadata.get("_progress", False)
-
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                # Final response: simulate streaming via draft, then persist
-                if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
-                else:
-                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                # Streaming disabled: send_message_draft causes duplicate messages
+                # when used with some bot configurations
+                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
     async def _send_text(
         self,
