@@ -1,6 +1,7 @@
 """Configuration loading utilities."""
 
 import json
+import os
 from pathlib import Path
 
 from nanobot.config.schema import Config
@@ -17,9 +18,21 @@ def set_config_path(path: Path) -> None:
 
 
 def get_config_path() -> Path:
-    """Get the configuration file path."""
+    """Get the configuration file path.
+
+    Priority:
+    1. Explicitly set path via set_config_path()
+    2. NANOBOT_HOME environment variable
+    3. Default ~/.nanobot/config.json
+    """
     if _current_config_path:
         return _current_config_path
+
+    # Support NANOBOT_HOME for multi-instance deployments
+    nanobot_home = os.environ.get("NANOBOT_HOME")
+    if nanobot_home:
+        return Path(nanobot_home).expanduser() / "config.json"
+
     return Path.home() / ".nanobot" / "config.json"
 
 
