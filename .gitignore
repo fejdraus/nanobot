@@ -1,13 +1,13 @@
 .worktrees/
 .assets
+.docs
 .env
 *.pyc
 dist/
 build/
-docs/
 *.egg-info/
 *.egg
-*.pyc
+*.pycs
 *.pyo
 *.pyd
 *.pyw
@@ -22,3 +22,4 @@ poetry.lock
 botpy.log
 /.claude
 nul
+nano.*.save

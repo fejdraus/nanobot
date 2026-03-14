@@ -1,6 +1,9 @@
 """Base channel interface for chat platforms."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -18,6 +21,8 @@ class BaseChannel(ABC):
     """
 
     name: str = "base"
+    display_name: str = "Base"
+    transcription_api_key: str = ""
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -30,6 +35,19 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+
+    async def transcribe_audio(self, file_path: str | Path) -> str:
+        """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
+        if not self.transcription_api_key:
+            return ""
+        try:
+            from nanobot.providers.transcription import GroqTranscriptionProvider
+
+            provider = GroqTranscriptionProvider(api_key=self.transcription_api_key)
+            return await provider.transcribe(file_path)
+        except Exception as e:
+            logger.warning("{}: audio transcription failed: {}", self.name, e)
+            return ""
 
     @abstractmethod
     async def start(self) -> None:
@@ -66,8 +84,7 @@ class BaseChannel(ABC):
             return False
         if "*" in allow_list:
             return True
-        sender_str = str(sender_id)
-        return sender_str in allow_list or any(p in allow_list for p in sender_str.split("|") if p)
+        return str(sender_id) in allow_list
 
     async def _handle_message(
         self,
@@ -91,15 +108,11 @@ class BaseChannel(ABC):
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
-        # Check if chat is in allowed_chats (bypass user check)
-        chat_allowed = metadata.get("chat_allowed", False) if metadata else False
-
-        if not chat_allowed and not self.is_allowed(sender_id):
+        if not self.is_allowed(sender_id):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id,
-                self.name,
+                sender_id, self.name,
             )
             return
 
@@ -114,6 +127,11 @@ class BaseChannel(ABC):
         )
 
         await self.bus.publish_inbound(msg)
+
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        """Return default config for onboard. Override in plugins to auto-populate config.json."""
+        return {"enabled": False}
 
     @property
     def is_running(self) -> bool:
