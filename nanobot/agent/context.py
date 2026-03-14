@@ -151,7 +151,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if not media:
             return text
 
-        logger.debug("Building user content with {} media files: {}", len(media), media)
         images = []
         for path in media:
             p = Path(path)
@@ -162,33 +161,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             # Detect real MIME type from magic bytes; fallback to filename guess
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
-                logger.warning("Skipping non-image media: {} (mime={})", path, mime)
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append(
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64[:50]}..."}}
-            )
-            logger.info("Added image to LLM request: {} ({}, {} bytes)", path, mime, len(raw))
+            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            logger.debug("Image attached to LLM request: {} ({}, {} bytes)", path, mime, len(raw))
 
         if not images:
-            logger.debug("No valid images found in media")
             return text
-        logger.info("Sending {} images to LLM", len(images))
-        # Return actual base64, not truncated version
-        images_full = []
-        for path in media:
-            p = Path(path)
-            if not p.is_file():
-                continue
-            raw = p.read_bytes()
-            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
-                continue
-            b64 = base64.b64encode(raw).decode()
-            images_full.append(
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-            )
-        return images_full + [{"type": "text", "text": text}]
+        return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
         self,
