@@ -146,46 +146,78 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
+        from loguru import logger
+
         if not media:
             return text
 
+        logger.debug("Building user content with {} media files: {}", len(media), media)
         images = []
         for path in media:
             p = Path(path)
             if not p.is_file():
+                logger.warning("Media file not found: {}", path)
                 continue
             raw = p.read_bytes()
             # Detect real MIME type from magic bytes; fallback to filename guess
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
+                logger.warning("Skipping non-image media: {} (mime={})", path, mime)
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            images.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64[:50]}..."}}
+            )
+            logger.info("Added image to LLM request: {} ({}, {} bytes)", path, mime, len(raw))
 
         if not images:
+            logger.debug("No valid images found in media")
             return text
-        return images + [{"type": "text", "text": text}]
+        logger.info("Sending {} images to LLM", len(images))
+        # Return actual base64, not truncated version
+        images_full = []
+        for path in media:
+            p = Path(path)
+            if not p.is_file():
+                continue
+            raw = p.read_bytes()
+            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
+            if not mime or not mime.startswith("image/"):
+                continue
+            b64 = base64.b64encode(raw).decode()
+            images_full.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+            )
+        return images_full + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: str,
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: str,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        )
         return messages
 
     def add_assistant_message(
-        self, messages: list[dict[str, Any]],
+        self,
+        messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
+        messages.append(
+            build_assistant_message(
+                content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                thinking_blocks=thinking_blocks,
+            )
+        )
         return messages
