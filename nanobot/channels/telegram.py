@@ -11,6 +11,7 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReplyParameters, Update
+from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -19,6 +20,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
@@ -154,6 +156,10 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+_SEND_MAX_RETRIES = 3
+_SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
+
+
 class TelegramConfig(Base):
     """Telegram channel configuration."""
 
@@ -165,6 +171,8 @@ class TelegramConfig(Base):
     proxy: str | None = None
     reply_to_message: bool = False
     group_policy: Literal["open", "mention"] = "mention"
+    connection_pool_size: int = 32
+    pool_timeout: float = 5.0
 
 
 class TelegramChannel(BaseChannel):
@@ -231,16 +239,28 @@ class TelegramChannel(BaseChannel):
 
         self._running = True
 
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(
-            connection_pool_size=16,
-            pool_timeout=5.0,
+        proxy = self.config.proxy or None
+
+        # Separate pools so long-polling (getUpdates) never starves outbound sends.
+        api_request = HTTPXRequest(
+            connection_pool_size=self.config.connection_pool_size,
+            pool_timeout=self.config.pool_timeout,
             connect_timeout=30.0,
             read_timeout=30.0,
-            proxy=self.config.proxy if self.config.proxy else None,
+            proxy=proxy,
+        )
+        poll_request = HTTPXRequest(
+            connection_pool_size=4,
+            pool_timeout=self.config.pool_timeout,
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            proxy=proxy,
         )
         builder = (
-            Application.builder().token(self.config.token).request(req).get_updates_request(req)
+            Application.builder()
+            .token(self.config.token)
+            .request(api_request)
+            .get_updates_request(poll_request)
         )
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
@@ -327,6 +347,10 @@ class TelegramChannel(BaseChannel):
             return "audio"
         return "document"
 
+    @staticmethod
+    def _is_remote_media_url(path: str) -> bool:
+        return path.startswith(("http://", "https://"))
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         if not self._app:
@@ -366,13 +390,23 @@ class TelegramChannel(BaseChannel):
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
-                param = (
-                    "photo"
-                    if media_type == "photo"
-                    else media_type
-                    if media_type in ("voice", "audio")
-                    else "document"
-                )
+                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+
+                # Telegram Bot API accepts HTTP(S) URLs directly for media params.
+                if self._is_remote_media_url(media_path):
+                    ok, error = validate_url_target(media_path)
+                    if not ok:
+                        raise ValueError(f"unsafe media URL: {error}")
+                    await self._call_with_retry(
+                        sender,
+                        chat_id=chat_id,
+                        **{param: media_path},
+                        reply_parameters=reply_params,
+                        **thread_kwargs,
+                    )
+                    continue
+
+
                 with open(media_path, "rb") as f:
                     await sender(
                         chat_id=chat_id,
@@ -397,6 +431,21 @@ class TelegramChannel(BaseChannel):
                 # when used with some bot configurations
                 await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
+    async def _call_with_retry(self, fn, *args, **kwargs):
+        """Call an async Telegram API function with retry on pool/network timeout."""
+        for attempt in range(1, _SEND_MAX_RETRIES + 1):
+            try:
+                return await fn(*args, **kwargs)
+            except TimedOut:
+                if attempt == _SEND_MAX_RETRIES:
+                    raise
+                delay = _SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "Telegram timeout (attempt {}/{}), retrying in {:.1f}s",
+                    attempt, _SEND_MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+
     async def _send_text(
         self,
         chat_id: int,
@@ -407,17 +456,17 @@ class TelegramChannel(BaseChannel):
         """Send a plain text message with HTML fallback."""
         try:
             html = _markdown_to_telegram_html(text)
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html,
-                parse_mode="HTML",
+            await self._call_with_retry(
+                self._app.bot.send_message,
+                chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
             )
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._app.bot.send_message(
+                await self._call_with_retry(
+                    self._app.bot.send_message,
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,

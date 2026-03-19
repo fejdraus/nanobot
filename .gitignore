@@ -23,3 +23,5 @@ botpy.log
 /.claude
 nul
 nano.*.save
+.DS_Store
+uv.lock
