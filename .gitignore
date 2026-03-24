@@ -25,3 +25,4 @@ nul
 nano.*.save
 .DS_Store
 uv.lock
+AGENTS.md
