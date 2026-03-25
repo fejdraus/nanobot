@@ -183,7 +183,7 @@ class TelegramConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
-    streaming: bool = True
+    streaming: bool = False
 
 
 class TelegramChannel(BaseChannel):
