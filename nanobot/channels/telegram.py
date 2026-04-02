@@ -790,6 +790,12 @@ class TelegramChannel(BaseChannel):
         if message.caption:
             content_parts.append(message.caption)
 
+        # Location
+        if message.location:
+            content_parts.append(
+                f"[location: lat={message.location.latitude}, lon={message.location.longitude}]"
+            )
+
         # Download current message media
         current_media_paths, current_media_parts = await self._download_message_media(
             message, add_failure_content=True
