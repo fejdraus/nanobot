@@ -297,6 +297,7 @@ class TelegramChannel(BaseChannel):
                     | filters.VOICE
                     | filters.AUDIO
                     | filters.Document.ALL
+                    | filters.LOCATION
                 )
                 & ~filters.COMMAND,
                 self._on_message,
