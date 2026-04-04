@@ -381,7 +381,9 @@ class TelegramChannel(BaseChannel):
     def _get_media_type(path: str) -> str:
         """Guess media type from file extension."""
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if ext in ("jpg", "jpeg", "png", "gif", "webp"):
+        if ext == "gif":
+            return "animation"
+        if ext in ("jpg", "jpeg", "png", "webp"):
             return "photo"
         if ext == "ogg":
             return "voice"
@@ -434,10 +436,11 @@ class TelegramChannel(BaseChannel):
                 media_type = self._get_media_type(media_path)
                 sender = {
                     "photo": self._app.bot.send_photo,
+                    "animation": self._app.bot.send_animation,
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                param = media_type if media_type in ("photo", "animation", "voice", "audio") else "document"
 
                 # Telegram Bot API accepts HTTP(S) URLs directly for media params.
                 if self._is_remote_media_url(media_path):
