@@ -12,13 +12,14 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
-from telegram.error import TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
@@ -167,6 +168,7 @@ class _StreamBuf:
     text: str = ""
     message_id: int | None = None
     last_edit: float = 0.0
+    stream_id: str | None = None
 
 
 class TelegramConfig(Base):
@@ -201,9 +203,12 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
-        BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("dream", "Run Dream memory consolidation now"),
+        BotCommand("dream_log", "Show the latest Dream memory change"),
+        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("help", "Show available commands"),
     ]
 
     @classmethod
@@ -246,6 +251,17 @@ class TelegramChannel(BaseChannel):
 
         return sid in allow_list or username in allow_list
 
+    @staticmethod
+    def _normalize_telegram_command(content: str) -> str:
+        """Map Telegram-safe command aliases back to canonical nanobot commands."""
+        if not content.startswith("/"):
+            return content
+        if content == "/dream_log" or content.startswith("/dream_log "):
+            return content.replace("/dream_log", "/dream-log", 1)
+        if content == "/dream_restore" or content.startswith("/dream_restore "):
+            return content.replace("/dream_restore", "/dream-restore", 1)
+        return content
+
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
@@ -280,13 +296,21 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("stop", self._forward_command))
-        self._app.add_handler(CommandHandler("restart", self._forward_command))
-        self._app.add_handler(CommandHandler("status", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
+        # Add command handlers (using Regex to support @username suffixes before bot initialization)
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                self._forward_command,
+            )
+        )
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
+                self._forward_command,
+            )
+        )
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -325,7 +349,8 @@ class TelegramChannel(BaseChannel):
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True,  # Ignore old messages on startup
+            drop_pending_updates=False,  # Process pending messages on startup
+            error_callback=self._on_polling_error,
         )
 
         # Keep running until stopped
@@ -374,9 +399,14 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
-        # Only stop typing indicator for final responses
+        # Only stop typing indicator and remove reaction for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
+            if reply_to_message_id := msg.metadata.get("message_id"):
+                try:
+                    await self._remove_reaction(msg.chat_id, int(reply_to_message_id))
+                except ValueError:
+                    pass
 
         try:
             chat_id = int(msg.chat_id)
@@ -447,7 +477,9 @@ class TelegramChannel(BaseChannel):
                 await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
     async def _call_with_retry(self, fn, *args, **kwargs):
-        """Call an async Telegram API function with retry on pool/network timeout."""
+        """Call an async Telegram API function with retry on pool/network timeout and RetryAfter."""
+        from telegram.error import RetryAfter
+        
         for attempt in range(1, _SEND_MAX_RETRIES + 1):
             try:
                 return await fn(*args, **kwargs)
@@ -457,6 +489,15 @@ class TelegramChannel(BaseChannel):
                 delay = _SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(
                     "Telegram timeout (attempt {}/{}), retrying in {:.1f}s",
+                    attempt, _SEND_MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+            except RetryAfter as e:
+                if attempt == _SEND_MAX_RETRIES:
+                    raise
+                delay = float(e.retry_after)
+                logger.warning(
+                    "Telegram Flood Control (attempt {}/{}), retrying in {:.1f}s",
                     attempt, _SEND_MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
@@ -489,6 +530,11 @@ class TelegramChannel(BaseChannel):
                 )
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
+                raise
+
+    @staticmethod
+    def _is_not_modified_error(exc: Exception) -> bool:
+        return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
 
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive message editing: send on first delta, edit on subsequent ones."""
@@ -496,12 +542,20 @@ class TelegramChannel(BaseChannel):
             return
         meta = metadata or {}
         int_chat_id = int(chat_id)
+        stream_id = meta.get("_stream_id")
 
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.pop(chat_id, None)
+            buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.message_id or not buf.text:
                 return
+            if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
+                return
             self._stop_typing(chat_id)
+            if reply_to_message_id := meta.get("message_id"):
+                try:
+                    await self._remove_reaction(chat_id, int(reply_to_message_id))
+                except ValueError:
+                    pass
             try:
                 html = _markdown_to_telegram_html(buf.text)
                 await self._call_with_retry(
@@ -510,6 +564,10 @@ class TelegramChannel(BaseChannel):
                     text=html, parse_mode="HTML",
                 )
             except Exception as e:
+                if self._is_not_modified_error(e):
+                    logger.debug("Final stream edit already applied for {}", chat_id)
+                    self._stream_bufs.pop(chat_id, None)
+                    return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
                     await self._call_with_retry(
@@ -517,14 +575,22 @@ class TelegramChannel(BaseChannel):
                         chat_id=int_chat_id, message_id=buf.message_id,
                         text=buf.text,
                     )
-                except Exception:
-                    pass
+                except Exception as e2:
+                    if self._is_not_modified_error(e2):
+                        logger.debug("Final stream plain edit already applied for {}", chat_id)
+                        self._stream_bufs.pop(chat_id, None)
+                        return
+                    logger.warning("Final stream edit failed: {}", e2)
+                    raise  # Let ChannelManager handle retry
+            self._stream_bufs.pop(chat_id, None)
             return
 
         buf = self._stream_bufs.get(chat_id)
-        if buf is None:
-            buf = _StreamBuf()
+        if buf is None or (stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id):
+            buf = _StreamBuf(stream_id=stream_id)
             self._stream_bufs[chat_id] = buf
+        elif buf.stream_id is None:
+            buf.stream_id = stream_id
         buf.text += delta
 
         if not buf.text.strip():
@@ -541,6 +607,7 @@ class TelegramChannel(BaseChannel):
                 buf.last_edit = now
             except Exception as e:
                 logger.warning("Stream initial send failed: {}", e)
+                raise  # Let ChannelManager handle retry
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
             try:
                 await self._call_with_retry(
@@ -549,8 +616,12 @@ class TelegramChannel(BaseChannel):
                     text=buf.text,
                 )
                 buf.last_edit = now
-            except Exception:
-                pass
+            except Exception as e:
+                if self._is_not_modified_error(e):
+                    buf.last_edit = now
+                    return
+                logger.warning("Stream edit failed: {}", e)
+                raise  # Let ChannelManager handle retry
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -568,14 +639,7 @@ class TelegramChannel(BaseChannel):
         """Handle /help command, bypassing ACL so all users can access it."""
         if not update.message:
             return
-        await update.message.reply_text(
-            "🐈 nanobot commands:\n"
-            "/new — Start a new conversation\n"
-            "/stop — Stop the current task\n"
-            "/restart — Restart the bot\n"
-            "/status — Show bot status\n"
-            "/help — Show available commands"
-        )
+        await update.message.reply_text(build_help_text())
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -610,8 +674,7 @@ class TelegramChannel(BaseChannel):
             "chat_allowed": chat_allowed,
         }
 
-    @staticmethod
-    def _extract_reply_context(message) -> str | None:
+    async def _extract_reply_context(self, message) -> str | None:
         """Extract text from the message being replied to, if any."""
         reply = getattr(message, "reply_to_message", None)
         if not reply:
@@ -619,7 +682,21 @@ class TelegramChannel(BaseChannel):
         text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
         if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
             text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
-        return f"[Reply to: {text}]" if text else None
+            
+        if not text:
+            return None
+            
+        bot_id, _ = await self._ensure_bot_identity()
+        reply_user = getattr(reply, "from_user", None)
+        
+        if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
+            return f"[Reply to bot: {text}]"
+        elif reply_user and getattr(reply_user, "username", None):
+            return f"[Reply to @{reply_user.username}: {text}]"
+        elif reply_user and getattr(reply_user, "first_name", None):
+            return f"[Reply to {reply_user.first_name}: {text}]"
+        else:
+            return f"[Reply to: {text}]"
 
     async def _download_message_media(
         self, msg, *, add_failure_content: bool = False
@@ -756,10 +833,19 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         self._remember_thread_context(message)
+        
+        # Strip @bot_username suffix if present
+        content = message.text or ""
+        if content.startswith("/") and "@" in content:
+            cmd_part, *rest = content.split(" ", 1)
+            cmd_part = cmd_part.split("@")[0]
+            content = f"{cmd_part} {rest[0]}" if rest else cmd_part
+        content = self._normalize_telegram_command(content)
+            
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
-            content=message.text or "",
+            content=content,
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )
@@ -809,7 +895,7 @@ class TelegramChannel(BaseChannel):
         # Reply context: text and/or media from the replied-to message
         reply = getattr(message, "reply_to_message", None)
         if reply is not None:
-            reply_ctx = self._extract_reply_context(message)
+            reply_ctx = await self._extract_reply_context(message)
             reply_media, reply_media_parts = await self._download_message_media(reply)
             if reply_media:
                 media_paths = reply_media + media_paths
@@ -920,6 +1006,19 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug("Telegram reaction failed: {}", e)
 
+    async def _remove_reaction(self, chat_id: str, message_id: int) -> None:
+        """Remove emoji reaction from a message (best-effort, non-blocking)."""
+        if not self._app:
+            return
+        try:
+            await self._app.bot.set_message_reaction(
+                chat_id=int(chat_id),
+                message_id=message_id,
+                reaction=[],
+            )
+        except Exception as e:
+            logger.debug("Telegram reaction removal failed: {}", e)
+
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
         try:
@@ -931,9 +1030,36 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
 
+    @staticmethod
+    def _format_telegram_error(exc: Exception) -> str:
+        """Return a short, readable error summary for logs."""
+        text = str(exc).strip()
+        if text:
+            return text
+        if exc.__cause__ is not None:
+            cause = exc.__cause__
+            cause_text = str(cause).strip()
+            if cause_text:
+                return f"{exc.__class__.__name__} ({cause_text})"
+            return f"{exc.__class__.__name__} ({cause.__class__.__name__})"
+        return exc.__class__.__name__
+
+    def _on_polling_error(self, exc: Exception) -> None:
+        """Keep long-polling network failures to a single readable line."""
+        summary = self._format_telegram_error(exc)
+        if isinstance(exc, (NetworkError, TimedOut)):
+            logger.warning("Telegram polling network issue: {}", summary)
+        else:
+            logger.error("Telegram polling error: {}", summary)
+
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
-        logger.error("Telegram error: {}", context.error)
+        summary = self._format_telegram_error(context.error)
+
+        if isinstance(context.error, (NetworkError, TimedOut)):
+            logger.warning("Telegram network issue: {}", summary)
+        else:
+            logger.error("Telegram error: {}", summary)
 
     def _get_extension(
         self,

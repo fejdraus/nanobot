@@ -79,9 +79,20 @@ class MessageTool(Tool):
         media: list[str] | str | None = None,
         **kwargs: Any,
     ) -> str:
+        from nanobot.utils.helpers import strip_think
+        content = strip_think(content)
+        
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+        # Only inherit default message_id when targeting the same channel+chat.
+        # Cross-chat sends must not carry the original message_id, because
+        # some channels (e.g. Feishu) use it to determine the target
+        # conversation via their Reply API, which would route the message
+        # to the wrong chat entirely.
+        if channel == self._default_channel and chat_id == self._default_chat_id:
+            message_id = message_id or self._default_message_id
+        else:
+            message_id = None
 
         # Handle media as string (model sometimes sends JSON string instead of array)
         if isinstance(media, str):
@@ -107,7 +118,7 @@ class MessageTool(Tool):
             media=media_list,
             metadata={
                 "message_id": message_id,
-            },
+            } if message_id else {},
         )
 
         try:
