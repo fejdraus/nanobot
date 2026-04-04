@@ -240,7 +240,6 @@ def maybe_persist_tool_result(
         preview=preview,
         truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
     )
->>>>>>> upstream/main
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
