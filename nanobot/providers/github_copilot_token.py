@@ -4,9 +4,7 @@ Refreshes token 5 minutes before expiry, not after.
 """
 
 import json
-import os
 from datetime import datetime
-from pathlib import Path
 
 from litellm.llms.github_copilot.authenticator import Authenticator
 
