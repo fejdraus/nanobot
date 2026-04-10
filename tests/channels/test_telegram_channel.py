@@ -65,6 +65,9 @@ class _FakeBot:
     async def send_audio(self, **kwargs) -> None:
         self.sent_media.append({"kind": "audio", **kwargs})
 
+    async def send_animation(self, **kwargs) -> None:
+        self.sent_media.append({"kind": "animation", **kwargs})
+
     async def send_document(self, **kwargs) -> None:
         self.sent_media.append({"kind": "document", **kwargs})
 
