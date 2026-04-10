@@ -21,7 +21,8 @@ from nanobot.cron.types import CronJob, CronJobState, CronSchedule
             "Instruction for the agent to execute when the job triggers "
             "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report')"
         ),
-        every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
+        delay_seconds=IntegerSchema(0, description="One-time timer: fire once after N seconds (e.g. 300 for 5 min). Use for 'remind me in X minutes'"),
+        every_seconds=IntegerSchema(0, description="Recurring: repeat every N seconds. Use ONLY for 'remind me every X hours'"),
         cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
         tz=StringSchema(
             "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
@@ -99,6 +100,7 @@ class CronTool(Tool):
         action: str,
         name: str | None = None,
         message: str = "",
+        delay_seconds: int | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -110,7 +112,7 @@ class CronTool(Tool):
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(name, message, delay_seconds, every_seconds, cron_expr, tz, at, deliver)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -121,6 +123,7 @@ class CronTool(Tool):
         self,
         name: str | None,
         message: str,
+        delay_seconds: int | None,
         every_seconds: int | None,
         cron_expr: str | None,
         tz: str | None,
@@ -139,7 +142,12 @@ class CronTool(Tool):
 
         # Build schedule
         delete_after = False
-        if every_seconds:
+        if delay_seconds:
+            import time
+            at_ms = int((time.time() + delay_seconds) * 1000)
+            schedule = CronSchedule(kind="at", at_ms=at_ms)
+            delete_after = True
+        elif every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
             effective_tz = tz or self._default_timezone
@@ -162,7 +170,7 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either every_seconds, cron_expr, or at is required"
+            return "Error: either delay_seconds, every_seconds, cron_expr, or at is required"
 
         job = self._cron.add_job(
             name=name or message[:30],
