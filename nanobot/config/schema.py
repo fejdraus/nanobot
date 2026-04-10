@@ -28,6 +28,7 @@ class ChannelsConfig(Base):
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
+    transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
 
 
 class DreamConfig(Base):
@@ -73,8 +74,9 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 200
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
-    reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
+    reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
@@ -121,6 +123,7 @@ class ProvidersConfig(Base):
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+    qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
 
 class HeartbeatConfig(Base):
@@ -154,6 +157,7 @@ class WebSearchConfig(Base):
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
     max_results: int = 5
+    timeout: int = 30  # Wall-clock timeout (seconds) for search operations
 
 
 class WebToolsConfig(Base):
@@ -172,6 +176,8 @@ class ExecToolConfig(Base):
     enable: bool = True
     timeout: int = 60
     path_append: str = ""
+    sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through to subprocess (e.g. ["GOPATH", "JAVA_HOME"])
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
@@ -190,8 +196,9 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
 class Config(BaseSettings):
