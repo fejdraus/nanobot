@@ -53,27 +53,13 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "(delay_seconds, every_seconds, cron_expr, or at); remove requires job_id; list only needs action."
     ),
 )
-_CRON_PARAMETERS["oneOf"] = [
-    {
-        "properties": {
-            "action": {"enum": ["add"]},
-            "message": {"type": "string", "minLength": 1},
-        },
-        "required": ["action", "message"],
-    },
-    {
-        "properties": {
-            "action": {"enum": ["list"]},
-        },
-        "required": ["action"],
-    },
-    {
-        "properties": {
-            "action": {"enum": ["remove"]},
-        },
-        "required": ["action", "job_id"],
-    },
-]
+# NOTE: upstream adds `oneOf` here to harden the cron tool contract at the
+# schema level. Anthropic / AWS Bedrock (Kiro) reject JSON Schema that contains
+# `oneOf` / `anyOf` / `allOf` in tool input schemas — Claude accepts only a
+# Draft-7 subset. Keeping `oneOf` breaks every bot on a Claude-based model
+# with "Improperly formed request" (400). Runtime validation in `_add_job`
+# already enforces the same contract, so we drop the schema-level constraint
+# to stay compatible with all providers.
 
 
 @tool_parameters(_CRON_PARAMETERS)
