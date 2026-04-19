@@ -167,9 +167,9 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    provider: str = "duckduckgo"  # brave, tavily, duckduckgo, searxng, jina, kagi
+    provider: str = "searxng"  # brave, tavily, duckduckgo, searxng, jina, kagi
     api_key: str = ""
-    base_url: str = ""  # SearXNG base URL
+    base_url: str = "http://localhost:8888"  # SearXNG base URL
     max_results: int = 5
     timeout: int = 30  # Wall-clock timeout (seconds) for search operations
 
