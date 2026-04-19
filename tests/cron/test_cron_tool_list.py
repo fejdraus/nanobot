@@ -348,24 +348,15 @@ def test_add_job_can_disable_delivery(tmp_path) -> None:
 def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:
     tool = _make_tool(tmp_path)
 
+    # NOTE: fork drops upstream's `oneOf` constraint for Anthropic/Bedrock
+    # compatibility (see nanobot/agent/tools/cron.py). Action-specific
+    # requirements are documented in the schema `description` and enforced at
+    # runtime by `validate_params` / `_add_job` instead.
     assert tool.parameters["required"] == ["action"]
-    assert tool.parameters["oneOf"] == [
-        {
-            "properties": {
-                "action": {"enum": ["add"]},
-                "message": {"type": "string", "minLength": 1},
-            },
-            "required": ["action", "message"],
-        },
-        {
-            "properties": {"action": {"enum": ["list"]}},
-            "required": ["action"],
-        },
-        {
-            "properties": {"action": {"enum": ["remove"]}},
-            "required": ["action", "job_id"],
-        },
-    ]
+    assert "oneOf" not in tool.parameters
+    description = tool.parameters.get("description", "")
+    assert "add requires a non-empty message" in description
+    assert "remove requires job_id" in description
 
 
 def test_validate_params_requires_message_only_for_add(tmp_path) -> None:
@@ -380,7 +371,9 @@ def test_add_job_empty_message_returns_actionable_error(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool.set_context("telegram", "chat-1")
 
-    result = tool._add_job(None, "", 60, None, None, None)
+    # Fork signature: _add_job(name, message, delay_seconds, every_seconds,
+    # cron_expr, tz, at) — 7 positional args (delay_seconds is fork-only).
+    result = tool._add_job(None, "", 60, None, None, None, None)
 
     assert "action='add' requires a non-empty 'message'" in result
     assert "Retry including message=" in result
