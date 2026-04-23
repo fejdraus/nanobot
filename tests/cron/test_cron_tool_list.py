@@ -348,15 +348,21 @@ def test_add_job_can_disable_delivery(tmp_path) -> None:
 def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:
     tool = _make_tool(tmp_path)
 
-    # NOTE: fork drops upstream's `oneOf` constraint for Anthropic/Bedrock
-    # compatibility (see nanobot/agent/tools/cron.py). Action-specific
-    # requirements are documented in the schema `description` and enforced at
-    # runtime by `validate_params` / `_add_job` instead.
+    # Only ``action`` is required at the schema root — per-action requirements
+    # are enforced at runtime via ``validate_params`` and surfaced to the LLM
+    # through field descriptions. We intentionally do NOT set top-level
+    # ``oneOf``/``anyOf``/``allOf``/``enum``/``not``: OpenAI Codex/Responses,
+    # Anthropic Claude, and AWS Bedrock/Kiro all reject those at the root of
+    # function parameters.
     assert tool.parameters["required"] == ["action"]
-    assert "oneOf" not in tool.parameters
-    description = tool.parameters.get("description", "")
-    assert "add requires a non-empty message" in description
-    assert "remove requires job_id" in description
+    for disallowed in ("oneOf", "anyOf", "allOf", "not"):
+        assert disallowed not in tool.parameters, (
+            f"Top-level '{disallowed}' is rejected by OpenAI Codex/Responses tool schemas"
+        )
+    message_desc = tool.parameters["properties"]["message"]["description"]
+    assert "REQUIRED" in message_desc and "action='add'" in message_desc
+    job_id_desc = tool.parameters["properties"]["job_id"]["description"]
+    assert "REQUIRED" in job_id_desc and "action='remove'" in job_id_desc
 
 
 def test_validate_params_requires_message_only_for_add(tmp_path) -> None:
