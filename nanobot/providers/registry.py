@@ -63,6 +63,19 @@ class ProviderSpec:
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
 
+    # How to inject the thinking on/off toggle into extra_body.
+    # ""              — no extra_body needed (default)
+    # "thinking_type" — {"thinking": {"type": "enabled"/"disabled"}}
+    #                   (DeepSeek, VolcEngine, BytePlus)
+    # "enable_thinking" — {"enable_thinking": true/false}  (DashScope)
+    # "reasoning_split" — {"reasoning_split": true/false}  (MiniMax)
+    thinking_style: str = ""
+
+    # When True, treat the "reasoning" response field as formal content
+    # when "content" is empty.  Only set this for providers (e.g. StepFun)
+    # whose API returns the actual answer in "reasoning" instead of "content".
+    reasoning_as_content: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -141,6 +154,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         detect_by_base_keyword="volces",
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
+        thinking_style="thinking_type",
     ),
     # VolcEngine Coding Plan (火山引擎 Coding Plan): same key as volcengine
     ProviderSpec(
@@ -152,6 +166,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         default_api_base="https://ark.cn-beijing.volces.com/api/coding/v3",
         strip_model_prefix=True,
+        thinking_style="thinking_type",
     ),
     # BytePlus: VolcEngine international, pay-per-use models
     ProviderSpec(
@@ -164,6 +179,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="bytepluses",
         default_api_base="https://ark.ap-southeast.bytepluses.com/api/v3",
         strip_model_prefix=True,
+        thinking_style="thinking_type",
     ),
     # BytePlus Coding Plan: same key as byteplus
     ProviderSpec(
@@ -175,6 +191,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         default_api_base="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         strip_model_prefix=True,
+        thinking_style="thinking_type",
     ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: native Anthropic SDK
@@ -226,6 +243,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="DeepSeek",
         backend="openai_compat",
         default_api_base="https://api.deepseek.com",
+        thinking_style="thinking_type",
     ),
     # Gemini: Google's OpenAI-compatible endpoint
     ProviderSpec(
@@ -254,6 +272,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="DashScope",
         backend="openai_compat",
         default_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        thinking_style="enable_thinking",
     ),
     # Moonshot (月之暗面): Kimi K2.5 / K2.6 enforce temperature >= 1.0.
     ProviderSpec(
@@ -276,6 +295,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="MiniMax",
         backend="openai_compat",
         default_api_base="https://api.minimax.io/v1",
+        thinking_style="reasoning_split",
     ),
     # MiniMax Anthropic-compatible endpoint: supports thinking mode
     ProviderSpec(
@@ -303,6 +323,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="Step Fun",
         backend="openai_compat",
         default_api_base="https://api.stepfun.com/v1",
+        reasoning_as_content=True,
     ),
     # Xiaomi MIMO (小米): OpenAI-compatible API
     ProviderSpec(

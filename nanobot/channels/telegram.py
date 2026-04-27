@@ -7,11 +7,19 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyParameters, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReactionTypeEmoji,
+    ReplyParameters,
+    Update,
+)
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
@@ -257,6 +265,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("stop", "Stop the current task"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("history", "Show recent conversation messages"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
@@ -362,10 +371,12 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
-        # Add message handler for text, photos, voice, documents, and locations
+        # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION)
+                (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+                 | filters.ANIMATION | filters.VOICE | filters.AUDIO
+                 | filters.Document.ALL | filters.LOCATION)
                 & ~filters.COMMAND,
                 self._on_message,
             )
@@ -436,6 +447,8 @@ class TelegramChannel(BaseChannel):
             return "animation"
         if ext in ("jpg", "jpeg", "png", "webp"):
             return "photo"
+        if ext in ("mp4", "mov", "avi", "mkv", "webm", "3gp"):
+            return "video"
         if ext == "ogg":
             return "voice"
         if ext in ("mp3", "m4a", "wav", "aac"):
@@ -488,10 +501,20 @@ class TelegramChannel(BaseChannel):
                 sender = {
                     "photo": self._app.bot.send_photo,
                     "animation": self._app.bot.send_animation,
+                    "video": self._app.bot.send_video,
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
-                param = media_type if media_type in ("photo", "animation", "voice", "audio") else "document"
+                param = {
+                    "photo": "photo",
+                    "animation": "animation",
+                    "video": "video",
+                    "voice": "voice",
+                    "audio": "audio",
+                }.get(media_type, "document")
+                extra: dict[str, Any] = {}
+                if media_type == "video":
+                    extra["supports_streaming"] = True
 
                 # Telegram Bot API accepts HTTP(S) URLs directly for media params.
                 if self._is_remote_media_url(media_path):
@@ -504,17 +527,19 @@ class TelegramChannel(BaseChannel):
                         **{param: media_path},
                         reply_parameters=reply_params,
                         **thread_kwargs,
+                        **extra,
                     )
                     continue
 
-
-                with open(media_path, "rb") as f:
-                    await sender(
-                        chat_id=chat_id,
-                        **{param: f},
-                        reply_parameters=reply_params,
-                        **thread_kwargs,
-                    )
+                media_bytes = Path(media_path).read_bytes()
+                await self._call_with_retry(
+                    sender,
+                    chat_id=chat_id,
+                    **{param: media_bytes},
+                    reply_parameters=reply_params,
+                    **thread_kwargs,
+                    **extra,
+                )
             except Exception as e:
                 filename = media_path.rsplit("/", 1)[-1]
                 logger.error("Failed to send media {}: {}", media_path, e)
@@ -1215,23 +1240,20 @@ class TelegramChannel(BaseChannel):
         """Get file extension based on media type or original filename."""
         if mime_type:
             ext_map = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/gif": ".gif",
-                "audio/ogg": ".ogg",
-                "audio/mpeg": ".mp3",
-                "audio/mp4": ".m4a",
+                "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+                "image/webp": ".webp",
+                "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+                "video/x-matroska": ".mkv", "video/3gpp": ".3gp",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
 
-        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
+        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "video": ".mp4", "file": ""}
         if ext := type_map.get(media_type, ""):
             return ext
 
         if filename:
-            from pathlib import Path
-
             return "".join(Path(filename).suffixes)
 
         return ""
