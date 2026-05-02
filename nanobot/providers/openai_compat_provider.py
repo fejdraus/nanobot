@@ -232,6 +232,25 @@ def _responses_circuit_key(
     return f"{model_name}:{effort}"
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge *override* into *base*, returning a new dict.
+
+    Nested dicts are merged key-by-key; all other types in *override*
+    replace the corresponding key in *base*.
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 class OpenAICompatProvider(LLMProvider):
     """Unified provider for all OpenAI-compatible APIs.
 
@@ -246,11 +265,13 @@ class OpenAICompatProvider(LLMProvider):
         default_model: str = "gpt-4o",
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
+        self._extra_body = extra_body or {}
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -431,15 +452,27 @@ class OpenAICompatProvider(LLMProvider):
     def _drop_deepseek_incomplete_reasoning_history(
         self,
         messages: list[dict[str, Any]],
+        model_name: str,
         reasoning_effort: str | None,
     ) -> list[dict[str, Any]]:
         if (
             not self._spec
             or self._spec.name != "deepseek"
-            or not reasoning_effort
-            or reasoning_effort.lower() == "none"
         ):
             return messages
+
+        semantic_effort = reasoning_effort.lower() if isinstance(reasoning_effort, str) else None
+        if semantic_effort in {"none", "minimal", "minimum"}:
+            return messages
+
+        # DeepSeek-V4 can require reasoning_content even when the config did
+        # not explicitly request reasoning_effort. Keep that implicit-thinking
+        # cleanup scoped to known thinking-capable DeepSeek models so normal
+        # deepseek-chat history is not trimmed.
+        if semantic_effort is None:
+            model_lower = model_name.lower()
+            if not any(token in model_lower for token in ("deepseek-v4", "deepseek-reasoner")):
+                return messages
 
         bad_idx = None
         for idx, msg in enumerate(messages):
@@ -511,6 +544,7 @@ class OpenAICompatProvider(LLMProvider):
 
         messages = self._drop_deepseek_incomplete_reasoning_history(
             messages,
+            model_name,
             reasoning_effort,
         )
         kwargs: dict[str, Any] = {
@@ -549,7 +583,7 @@ class OpenAICompatProvider(LLMProvider):
             # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
             wire_effort = "minimum"
 
-        if wire_effort:
+        if wire_effort and semantic_effort != "none":
             kwargs["reasoning_effort"] = wire_effort
 
         # Provider-specific thinking parameters.
@@ -558,7 +592,7 @@ class OpenAICompatProvider(LLMProvider):
         # The mapping is driven by ProviderSpec.thinking_style so that adding
         # a new provider never requires touching this function.
         if spec and spec.thinking_style and reasoning_effort is not None:
-            thinking_enabled = semantic_effort != "minimal"
+            thinking_enabled = semantic_effort not in ("none", "minimal")
             extra = _THINKING_STYLE_MAP.get(spec.thinking_style, lambda _: None)(thinking_enabled)
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
@@ -568,7 +602,7 @@ class OpenAICompatProvider(LLMProvider):
         # so that OpenRouter-style names like "moonshotai/kimi-k2.5" are handled
         # identically to bare names like "kimi-k2.5".
         if reasoning_effort is not None and _is_kimi_thinking_model(model_name):
-            thinking_enabled = semantic_effort != "minimal"
+            thinking_enabled = semantic_effort not in ("none", "minimal")
             kwargs.setdefault("extra_body", {}).update(
                 {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
             )
@@ -588,14 +622,23 @@ class OpenAICompatProvider(LLMProvider):
         # thinking happened on that turn").
         thinking_active = (
             (spec and spec.thinking_style and reasoning_effort is not None
-             and semantic_effort != "minimal")
+             and semantic_effort not in ("none", "minimal"))
             or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
-                and semantic_effort != "minimal")
+                and semantic_effort not in ("none", "minimal"))
         )
         if thinking_active:
             for msg in kwargs["messages"]:
                 if msg.get("role") == "assistant" and "reasoning_content" not in msg:
                     msg["reasoning_content"] = ""
+
+        # Merge user-configured extra_body last so it can override or
+        # extend provider-specific defaults (e.g. chat_template_kwargs,
+        # guided_json, repetition_penalty).  Uses recursive merge so
+        # nested dicts like {"chat_template_kwargs": {"enable_thinking": false}}
+        # do not clobber sibling keys already set by thinking-style logic.
+        if self._extra_body:
+            existing = kwargs.get("extra_body", {})
+            kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
 
         return kwargs
 

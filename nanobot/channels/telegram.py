@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 import unicodedata
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -469,10 +470,8 @@ class TelegramChannel(BaseChannel):
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
             if reply_to_message_id := msg.metadata.get("message_id"):
-                try:
+                with suppress(ValueError):
                     await self._remove_reaction(msg.chat_id, int(reply_to_message_id))
-                except ValueError:
-                    pass
 
         try:
             chat_id = int(msg.chat_id)
@@ -532,13 +531,15 @@ class TelegramChannel(BaseChannel):
                     continue
 
                 media_bytes = Path(media_path).read_bytes()
+                filename = Path(media_path).name
+                send_kwargs = {param: media_bytes, "filename": filename}
                 await self._call_with_retry(
                     sender,
                     chat_id=chat_id,
-                    **{param: media_bytes},
                     reply_parameters=reply_params,
                     **thread_kwargs,
                     **extra,
+                    **send_kwargs,
                 )
             except Exception as e:
                 filename = media_path.rsplit("/", 1)[-1]
@@ -648,10 +649,8 @@ class TelegramChannel(BaseChannel):
                 return
             self._stop_typing(chat_id)
             if reply_to_message_id := meta.get("message_id"):
-                try:
+                with suppress(ValueError):
                     await self._remove_reaction(chat_id, int(reply_to_message_id))
-                except ValueError:
-                    pass
             thread_kwargs = {}
             if message_thread_id := meta.get("message_thread_id"):
                 thread_kwargs["message_thread_id"] = message_thread_id
@@ -1192,11 +1191,10 @@ class TelegramChannel(BaseChannel):
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
         try:
-            while self._app:
-                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
-                await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            pass
+            with suppress(asyncio.CancelledError):
+                while self._app:
+                    await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
+                    await asyncio.sleep(4)
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
 
@@ -1295,10 +1293,8 @@ class TelegramChannel(BaseChannel):
         button_label = query.data or ""
         await query.answer()
         if query.message:
-            try:
+            with suppress(Exception):
                 await query.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
         logger.debug("Inline button tap from {}: {}", sender_id, button_label)
         self._start_typing(str(chat_id))
         await self._handle_message(

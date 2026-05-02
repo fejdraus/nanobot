@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -12,15 +13,13 @@ from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import (
-    estimate_message_tokens,
     ensure_dir,
+    estimate_message_tokens,
     find_legal_message_start,
     image_placeholder_text,
     safe_filename,
 )
 
-
-HISTORY_MAX_MESSAGES = 120
 FILE_MAX_MESSAGES = 2000
 
 
@@ -74,7 +73,7 @@ class Session:
 
     def get_history(
         self,
-        max_messages: int = HISTORY_MAX_MESSAGES,
+        max_messages: int = 120,
         *,
         max_tokens: int = 0,
         include_timestamps: bool = False,
@@ -85,6 +84,7 @@ class Session:
         token budget from the tail (``max_tokens``) when provided.
         """
         unconsolidated = self.messages[self.last_consolidated:]
+        max_messages = max_messages if max_messages > 0 else 120
         sliced = unconsolidated[-max_messages:]
 
         # Avoid starting mid-turn when possible, except for proactive
@@ -119,7 +119,7 @@ class Session:
             if include_timestamps:
                 content = self._annotate_message_time(message, content)
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -363,15 +363,11 @@ class SessionManager:
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         if data.get("created_at"):
-                            try:
+                            with suppress(ValueError, TypeError):
                                 created_at = datetime.fromisoformat(data["created_at"])
-                            except (ValueError, TypeError):
-                                pass
                         if data.get("updated_at"):
-                            try:
+                            with suppress(ValueError, TypeError):
                                 updated_at = datetime.fromisoformat(data["updated_at"])
-                            except (ValueError, TypeError):
-                                pass
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -441,14 +437,12 @@ class SessionManager:
                 # On Windows, opening a directory with O_RDONLY raises
                 # PermissionError — skip the dir sync there (NTFS
                 # journals metadata synchronously).
-                try:
+                with suppress(PermissionError):
                     fd = os.open(str(path.parent), os.O_RDONLY)
                     try:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
-                except PermissionError:
-                    pass  # Windows — directory fsync not supported
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
