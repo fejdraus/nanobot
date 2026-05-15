@@ -360,7 +360,7 @@ def test_config_defaults():
     assert config.tools.exec.enable is True
     assert config.tools.exec.timeout == 60
     assert config.tools.web.enable is True
-    assert config.tools.web.search.provider == "duckduckgo"
+    assert config.tools.web.search.provider == "searxng"  # fork default
     assert config.tools.my.enable is True
     assert config.tools.my.allow_set is False
     assert config.tools.image_generation.enabled is False
