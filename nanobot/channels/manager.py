@@ -36,6 +36,7 @@ _SEND_RETRY_DELAYS = (1, 2, 4)
 _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
     "send_tool_hints": "sendToolHints",
+    "show_reasoning": "showReasoning",
 }
 
 class ChannelManager:
@@ -104,6 +105,9 @@ class ChannelManager:
                 channel.send_tool_hints = self._resolve_bool_override(
                     section, "send_tool_hints", self.config.channels.send_tool_hints,
                 )
+                channel.show_reasoning = self._resolve_bool_override(
+                    section, "show_reasoning", self.config.channels.show_reasoning,
+                )
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:
@@ -139,10 +143,12 @@ class ChannelManager:
                     allow = cfg.get("allowFrom")
             else:
                 allow = getattr(cfg, "allow_from", None)
-            if allow == []:
-                raise SystemExit(
-                    f'Error: "{name}" has empty allowFrom (denies all). '
-                    f'Set ["*"] to allow everyone, or add specific user IDs.'
+            if allow is None:
+                # allowFrom omitted → pairing-only mode.  Unapproved senders
+                # receive a pairing code instead of being silently ignored.
+                logger.info(
+                    '"{}" has no allowFrom; unapproved users will receive a pairing code',
+                    name,
                 )
 
     def _should_send_progress(self, channel_name: str, *, tool_hint: bool = False) -> bool:
@@ -279,6 +285,23 @@ class ChannelManager:
                         timeout=1.0
                     )
 
+                if (
+                    msg.metadata.get("_reasoning_delta")
+                    or msg.metadata.get("_reasoning_end")
+                    or msg.metadata.get("_reasoning")
+                ):
+                    # Reasoning rides its own plugin channel: only delivered
+                    # when the destination channel opts in via ``show_reasoning``
+                    # and overrides the streaming primitives. Channels without
+                    # a low-emphasis UI affordance keep the base no-op and the
+                    # content silently drops here. ``_reasoning`` (one-shot)
+                    # is accepted for backward compatibility with hooks that
+                    # haven't migrated to delta/end yet.
+                    channel = self.channels.get(msg.channel)
+                    if channel is not None and channel.show_reasoning:
+                        await self._send_with_retry(channel, msg)
+                    continue
+
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self._should_send_progress(
                         msg.channel, tool_hint=True,
@@ -290,6 +313,13 @@ class ChannelManager:
                         continue
 
                 if msg.metadata.get("_retry_wait"):
+                    continue
+
+                if (
+                    msg.metadata.get("_runtime_model_updated")
+                    and msg.channel == "websocket"
+                    and "websocket" not in self.channels
+                ):
                     continue
 
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
@@ -322,7 +352,16 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+        if msg.metadata.get("_reasoning_end"):
+            await channel.send_reasoning_end(msg.chat_id, msg.metadata)
+        elif msg.metadata.get("_reasoning_delta"):
+            await channel.send_reasoning_delta(msg.chat_id, msg.content, msg.metadata)
+        elif msg.metadata.get("_reasoning"):
+            # Back-compat: one-shot reasoning. BaseChannel translates this
+            # to a single delta + end pair so plugins only implement the
+            # streaming primitives.
+            await channel.send_reasoning(msg)
+        elif msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
             await channel.send(msg)

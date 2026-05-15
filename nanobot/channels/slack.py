@@ -18,6 +18,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.pairing import is_approved
 from nanobot.utils.helpers import safe_filename, split_message
 
 
@@ -342,6 +343,13 @@ class SlackChannel(BaseChannel):
         channel_type = event.get("channel_type") or ""
 
         if not self._is_allowed(sender_id, chat_id, channel_type):
+            if channel_type == "im" and self.config.dm.enabled:
+                await self._handle_message(
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    content="",
+                    is_dm=True,
+                )
             return
 
         if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
@@ -471,7 +479,7 @@ class SlackChannel(BaseChannel):
         return preview.startswith(_HTML_DOWNLOAD_PREFIXES)
 
     async def _on_block_action(self, client: SocketModeClient, req: SocketModeRequest) -> None:
-        """Handle button clicks from ask_user blocks."""
+        """Handle button clicks from inline action buttons."""
         await client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
         payload = req.payload or {}
         actions = payload.get("actions") or []
@@ -568,7 +576,7 @@ class SlackChannel(BaseChannel):
 
     @staticmethod
     def _build_button_blocks(text: str, buttons: list[list[str]]) -> list[dict[str, Any]]:
-        """Build Slack Block Kit blocks with action buttons for ask_user choices."""
+        """Build Slack Block Kit blocks with action buttons."""
         blocks: list[dict[str, Any]] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}},
         ]
@@ -579,7 +587,7 @@ class SlackChannel(BaseChannel):
                     "type": "button",
                     "text": {"type": "plain_text", "text": label[:75]},
                     "value": label[:75],
-                    "action_id": f"ask_user_{label[:50]}",
+                    "action_id": f"btn_{label[:50]}",
                 })
         if elements:
             blocks.append({"type": "actions", "elements": elements[:25]})
@@ -612,7 +620,7 @@ class SlackChannel(BaseChannel):
             if not self.config.dm.enabled:
                 return False
             if self.config.dm.policy == "allowlist":
-                return sender_id in self.config.dm.allow_from
+                return sender_id in self.config.dm.allow_from or is_approved(self.name, sender_id)
             return True
 
         # Group / channel messages
