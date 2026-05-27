@@ -71,6 +71,11 @@ class ProviderSpec:
     # "reasoning_split" — {"reasoning_split": true/false}  (MiniMax)
     thinking_style: str = ""
 
+    # Gateway-native reasoning control to pair with model-level thinking styles.
+    # "reasoning_effort" — {"reasoning": {"effort": <none|minimal|...>}}
+    #                      (OpenRouter)
+    gateway_reasoning_style: str = ""
+
     # When True, treat the "reasoning" response field as formal content
     # when "content" is empty.  Only set this for providers (e.g. StepFun)
     # whose API returns the actual answer in "reasoning" instead of "content".
@@ -141,6 +146,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="openrouter",
         default_api_base="https://openrouter.ai/api/v1",
         supports_prompt_caching=True,
+        gateway_reasoning_style="reasoning_effort",
     ),
     # Hugging Face Inference Providers: OpenAI-compatible router for chat models.
     ProviderSpec(
@@ -153,6 +159,18 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="hf_",
         detect_by_base_keyword="huggingface",
         default_api_base="https://router.huggingface.co/v1",
+    ),
+    # Skywork API platform (APIFree): OpenAI-compatible MaaS gateway.
+    ProviderSpec(
+        name="skywork",
+        keywords=("skywork", "skyclaw", "apifree"),
+        env_key="SKYWORK_API_KEY",
+        display_name="Skywork",
+        backend="openai_compat",
+        env_extras=(("APIFREE_API_KEY", "{api_key}"),),
+        is_gateway=True,
+        detect_by_base_keyword="apifree.ai",
+        default_api_base="https://api.apifree.ai/agent/v1",
     ),
     # AiHubMix: global gateway, OpenAI-compatible interface.
     # strip_model_prefix=True: doesn't understand "anthropic/claude-3",
@@ -179,6 +197,19 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="siliconflow",
         default_api_base="https://api.siliconflow.cn/v1",
     ),
+
+    # Novita AI: OpenAI-compatible gateway for hosted model APIs.
+    ProviderSpec(
+        name="novita",
+        keywords=("novita",),
+        env_key="NOVITA_API_KEY",
+        display_name="Novita AI",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="novita",
+        default_api_base="https://api.novita.ai/openai",
+    ),
+
     # VolcEngine (火山引擎): OpenAI-compatible gateway, pay-per-use models
     ProviderSpec(
         name="volcengine",
@@ -383,13 +414,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://api.longcat.chat/openai/v1",
     ),
+    # Ant Ling: OpenAI-compatible API for Ling/Ring model families.
+    ProviderSpec(
+        name="ant_ling",
+        keywords=("ant_ling", "ant-ling", "ling-", "ring-"),
+        env_key="ANT_LING_API_KEY",
+        display_name="Ant Ling",
+        backend="openai_compat",
+        detect_by_base_keyword="ant-ling.com",
+        default_api_base="https://api.ant-ling.com/v1",
+    ),
     # === Local deployment (matched by config key, NOT by api_base) =========
     # vLLM / any OpenAI-compatible local server
     ProviderSpec(
         name="vllm",
         keywords=("vllm",),
         env_key="HOSTED_VLLM_API_KEY",
-        display_name="vLLM/Local",
+        display_name="vLLM",
         backend="openai_compat",
         is_local=True,
     ),
@@ -414,6 +455,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_local=True,
         detect_by_base_keyword="1234",
         default_api_base="http://localhost:1234/v1",
+    ),
+    # Atomic Chat (local, OpenAI-compatible) — https://atomic.chat/
+    ProviderSpec(
+        name="atomic_chat",
+        keywords=("atomic-chat", "atomic_chat", "atomicchat"),
+        env_key="ATOMIC_CHAT_API_KEY",
+        display_name="Atomic Chat",
+        backend="openai_compat",
+        is_local=True,
+        detect_by_base_keyword="1337",
+        default_api_base="http://localhost:1337/v1",
     ),
     # === OpenVINO Model Server (direct, local, OpenAI-compatible at /v3) ===
     ProviderSpec(

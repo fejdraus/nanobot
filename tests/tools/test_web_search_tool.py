@@ -19,7 +19,10 @@ def _tool(
     )
 
 
-def _response(status: int = 200, json: dict | None = None) -> httpx.Response:
+def _response(
+    status: int = 200,
+    json: dict | None = None,
+) -> httpx.Response:
     """Build a mock httpx.Response with a dummy request attached."""
     r = httpx.Response(status, json=json)
     r._request = httpx.Request("GET", "https://mock")
@@ -60,6 +63,55 @@ async def test_brave_search(monkeypatch):
     result = await tool.execute(query="nanobot", count=1)
     assert "NanoBot" in result
     assert "https://example.com" in result
+
+
+@pytest.mark.asyncio
+async def test_brave_search_retries_rate_limit_once(monkeypatch):
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    async def mock_sleep(delay: float):
+        sleeps.append(delay)
+
+    async def mock_get(self, url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _response(status=429, json={"error": "rate limit"})
+        return _response(json={
+            "web": {"results": [{"title": "Recovered", "url": "https://example.com", "description": "ok"}]}
+        })
+
+    monkeypatch.setattr("nanobot.agent.tools.web.asyncio.sleep", mock_sleep)
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert calls["n"] == 2
+    assert "Recovered" in result
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_brave_search_returns_clear_rate_limit_after_retries(monkeypatch):
+    calls = {"n": 0}
+
+    async def mock_sleep(delay: float):
+        return None
+
+    async def mock_get(self, url, **kw):
+        calls["n"] += 1
+        return _response(status=429, json={"error": "rate limit"})
+
+    monkeypatch.setattr("nanobot.agent.tools.web.asyncio.sleep", mock_sleep)
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert calls["n"] == 2
+    assert "Brave search rate limited" in result
+    assert "consecutive web_search" in result
 
 
 @pytest.mark.asyncio
@@ -150,19 +202,23 @@ async def test_jina_search(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_kagi_search(monkeypatch):
-    async def mock_get(self, url, **kw):
-        assert "kagi.com/api/v0/search" in url
-        assert kw["headers"]["Authorization"] == "Bot kagi-key"
+    async def mock_post(self, url, **kw):
+        assert "kagi.com/api/v1/search" in url
+        assert kw["headers"]["Authorization"] == "Bearer kagi-key"
         assert kw["headers"]["User-Agent"] == "nanobot-search-test"
-        assert kw["params"] == {"q": "test", "limit": 2}
+        assert kw["json"] == {"query": "test", "limit": 2}
         return _response(json={
-            "data": [
-                {"t": 0, "title": "Kagi Result", "url": "https://kagi.com", "snippet": "Premium search"},
-                {"t": 1, "list": ["ignored related search"]},
-            ]
+            "data": {
+                "search": [
+                    {"title": "Kagi Result", "url": "https://kagi.com", "snippet": "Premium search"},
+                ],
+                "related_search": [
+                    {"title": "ignored related search", "url": "", "snippet": ""},
+                ],
+            }
         })
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
     tool = _tool(provider="kagi", api_key="kagi-key", user_agent="nanobot-search-test")
     result = await tool.execute(query="test", count=2)
     assert "Kagi Result" in result

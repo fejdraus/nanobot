@@ -1,8 +1,65 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { MessageBubble } from "@/components/MessageBubble";
-import type { UIMessage } from "@/lib/types";
+import type { CliAppInfo, McpPresetInfo, UIMessage } from "@/lib/types";
+
+const CLI_APPS: CliAppInfo[] = [
+  {
+    name: "zoom",
+    display_name: "Zoom",
+    category: "productivity",
+    description: "Meetings",
+    requires: "",
+    source: "harness",
+    entry_point: "cli-anything-zoom",
+    install_supported: true,
+    installed: true,
+    available: true,
+    status: "installed",
+    logo_url: "https://example.invalid/zoom.svg",
+    brand_color: "#0B5CFF",
+    skill_installed: true,
+  },
+  {
+    name: "krita",
+    display_name: "Krita",
+    category: "image",
+    description: "Painting",
+    requires: "",
+    source: "harness",
+    entry_point: "cli-anything-krita",
+    install_supported: true,
+    installed: false,
+    available: false,
+    status: "not_installed",
+    logo_url: null,
+    brand_color: "#3BABFF",
+    skill_installed: false,
+  },
+];
+
+const MCP_PRESETS: McpPresetInfo[] = [
+  {
+    name: "browserbase",
+    display_name: "Browserbase",
+    category: "browser",
+    description: "Cloud browser automation",
+    docs_url: "https://docs.browserbase.com",
+    transport: "streamableHttp",
+    requires: "Browserbase API key",
+    note: "",
+    install_supported: true,
+    installed: true,
+    configured: true,
+    available: true,
+    status: "configured",
+    logo_url: "https://example.invalid/browserbase.svg",
+    brand_color: "#111827",
+    required_fields: [],
+    connection_summary: "https://mcp.browserbase.com/mcp",
+  },
+];
 
 describe("MessageBubble", () => {
   it("renders user messages as right-aligned pills", () => {
@@ -20,6 +77,71 @@ describe("MessageBubble", () => {
     expect(row).toHaveClass("ml-auto", "flex");
     expect(pill).toHaveClass("ml-auto", "w-fit", "rounded-[18px]");
     expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
+  });
+
+  it("renders installed CLI app mentions inside sent user messages", () => {
+    const message: UIMessage = {
+      id: "u-cli",
+      role: "user",
+      content: "Hi nano, please use @zoom to book a meeting, not @krita",
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} cliApps={CLI_APPS} />);
+
+    const token = screen.getByTestId("message-cli-mention-zoom");
+    expect(token).toHaveTextContent("@zoom");
+    expect(token).toHaveAttribute("title", "CLI app: Zoom");
+    expect(token.className).not.toContain("rounded");
+    expect(token.className).not.toContain("px-");
+    expect(token.getAttribute("style")).toContain("color: #0B5CFF");
+    expect(token.getAttribute("style")).toContain("text-shadow");
+    expect(screen.getByTestId("message-cli-mention-logo-zoom")).toBeInTheDocument();
+    expect(screen.queryByTestId("message-cli-mention-krita")).not.toBeInTheDocument();
+    expect(screen.getByText(/not @krita/)).toBeInTheDocument();
+  });
+
+  it("renders structured CLI app attachments even without the installed catalog", () => {
+    const message: UIMessage = {
+      id: "u-cli-attached",
+      role: "user",
+      content: "Please use @drawio for the diagram",
+      createdAt: Date.now(),
+      cliApps: [{
+        name: "drawio",
+        display_name: "Draw.io",
+        category: "diagram",
+        entry_point: "cli-anything-drawio",
+        logo_url: "https://example.invalid/drawio.svg",
+        brand_color: "#F08705",
+      }],
+    };
+
+    render(<MessageBubble message={message} cliApps={[]} />);
+
+    const token = screen.getByTestId("message-cli-mention-drawio");
+    expect(token).toHaveTextContent("@drawio");
+    expect(token.className).not.toContain("rounded");
+    expect(token.className).not.toContain("px-");
+    expect(token.getAttribute("style")).toContain("color: #F08705");
+    expect(screen.getByTestId("message-cli-mention-logo-drawio")).toBeInTheDocument();
+  });
+
+  it("renders MCP preset mentions inside sent user messages", () => {
+    const message: UIMessage = {
+      id: "u-mcp",
+      role: "user",
+      content: "Use @browserbase to inspect the checkout flow",
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} mcpPresets={MCP_PRESETS} />);
+
+    const token = screen.getByTestId("message-mcp-mention-browserbase");
+    expect(token).toHaveTextContent("@browserbase");
+    expect(token).toHaveAttribute("title", "MCP server: Browserbase");
+    expect(token.getAttribute("style")).toContain("color: #111827");
+    expect(screen.getByTestId("message-mcp-mention-logo-browserbase")).toBeInTheDocument();
   });
 
   it("copies completed assistant replies from the action row", async () => {
@@ -55,6 +177,19 @@ describe("MessageBubble", () => {
     };
 
     render(<MessageBubble message={message} />);
+
+    expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
+  });
+
+  it("does not show copy when showAssistantCopyAction is false", () => {
+    const message: UIMessage = {
+      id: "a-mid",
+      role: "assistant",
+      content: "Mid-turn snippet.",
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} showAssistantCopyAction={false} />);
 
     expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
   });
@@ -118,7 +253,9 @@ describe("MessageBubble", () => {
 
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
     expect(screen.getByText(/Step 1: parse intent\./)).toBeInTheDocument();
-    expect(container.querySelector(".reasoning-shimmer")).toBeInTheDocument();
+    expect(container.querySelector(".reasoning-sheen-stripe")).not.toBeInTheDocument();
+    expect(screen.getByText("Thinking…")).toHaveClass("streaming-text-sheen");
+    expect(screen.getByText("Thinking…")).toHaveAttribute("data-sheen-text", "Thinking…");
     expect(screen.getByRole("button", { name: /thinking/i }).parentElement).not.toHaveClass("mb-2");
   });
 
@@ -141,6 +278,70 @@ describe("MessageBubble", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /thinking/i }));
     expect(screen.getByText("hidden until expanded")).toBeInTheDocument();
+  });
+
+  it("renders reasoning body as markdown so headings are not left as raw ###", async () => {
+    await import("@/components/MarkdownTextRenderer");
+    const message: UIMessage = {
+      id: "a-reasoning-md",
+      role: "assistant",
+      content: "",
+      createdAt: Date.now(),
+      reasoning: "### Section title\n\nBody line.",
+      reasoningStreaming: false,
+    };
+
+    const { container } = render(<MessageBubble message={message} />);
+    fireEvent.click(screen.getByRole("button", { name: /thinking/i }));
+
+    await waitFor(() => {
+      expect(container.querySelector("h3")?.textContent).toBe("Section title");
+    });
+    expect(container.textContent).not.toContain("###");
+    expect(screen.getByText("Body line.")).toBeInTheDocument();
+  });
+
+  it("renders inline file paths as compact file references", async () => {
+    await import("@/components/MarkdownTextRenderer");
+    const message: UIMessage = {
+      id: "a-file-path",
+      role: "assistant",
+      content:
+        "改动在 `webui/src/components/MarkdownTextRenderer.tsx` 和 `/Users/renxubin/.nanobot/workspace/minecraft-fps/index.html`。",
+      createdAt: Date.now(),
+    };
+
+    try {
+      render(<MessageBubble message={message} />);
+
+      const references = await screen.findAllByTestId("inline-file-path");
+      expect(references).toHaveLength(2);
+      expect(references[0].parentElement).not.toHaveClass("translate-y-[0.08em]");
+      expect(references[0].parentElement).toHaveClass("align-baseline");
+      expect(references[0].parentElement).toHaveClass("leading-[inherit]");
+      expect(references[0]).toHaveClass("items-baseline");
+      expect(references[0]).toHaveTextContent("MarkdownTextRenderer.tsx");
+      expect(references[0]).not.toHaveTextContent("webui/src/components");
+      expect(screen.getByText("index.html")).toBeInTheDocument();
+      expect(references[1]).not.toHaveTextContent("/Users/renxubin");
+      expect(references[1]).not.toHaveAttribute("title");
+      expect(references[1]).toHaveAttribute(
+        "aria-label",
+        "/Users/renxubin/.nanobot/workspace/minecraft-fps/index.html",
+      );
+
+      vi.useFakeTimers();
+      fireEvent.pointerMove(references[1].parentElement!);
+      await act(async () => {
+        vi.advanceTimersByTime(500);
+      });
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(
+        "/Users/renxubin/.nanobot/workspace/minecraft-fps/index.html",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders assistant image media as a larger generated result", () => {

@@ -103,3 +103,5 @@ botpy.log
 # Project fork specific
 /.claude
 AGENTS.md
+exp/
+.playwright-mcp/

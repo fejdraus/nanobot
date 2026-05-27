@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -79,6 +79,8 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
+        max_concurrent_subagents: int | None = None,
+        llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -94,8 +96,13 @@ class SubagentManager:
             if max_iterations is not None
             else defaults.max_tool_iterations
         )
-        self.max_concurrent_subagents = defaults.max_concurrent_subagents
+        self.max_concurrent_subagents = (
+            max_concurrent_subagents
+            if max_concurrent_subagents is not None
+            else defaults.max_concurrent_subagents
+        )
         self.runner = AgentRunner(provider)
+        self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -108,12 +115,18 @@ class SubagentManager:
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
-    def _build_tools(self) -> ToolRegistry:
+    def _build_tools(
+        self,
+        workspace: Path | None = None,
+        tools_config: ToolsConfig | None = None,
+    ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
+        root = self.workspace if workspace is None else workspace
         registry = ToolRegistry()
+        cfg = tools_config if tools_config is not None else self._subagent_tools_config()
         ctx = ToolContext(
-            config=self._subagent_tools_config(),
-            workspace=str(self.workspace),
+            config=cfg,
+            workspace=str(root.resolve()),
             file_state_store=FileStates(),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
@@ -132,6 +145,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        temperature: float | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -147,7 +161,9 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
+            self._run_subagent(
+                task_id, task, display_label, origin, status, origin_message_id, temperature
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -174,6 +190,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        temperature: float | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -190,10 +207,17 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
+            sess_key = origin.get("session_key")
+            llm_timeout = (
+                self._llm_wall_timeout_for_session(sess_key)
+                if self._llm_wall_timeout_for_session
+                else None
+            )
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
                 model=self.model,
+                temperature=temperature,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=_SubagentHook(task_id, status),
@@ -201,6 +225,8 @@ class SubagentManager:
                 error_message=None,
                 fail_on_tool_error=True,
                 checkpoint_callback=_on_checkpoint,
+                session_key=sess_key,
+                llm_timeout_s=llm_timeout,
             ))
             status.phase = "done"
             status.stop_reason = result.stop_reason

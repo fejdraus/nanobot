@@ -1,13 +1,11 @@
 """Tests for ContextBuilder — system prompt and message assembly."""
 
-import base64
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nanobot.agent.context import ContextBuilder
-
+from nanobot.session.goal_state import GOAL_STATE_KEY
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,6 +139,13 @@ class TestLoadBootstrapFiles:
         for name in ContextBuilder.BOOTSTRAP_FILES:
             assert f"## {name}" in result
 
+    def test_legacy_tools_md_is_not_bootstrapped(self, tmp_path):
+        (tmp_path / "TOOLS.md").write_text("workspace tool notes", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files()
+        assert "TOOLS.md" not in result
+        assert "workspace tool notes" not in result
+
     def test_utf8_content(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("用中文回复", encoding="utf-8")
         builder = _builder(tmp_path)
@@ -171,6 +176,37 @@ class TestIsTemplateContent:
         if not tpl.is_file():
             pytest.skip("MEMORY.md template not bundled")
         assert ContextBuilder._is_template_content("totally different", "memory/MEMORY.md") is False
+
+
+# ---------------------------------------------------------------------------
+# Bundled bootstrap templates
+# ---------------------------------------------------------------------------
+
+
+class TestBundledToolContract:
+    def test_tool_contract_balances_general_and_coding_workflows(self):
+        from importlib.resources import files as pkg_files
+
+        tpl = pkg_files("nanobot") / "templates" / "agent" / "tool_contract.md"
+        content = tpl.read_text(encoding="utf-8")
+
+        assert "## General Tool Contract" in content
+        assert "Use the narrowest structured tool" in content
+        assert "Do not use `exec` as a universal workaround" in content
+        assert "## File and Coding Workflows" in content
+        assert "apply_patch" in content
+        assert "## Web and External Information" in content
+        assert "## Messaging and Media" in content
+        assert "## Scheduling and Background Work" in content
+        assert "pure coding" not in content.lower()
+
+    def test_tool_contract_is_injected_without_workspace_file(self, tmp_path):
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt()
+
+        assert "# Tool Usage Notes" in prompt
+        assert "## General Tool Contract" in prompt
+        assert "Do not use `exec` as a universal workaround" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +321,62 @@ class TestBuildMessages:
         assert "[Runtime Context" in user_msg
         assert "hello" in user_msg
 
+    def test_session_metadata_injects_active_goal_state(self, tmp_path):
+        builder = _builder(tmp_path)
+        meta = {
+            GOAL_STATE_KEY: {"status": "active", "objective": "Finish docs migration."},
+        }
+        messages = builder.build_messages(
+            [],
+            "hi",
+            channel="cli",
+            chat_id="x",
+            session_metadata=meta,
+        )
+        user_msg = str(messages[-1]["content"])
+        assert "Goal (active):" in user_msg
+        assert "Finish docs migration." in user_msg
+
+    def test_goal_state_does_not_leak_without_session_metadata(self, tmp_path):
+        builder = _builder(tmp_path)
+        other_session_meta = {
+            GOAL_STATE_KEY: {"status": "active", "objective": "Other chat goal."},
+        }
+
+        with_goal = builder.build_messages(
+            [],
+            "hi",
+            channel="websocket",
+            chat_id="chat-a",
+            session_metadata=other_session_meta,
+        )
+        without_goal = builder.build_messages(
+            [],
+            "hi",
+            channel="websocket",
+            chat_id="chat-b",
+            session_metadata={},
+        )
+
+        assert "Other chat goal." in str(with_goal[-1]["content"])
+        assert "Other chat goal." not in str(without_goal[-1]["content"])
+        assert "Goal (active):" not in str(without_goal[-1]["content"])
+
+    def test_current_runtime_lines_are_injected(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages(
+            [],
+            "please use @zoom tonight",
+            current_runtime_lines=[
+                "CLI App Attachment: @zoom (installed; tool=run_cli_app; entry_point=cli-anything-zoom).",
+            ],
+        )
+        user_msg = str(messages[-1]["content"])
+
+        assert "CLI App Attachment: @zoom" in user_msg
+        assert "tool=run_cli_app" in user_msg
+        assert "entry_point=cli-anything-zoom" in user_msg
+
     def test_consecutive_same_role_merged(self, tmp_path):
         builder = _builder(tmp_path)
         history = [{"role": "user", "content": "previous user message"}]
@@ -308,26 +400,3 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
-
-
-# ---------------------------------------------------------------------------
-# add_tool_result
-# ---------------------------------------------------------------------------
-
-
-class TestAddToolResult:
-    def test_appends_tool_message(self, tmp_path):
-        builder = _builder(tmp_path)
-        msgs = [{"role": "user", "content": "hello"}]
-        result = builder.add_tool_result(msgs, "call_123", "read_file", "file content")
-        assert len(result) == 2
-        assert result[1]["role"] == "tool"
-        assert result[1]["tool_call_id"] == "call_123"
-        assert result[1]["name"] == "read_file"
-        assert result[1]["content"] == "file content"
-
-    def test_returns_same_list(self, tmp_path):
-        builder = _builder(tmp_path)
-        msgs = []
-        result = builder.add_tool_result(msgs, "id", "tool", "ok")
-        assert result is msgs

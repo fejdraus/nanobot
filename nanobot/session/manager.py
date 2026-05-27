@@ -20,12 +20,15 @@ from nanobot.utils.helpers import (
     image_placeholder_text,
     safe_filename,
 )
+from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
 
 FILE_MAX_MESSAGES = 2000
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
 _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
 _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
+_SESSION_LIST_PREVIEW_MAX_RECORDS = 200
+_SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
 
 
 def _sanitize_assistant_replay_text(content: str) -> str:
@@ -63,6 +66,14 @@ def _text_preview(content: Any) -> str:
     if len(text) > _SESSION_PREVIEW_MAX_CHARS:
         text = text[: _SESSION_PREVIEW_MAX_CHARS - 1].rstrip() + "…"
     return text
+
+
+def _message_preview_text(message: dict[str, Any]) -> str:
+    """Session list preview text; subagent inject blobs are shortened for display."""
+    content: Any = message.get("content")
+    if message.get("injected_event") == "subagent_result" and isinstance(content, str):
+        content = scrub_subagent_announce_body(content)
+    return _text_preview(content)
 
 
 @dataclass
@@ -156,6 +167,45 @@ class Session:
                     image_placeholder_text(p) for p in media if isinstance(p, str) and p
                 )
                 content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+            cli_apps = message.get("cli_apps")
+            if role == "user" and isinstance(cli_apps, list) and cli_apps and isinstance(content, str):
+                cli_lines: list[str] = []
+                for item in cli_apps[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip().lower()
+                    if not name:
+                        continue
+                    entry = str(item.get("entry_point") or "unknown").strip() or "unknown"
+                    cli_lines.append(
+                        f"[CLI App Attachment: @{name}; tool=run_cli_app; entry_point={entry}; "
+                        f"skill=skills/cli-app-{name}/SKILL.md]"
+                    )
+                if cli_lines:
+                    breadcrumbs = "\n".join(cli_lines)
+                    content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+            mcp_presets = message.get("mcp_presets")
+            if (
+                role == "user"
+                and isinstance(mcp_presets, list)
+                and mcp_presets
+                and isinstance(content, str)
+            ):
+                mcp_lines: list[str] = []
+                for item in mcp_presets[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip().lower()
+                    if not name:
+                        continue
+                    transport = str(item.get("transport") or "mcp").strip() or "mcp"
+                    mcp_lines.append(
+                        f"[MCP Preset Attachment: @{name}; tool_prefix=mcp_{name}_; "
+                        f"transport={transport}]"
+                    )
+                if mcp_lines:
+                    breadcrumbs = "\n".join(mcp_lines)
+                    content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             if include_timestamps:
                 content = self._annotate_message_time(message, content)
             if role == "assistant" and isinstance(content, str) and not content.strip():
@@ -595,13 +645,22 @@ class SessionManager:
                             title = metadata.get("title") if isinstance(metadata, dict) else None
                             preview = ""
                             fallback_preview = ""
+                            scanned_records = 0
+                            scanned_chars = 0
                             for line in f:
                                 if not line.strip():
                                     continue
+                                scanned_records += 1
+                                scanned_chars += len(line)
+                                if (
+                                    scanned_records > _SESSION_LIST_PREVIEW_MAX_RECORDS
+                                    or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
+                                ):
+                                    break
                                 item = json.loads(line)
                                 if item.get("_type") == "metadata":
                                     continue
-                                text = _text_preview(item.get("content"))
+                                text = _message_preview_text(item)
                                 if not text:
                                     continue
                                 if item.get("role") == "user":
@@ -634,7 +693,7 @@ class SessionManager:
                             (
                                 text
                                 for msg in repaired.messages
-                                if (text := _text_preview(msg.get("content")))
+                                if (text := _message_preview_text(msg))
                             ),
                             "",
                         ),
