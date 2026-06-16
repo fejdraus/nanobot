@@ -9,7 +9,9 @@ from nanobot.agent.memory import (
     Consolidator,
     MemoryStore,
 )
+from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import Session
+from nanobot.utils.prompt_templates import render_template
 
 
 @pytest.fixture
@@ -61,6 +63,23 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
 
+    async def test_summarize_appends_session_key_to_history(
+        self,
+        consolidator,
+        mock_provider,
+        store,
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="User fixed a bug in the auth module.",
+            finish_reason="stop",
+        )
+        messages = [{"role": "user", "content": "fix the auth bug"}]
+
+        await consolidator.archive(messages, session_key="telegram:chat-1")
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["session_key"] == "telegram:chat-1"
+
     async def test_summarize_raw_dumps_on_llm_failure(self, consolidator, mock_provider, store):
         """On LLM failure, raw-dump messages to HISTORY.md."""
         mock_provider.chat_with_retry.side_effect = Exception("API error")
@@ -71,9 +90,34 @@ class TestConsolidatorSummarize:
         assert len(entries) == 1
         assert "[RAW]" in entries[0]["content"]
 
+    async def test_raw_dump_fallback_appends_session_key(
+        self,
+        consolidator,
+        mock_provider,
+        store,
+    ):
+        mock_provider.chat_with_retry.side_effect = Exception("API error")
+        messages = [{"role": "user", "content": "hello"}]
+
+        await consolidator.archive(messages, session_key="slack:chat-2")
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["session_key"] == "slack:chat-2"
+
     async def test_summarize_skips_empty_messages(self, consolidator):
         result = await consolidator.archive([])
         assert result is None
+
+
+class TestConsolidatorPromptContract:
+    def test_archive_prompt_outputs_attribute_tags_without_missing_context_claims(self):
+        prompt = render_template("agent/consolidator_archive.md", strip=True)
+
+        assert "SNIP" in prompt
+        for mark in ("[permanent]", "[durable]", "[ephemeral]", "[correction]", "[skip]"):
+            assert mark in prompt
+        assert "check context below" not in prompt.lower()
+        assert "Do not mark something [skip] merely because it might already exist" in prompt
 
 
 class TestConsolidatorArchiveErrorHandling:
@@ -358,6 +402,77 @@ class TestCompactIdleSession:
         assert "last_active" in meta
 
     @pytest.mark.asyncio
+    async def test_summarizes_retained_suffix_not_just_dropped_prefix(
+        self, real_consolidator, mock_provider
+    ):
+        """idleCompact must summarize over the full unconsolidated tail, including
+        the recent suffix it retains. Otherwise a late user correction / final
+        result that lands in the kept suffix is excluded from the persisted
+        summary, leaving a stale wrong conclusion in history. Regression for #4264."""
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary.", finish_reason="stop"
+        )
+        sessions = real_consolidator.sessions
+        session = sessions.get_or_create("cli:correction")
+        for i in range(18):
+            session.add_message("user", f"user msg {i}")
+            session.add_message("assistant", f"assistant msg {i}")
+        # Final correction exchange lands inside the retained max_suffix window.
+        session.add_message("user", "no, that's wrong, use approach B")
+        session.add_message("assistant", "CORRECTED_FINAL_RESULT_alpha")
+        sessions.save(session)
+
+        await real_consolidator.compact_idle_session("cli:correction", max_suffix=8)
+
+        summarized = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "CORRECTED_FINAL_RESULT_alpha" in summarized
+
+    @pytest.mark.asyncio
+    async def test_raw_dumps_only_dropped_messages_on_llm_failure(
+        self, real_consolidator, mock_provider, store
+    ):
+        """Summarizing over the full tail must not widen what gets raw-dumped on
+        LLM failure: the breadcrumb should contain only the removed prefix, not
+        the retained suffix that stays live in the session. Regression for #4264."""
+        mock_provider.chat_with_retry.side_effect = RuntimeError("LLM unavailable")
+        sessions = real_consolidator.sessions
+        session = sessions.get_or_create("cli:rawdrop")
+        for i in range(18):
+            session.add_message("user", f"user msg {i}")
+            session.add_message("assistant", f"assistant msg {i}")
+        session.add_message("user", "final user follow-up")
+        session.add_message("assistant", "RETAINED_SUFFIX_marker")
+        sessions.save(session)
+
+        await real_consolidator.compact_idle_session("cli:rawdrop", max_suffix=8)
+
+        raw = "\n".join(e["content"] for e in store.read_unprocessed_history(since_cursor=0))
+        assert "[RAW]" in raw
+        assert "user msg 0" in raw  # removed prefix is the breadcrumb
+        assert "RETAINED_SUFFIX_marker" not in raw  # retained suffix not dumped
+
+    @pytest.mark.asyncio
+    async def test_idle_compact_writes_session_key_to_history(
+        self,
+        real_consolidator,
+        mock_provider,
+        store,
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary of old conversation.", finish_reason="stop"
+        )
+        session = real_consolidator.sessions.get_or_create("cli:test")
+        for i in range(10):
+            session.add_message("user", f"user msg {i}")
+            session.add_message("assistant", f"assistant msg {i}")
+        real_consolidator.sessions.save(session)
+
+        await real_consolidator.compact_idle_session("cli:test", max_suffix=4)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["session_key"] == "cli:test"
+
+    @pytest.mark.asyncio
     async def test_empty_session_refreshes_timestamp(self, real_consolidator):
         """Empty session with old updated_at → refreshed after call, returns ''."""
         from datetime import datetime, timedelta
@@ -441,17 +556,64 @@ class TestCompactIdleSession:
         assert "u25" in user_content or "a25" in user_content
 
     @pytest.mark.asyncio
+    async def test_non_contiguous_suffix_archives_actual_dropped_messages(
+        self,
+        real_consolidator,
+        mock_provider,
+    ):
+        """Assistant-only tails extend back to the latest user turn, so archive
+        the actual dropped messages rather than a computed prefix."""
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Tail summary.", finish_reason="stop"
+        )
+        sessions = real_consolidator.sessions
+        session = sessions.get_or_create("cli:noncontiguous")
+        for i in range(15):
+            session.add_message("user", f"user-{i:02d}")
+        for i in range(10):
+            session.add_message("assistant", f"assistant-{i:02d}")
+        sessions.save(session)
+
+        result = await real_consolidator.compact_idle_session("cli:noncontiguous", max_suffix=6)
+        assert result == "Tail summary."
+
+        reloaded = sessions.get_or_create("cli:noncontiguous")
+        assert [m["content"] for m in reloaded.messages] == [
+            "user-14",
+            "assistant-00",
+            "assistant-01",
+            "assistant-02",
+            "assistant-03",
+            "assistant-04",
+            "assistant-05",
+            "assistant-06",
+            "assistant-07",
+            "assistant-08",
+            "assistant-09",
+        ]
+
+        # #4264: idle compaction now summarizes the full unconsolidated tail, so
+        # the dropped head (user-00) and retained suffix (user-14 through
+        # assistant-09) are all summarized.
+        archived_call = mock_provider.chat_with_retry.call_args
+        user_content = archived_call.kwargs["messages"][1]["content"]
+        assert "user-00" in user_content
+        assert "assistant-09" in user_content
+        assert "user-14" in user_content
+
+    @pytest.mark.asyncio
     async def test_acquires_consolidation_lock(self, real_consolidator, mock_provider):
         """Verify lock is held during execution."""
         import asyncio
 
         # Use a slow LLM response to ensure the lock is held while we check
         started = asyncio.Event()
+        release_chat = asyncio.Event()
 
         async def slow_chat(**kwargs):
             started.set()
-            await asyncio.sleep(0.1)
-            return MagicMock(content="Summary.", finish_reason="stop")
+            await release_chat.wait()
+            return LLMResponse(content="Summary.", finish_reason="stop")
 
         mock_provider.chat_with_retry = slow_chat
 
@@ -470,6 +632,7 @@ class TestCompactIdleSession:
         )
         await started.wait()
         assert lock.locked()
+        release_chat.set()
         await task
         assert not lock.locked()
 
@@ -586,6 +749,12 @@ class TestRawArchiveTruncation:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "hello" in entries[0]["content"]
+
+    def test_raw_archive_preserves_session_key(self, store):
+        messages = [{"role": "user", "content": "hello"}]
+        store.raw_archive(messages, session_key="websocket:chat-1")
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["session_key"] == "websocket:chat-1"
 
     def test_raw_archive_custom_max_chars(self, store):
         """max_chars parameter should override default limit."""

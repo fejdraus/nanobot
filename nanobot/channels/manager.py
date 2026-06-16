@@ -56,12 +56,22 @@ class ChannelManager:
         bus: MessageBus,
         *,
         session_manager: "SessionManager | None" = None,
+        cron_service: Any | None = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
+        webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
+        webui_static_dist: bool = True,
+        webui_runtime_surface: str = "browser",
+        webui_runtime_capabilities: dict[str, Any] | None = None,
     ):
         self.config = config
         self.bus = bus
         self._session_manager = session_manager
+        self._cron_service = cron_service
         self._webui_runtime_model_name = webui_runtime_model_name
+        self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
+        self._webui_static_dist = webui_static_dist
+        self._webui_runtime_surface = webui_runtime_surface
+        self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -71,11 +81,6 @@ class ChannelManager:
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
         from nanobot.channels.registry import discover_channel_names, discover_enabled
-
-        transcription_provider = self.config.channels.transcription_provider
-        transcription_key = self._resolve_transcription_key(transcription_provider)
-        transcription_base = self._resolve_transcription_base(transcription_provider)
-        transcription_language = self.config.channels.transcription_language
 
         # Collect enabled module names first, then only import those.
         # Channel configs live in ChannelsConfig's extra fields (via
@@ -105,19 +110,29 @@ class ChannelManager:
             try:
                 kwargs: dict[str, Any] = {}
                 if cls.name == "websocket":
-                    if self._session_manager is not None:
-                        kwargs["session_manager"] = self._session_manager
-                        static_path = _default_webui_dist()
-                        if static_path is not None:
-                            kwargs["static_dist_path"] = static_path
-                    kwargs["workspace_path"] = self.config.workspace_path
-                    if self._webui_runtime_model_name is not None:
-                        kwargs["runtime_model_name"] = self._webui_runtime_model_name
+                    from nanobot.channels.websocket import WebSocketConfig
+                    from nanobot.webui.gateway_services import build_gateway_services
+
+                    parsed = WebSocketConfig.model_validate(section)
+                    static_path = _default_webui_dist() if self._webui_static_dist else None
+                    workspace = Path(self.config.workspace_path)
+                    gateway = build_gateway_services(
+                        config=parsed,
+                        bus=self.bus,
+                        session_manager=self._session_manager,
+                        static_dist_path=static_path,
+                        workspace_path=workspace,
+                        default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
+                        disabled_skills=set(self.config.agents.defaults.disabled_skills),
+                        runtime_model_name=self._webui_runtime_model_name,
+                        runtime_surface=self._webui_runtime_surface,
+                        runtime_capabilities_overrides=self._webui_runtime_capabilities,
+                        cron_service=self._cron_service,
+                        cron_pending_job_ids=self._webui_cron_pending_job_ids,
+                        logger=logger,
+                    )
+                    kwargs["gateway"] = gateway
                 channel = cls(section, self.bus, **kwargs)
-                channel.transcription_provider = transcription_provider
-                channel.transcription_api_key = transcription_key
-                channel.transcription_api_base = transcription_base
-                channel.transcription_language = transcription_language
                 channel.send_progress = self._resolve_bool_override(
                     section, "send_progress", self.config.channels.send_progress,
                 )
@@ -133,24 +148,6 @@ class ChannelManager:
                 logger.warning("{} channel not available: {}", name, e)
 
         self._validate_allow_from()
-
-    def _resolve_transcription_key(self, provider: str) -> str:
-        """Pick the API key for the configured transcription provider."""
-        try:
-            if provider == "openai":
-                return self.config.providers.openai.api_key
-            return self.config.providers.groq.api_key
-        except AttributeError:
-            return ""
-
-    def _resolve_transcription_base(self, provider: str) -> str:
-        """Pick the API base URL for the configured transcription provider."""
-        try:
-            if provider == "openai":
-                return self.config.providers.openai.api_base or ""
-            return self.config.providers.groq.api_base or ""
-        except AttributeError:
-            return ""
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
@@ -380,6 +377,13 @@ class ChannelManager:
             # to a single delta + end pair so plugins only implement the
             # streaming primitives.
             await channel.send_reasoning(msg)
+        elif msg.metadata.get("_file_edit_events"):
+            edits = msg.metadata.get("_file_edit_events")
+            await channel.send_file_edit_events(
+                msg.chat_id,
+                edits if isinstance(edits, list) else [],
+                msg.metadata,
+            )
         elif msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):

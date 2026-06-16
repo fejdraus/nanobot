@@ -10,9 +10,12 @@ import string
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import json_repair
-
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    tool_arguments_object_for_replay,
+)
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -45,12 +48,20 @@ class AnthropicProvider(LLMProvider):
         if api_key:
             client_kw["api_key"] = api_key
         if api_base:
-            client_kw["base_url"] = api_base
+            client_kw["base_url"] = self._normalize_base_url(api_base)
         if extra_headers:
             client_kw["default_headers"] = extra_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
         self._client = AsyncAnthropic(**client_kw)
+
+    @staticmethod
+    def _normalize_base_url(api_base: str) -> str:
+        """Anthropic SDK appends /v1 to request paths internally."""
+        normalized = api_base.rstrip("/")
+        if normalized.endswith("/v1"):
+            return normalized[: -len("/v1")]
+        return normalized
 
     @classmethod
     def _handle_error(cls, e: Exception) -> LLMResponse:
@@ -199,13 +210,11 @@ class AnthropicProvider(LLMProvider):
                 continue
             func = tc.get("function", {})
             args = func.get("arguments", "{}")
-            if isinstance(args, str):
-                args = json_repair.loads(args)
             blocks.append({
                 "type": "tool_use",
                 "id": tc.get("id") or _gen_tool_id(),
                 "name": func.get("name", ""),
-                "input": args,
+                "input": tool_arguments_object_for_replay(args),
             })
 
         return blocks or [{"type": "text", "text": ""}]
@@ -227,6 +236,13 @@ class AnthropicProvider(LLMProvider):
                 converted = AnthropicProvider._convert_image_block(item)
                 if converted:
                     result.append(converted)
+                continue
+            if not item.get("type"):
+                # Anthropic requires every content block to declare a "type".
+                # A tool that returned a bare dict (or a list of dicts) lands
+                # here; coerce it to a text block instead of emitting a block
+                # the API rejects with "content.0.type: Field required".
+                result.append({"type": "text", "text": str(item)})
                 continue
             result.append(item)
         return result or "(empty)"
@@ -436,9 +452,10 @@ class AnthropicProvider(LLMProvider):
         max_tokens = max(1, max_tokens)
         thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
 
-        # claude-opus-4-7 deprecated the `temperature` parameter entirely — the
-        # API returns 400 if it is present, on any code path.
-        omit_temperature = "opus-4-7" in model_name
+        # Several Anthropic models (opus-4-7, opus-4-8, fable) deprecated the
+        # `temperature` parameter — the API returns 400 if it is present.
+        _model_lower = model_name.lower()
+        omit_temperature = any(m in _model_lower for m in ("opus-4-7", "opus-4-8", "fable"))
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -494,7 +511,7 @@ class AnthropicProvider(LLMProvider):
                 tool_calls.append(ToolCallRequest(
                     id=block.id,
                     name=block.name,
-                    arguments=block.input if isinstance(block.input, dict) else {},
+                    arguments=block.input,
                 ))
             elif block.type == "thinking":
                 thinking_blocks.append({

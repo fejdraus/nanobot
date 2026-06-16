@@ -8,15 +8,21 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.cron.session_turns import CRON_HISTORY_META, CRON_TRIGGER_META
 from nanobot.providers.base import LLMResponse
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.turn_continuation import (
+    INTERNAL_CONTINUATION_META,
+    INTERNAL_CONTINUATION_RUN_STARTED_AT_META,
+)
 from nanobot.session.webui_turns import (
     TITLE_GENERATION_MAX_TOKENS,
     TITLE_GENERATION_REASONING_EFFORT,
     WEBUI_SESSION_METADATA_KEY,
     WEBUI_TITLE_METADATA_KEY,
     WebuiTurnCoordinator,
+    clean_generated_title,
     maybe_generate_webui_title,
 )
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -34,7 +40,13 @@ def _make_full_loop(tmp_path: Path) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Test title"))
-    return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    WebuiTurnCoordinator(
+        bus=loop.bus,
+        sessions=loop.sessions,
+        schedule_background=lambda coro: loop._schedule_background(coro),
+    ).subscribe(loop.runtime_events)
+    return loop
 
 
 def test_agent_loop_llm_runtime_reflects_current_provider_and_model(tmp_path: Path) -> None:
@@ -51,6 +63,46 @@ def test_agent_loop_llm_runtime_reflects_current_provider_and_model(tmp_path: Pa
 
     assert runtime.provider is next_provider
     assert runtime.model == "next-model"
+
+
+def test_persist_cron_turn_uses_distinct_history_marker(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:auto")
+    prompt_ref = {"id": "cron.agent_turn.reminder", "version": 1, "sha256": "abc"}
+
+    persisted = loop._persist_user_message_early(
+        InboundMessage(
+            channel="websocket",
+            sender_id="cron",
+            chat_id="auto",
+            content="Cron job: internal prompt",
+            metadata={
+                CRON_TRIGGER_META: {
+                    "job_id": "job-1",
+                    "job_name": "Daily check",
+                    "run_id": "job-1:1",
+                    "prompt_ref": prompt_ref,
+                    "persist_content": "Scheduled cron job triggered: Daily check",
+                }
+            },
+        ),
+        session,
+    )
+
+    assert persisted is True
+    message = session.messages[-1]
+    assert message["content"] == "Scheduled cron job triggered: Daily check"
+    assert message[CRON_HISTORY_META] is True
+    assert CRON_TRIGGER_META not in message
+    assert message["cron_job_id"] == "job-1"
+    assert message["cron_job_name"] == "Daily check"
+    assert message["cron_run_id"] == "job-1:1"
+    assert message["cron_prompt_ref"] == prompt_ref
+
+
+def test_clean_generated_title_strips_reasoning_tags() -> None:
+    assert clean_generated_title("<think>reasoning</think> WebUI polish") == "WebUI polish"
+    assert clean_generated_title("Title: <think> The user said hello") == ""
 
 
 @pytest.mark.asyncio
@@ -120,6 +172,31 @@ async def test_generate_webui_title_ignores_command_only_sessions(tmp_path: Path
     generated = await maybe_generate_webui_title(
         sessions=loop.sessions,
         session_key="websocket:command-title",
+        provider=loop.provider,
+        model=loop.model,
+    )
+
+    assert generated is False
+    assert WEBUI_TITLE_METADATA_KEY not in session.metadata
+    loop.provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_webui_title_ignores_cron_internal_turns(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:cron-title")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    session.add_message(
+        "user",
+        "Scheduled cron job triggered: 30s-test\n\nInternal reminder prompt",
+        **{CRON_HISTORY_META: True},
+    )
+    session.add_message("assistant", "提醒已经到期。")
+    loop.sessions.save(session)
+
+    generated = await maybe_generate_webui_title(
+        sessions=loop.sessions,
+        session_key="websocket:cron-title",
         provider=loop.provider,
         model=loop.model,
     )
@@ -270,11 +347,22 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
 
     loop._save_turn(
         session,
-        [{"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": content}],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": content},
+        ],
         skip=0,
     )
 
-    assert session.messages[0]["content"] == content
+    assert session.messages[1]["content"] == content
 
 
 def test_save_turn_stamps_latency_on_last_assistant() -> None:
@@ -555,6 +643,226 @@ async def test_process_message_does_not_duplicate_early_persisted_user_message(t
 
 
 @pytest.mark.asyncio
+async def test_internal_continuation_queues_turn_without_fake_user_history(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("feishu:c-auto")
+    session.metadata[GOAL_STATE_KEY] = {
+        "status": "active",
+        "objective": "Finish the long goal.",
+    }
+    loop.sessions.save(session)
+
+    calls: list[dict] = []
+
+    async def fake_run_agent_loop(initial_messages, *, metadata=None, **_kwargs):
+        calls.append({"initial_messages": initial_messages, "metadata": metadata})
+        if len(calls) == 1:
+            return (
+                "paused",
+                [],
+                [*initial_messages, {"role": "assistant", "content": "paused"}],
+                    "max_iterations",
+                    False,
+                )
+        return (
+            "done",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "done"}],
+                "completed",
+                False,
+            )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+    pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+
+    first = await loop._process_message(
+        InboundMessage(
+            channel="feishu",
+            sender_id="u1",
+            chat_id="c-auto",
+            content="start the goal",
+        ),
+        pending_queue=pending,
+    )
+
+    assert first is None
+    queued = pending.get_nowait()
+    assert queued.sender_id == "system:continuation"
+    assert queued.metadata[INTERNAL_CONTINUATION_META] is True
+    assert "Finish the long goal." in queued.content
+
+    session = loop.sessions.get_or_create("feishu:c-auto")
+    assert [
+        {k: v for k, v in m.items() if k in {"role", "content"}}
+        for m in session.messages
+    ] == [{"role": "user", "content": "start the goal"}]
+
+    second = await loop._process_message(queued, pending_queue=asyncio.Queue())
+
+    assert second is not None
+    assert second.content == "done"
+    session = loop.sessions.get_or_create("feishu:c-auto")
+    assert [
+        {k: v for k, v in m.items() if k in {"role", "content"}}
+        for m in session.messages
+    ] == [
+        {"role": "user", "content": "start the goal"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internal_continuation_preserves_streaming_route_metadata(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("feishu:c-stream")
+    session.metadata[GOAL_STATE_KEY] = {
+        "status": "active",
+        "objective": "Finish the streamed long goal.",
+    }
+    loop.sessions.save(session)
+
+    calls = 0
+
+    async def fake_run_agent_loop(initial_messages, *, on_stream=None, on_stream_end=None, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                "paused",
+                [],
+                [*initial_messages, {"role": "assistant", "content": "paused"}],
+                    "max_iterations",
+                    False,
+                )
+        assert on_stream is not None
+        assert on_stream_end is not None
+        await on_stream("done")
+        await on_stream_end(resuming=False)
+        return (
+            "done",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "done"}],
+            "completed",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    await loop._dispatch(InboundMessage(
+        channel="feishu",
+        sender_id="u1",
+        chat_id="c-stream",
+        content="start the goal",
+        metadata={
+            "_wants_stream": True,
+            "message_id": "om_001",
+            "origin_message_id": "root_001",
+            "_stream_id": "old-stream",
+        },
+    ))
+
+    assert loop.bus.outbound_size == 0
+    queued = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+    assert queued.metadata[INTERNAL_CONTINUATION_META] is True
+    assert queued.metadata["_wants_stream"] is True
+    assert queued.metadata["message_id"] == "om_001"
+    assert queued.metadata["origin_message_id"] == "root_001"
+    assert "_stream_id" not in queued.metadata
+
+    await loop._dispatch(queued)
+
+    outbound = []
+    while loop.bus.outbound_size:
+        outbound.append(await loop.bus.consume_outbound())
+    deltas = [m for m in outbound if m.metadata.get("_stream_delta")]
+    ends = [m for m in outbound if m.metadata.get("_stream_end")]
+    streamed_markers = [m for m in outbound if m.metadata.get("_streamed")]
+
+    assert [m.content for m in deltas] == ["done"]
+    assert len(ends) == 1
+    assert ends[0].metadata["_resuming"] is False
+    assert ends[0].metadata["message_id"] == "om_001"
+    assert ends[0].metadata["origin_message_id"] == "root_001"
+    assert isinstance(ends[0].metadata.get("_stream_id"), str)
+    assert streamed_markers and streamed_markers[-1].content == "done"
+
+
+@pytest.mark.asyncio
+async def test_websocket_internal_continuation_keeps_single_visible_run(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("websocket:c-auto")
+    session.metadata[GOAL_STATE_KEY] = {
+        "status": "active",
+        "objective": "Finish the long goal.",
+    }
+    loop.sessions.save(session)
+
+    calls = 0
+
+    async def fake_run_agent_loop(initial_messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                "paused",
+                [],
+                [*initial_messages, {"role": "assistant", "content": "paused"}],
+                    "max_iterations",
+                    False,
+                )
+        return (
+            "done",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "done"}],
+            "completed",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    await loop._dispatch(InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="c-auto",
+        content="start the goal",
+        metadata={"webui": True},
+    ))
+
+    first_outbound = []
+    while loop.bus.outbound_size:
+        first_outbound.append(await loop.bus.consume_outbound())
+    first_statuses = [m.metadata for m in first_outbound if m.metadata.get("_goal_status")]
+    assert [m["goal_status"] for m in first_statuses] == ["running"]
+    assert not [m for m in first_outbound if m.metadata.get("_turn_end")]
+    started_at = first_statuses[0]["started_at"]
+
+    queued = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+    assert queued.metadata[INTERNAL_CONTINUATION_META] is True
+    assert queued.metadata[INTERNAL_CONTINUATION_RUN_STARTED_AT_META] == started_at
+
+    await loop._dispatch(queued)
+
+    second_outbound = []
+    while loop.bus.outbound_size:
+        second_outbound.append(await loop.bus.consume_outbound())
+    second_statuses = [m.metadata for m in second_outbound if m.metadata.get("_goal_status")]
+    assert [m["goal_status"] for m in second_statuses] == ["running", "idle"]
+    assert second_statuses[0]["started_at"] == started_at
+    turn_end = [m for m in second_outbound if m.metadata.get("_turn_end")]
+    assert len(turn_end) == 1
+    assert isinstance(turn_end[0].metadata.get("latency_ms"), int)
+
+
+@pytest.mark.asyncio
 async def test_process_message_uses_context_chat_id_for_runtime_prompt(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
@@ -602,17 +910,17 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     chat_session = loop.sessions.get_or_create("websocket:chat-with-goal")
     chat_session.metadata[GOAL_STATE_KEY] = {
         "status": "active",
-        "objective": "This chat goal must not leak into heartbeat.",
+        "objective": "This chat goal must not leak into system.",
     }
     loop.sessions.save(chat_session)
-    system_session = loop.sessions.get_or_create("heartbeat")
+    system_session = loop.sessions.get_or_create("system")
     system_session.metadata = {}
     loop.sessions.save(system_session)
 
     loop.context.build_messages = MagicMock(  # type: ignore[method-assign]
         return_value=[
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "runtime + heartbeat"},
+            {"role": "user", "content": "runtime + system"},
         ]
     )
     loop._run_agent_loop = AsyncMock(return_value=(  # type: ignore[method-assign]
@@ -620,7 +928,7 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
         [],
         [
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "runtime + heartbeat"},
+            {"role": "user", "content": "runtime + system"},
             {"role": "assistant", "content": "ok"},
         ],
         "stop",
@@ -630,11 +938,11 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     result = await loop._process_message(
         InboundMessage(
             channel="websocket",
-            sender_id="heartbeat",
+            sender_id="system",
             chat_id="chat-with-goal",
-            content="heartbeat work",
+            content="system work",
         ),
-        session_key="heartbeat",
+        session_key="system",
     )
 
     assert result is not None
@@ -643,6 +951,41 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     assert kwargs["chat_id"] == "chat-with-goal"
     assert kwargs["session_metadata"] is system_session.metadata
     assert GOAL_STATE_KEY not in kwargs["session_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_goal_continue_message_reads_latest_metadata(
+    tmp_path: Path,
+) -> None:
+    from nanobot.agent.runner import AgentRunResult
+
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:late-goal")
+    seen: dict[str, str | None] = {}
+
+    async def fake_run(spec):
+        assert callable(spec.goal_continue_message)
+        session.metadata[GOAL_STATE_KEY] = {
+            "status": "active",
+            "objective": "Goal created during this runner call.",
+        }
+        seen["goal_continue"] = spec.goal_continue_message()
+        return AgentRunResult(
+            final_content="ok",
+            messages=[{"role": "assistant", "content": "ok"}],
+        )
+
+    loop.runner.run = fake_run  # type: ignore[method-assign]
+
+    await loop._run_agent_loop(
+        [],
+        session=session,
+        channel="websocket",
+        chat_id="late-goal",
+        session_key=session.key,
+    )
+
+    assert "Goal created during this runner call." in (seen["goal_continue"] or "")
 
 
 def test_set_tool_context_uses_effective_key_for_spawn_tool(tmp_path: Path) -> None:
@@ -1042,3 +1385,146 @@ async def test_system_subagent_followup_uses_thread_session_and_slack_metadata(t
     loop.sessions.invalidate("slack:C123:1700.42")
     persisted = loop.sessions.get_or_create("slack:C123:1700.42")
     assert any(m.get("subagent_task_id") == "sub-1" for m in persisted.messages)
+
+
+@pytest.mark.asyncio
+async def test_turn_after_unanswered_user_keeps_tool_call_pairing(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("feishu:c-merge")
+    session.add_message("user", "earlier question that never got an answer")
+    loop.sessions.save(session)
+
+    async def fake_run_agent_loop(initial_messages, **_kwargs):
+        assert [m["role"] for m in initial_messages] == ["system", "user"]
+        return (
+            "done",
+            [],
+            [
+                *initial_messages,
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_ls",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": '{"command": "ls"}'},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_ls", "name": "exec", "content": "file.txt"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "stop",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="feishu", sender_id="u1", chat_id="c-merge", content="and another thing"
+        )
+    )
+
+    assert result is not None
+    loop.sessions.invalidate("feishu:c-merge")
+    persisted = loop.sessions.get_or_create("feishu:c-merge")
+
+    declared: set[str] = set()
+    for message in persisted.messages:
+        if message.get("role") == "assistant":
+            declared.update(
+                str(tc["id"]) for tc in message.get("tool_calls") or [] if tc.get("id")
+            )
+        if message.get("role") == "tool":
+            assert str(message.get("tool_call_id")) in declared, (
+                f"orphaned tool result {message.get('tool_call_id')!r}: "
+                f"{[m.get('role') for m in persisted.messages]}"
+            )
+    assert [m["role"] for m in persisted.messages] == [
+        "user", "user", "assistant", "tool", "assistant",
+    ]
+
+
+def test_save_turn_keeps_placeholder_for_empty_tool_result_blocks() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:empty-tool-blocks")
+
+    loop._save_turn(
+        session,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_empty", "name": "exec", "content": []},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["assistant", "tool"]
+    assert session.messages[1]["content"] == [
+        {"type": "text", "text": "[tool result omitted during persistence]"}
+    ]
+
+
+def test_save_turn_drops_orphaned_tool_results() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:orphan-guard")
+    session.add_message("user", "hi")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "tool", "tool_call_id": "call_ghost", "name": "exec", "content": "boo"},
+            {"role": "assistant", "content": "done"},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]
+
+
+def test_save_turn_drops_tool_results_without_tool_call_id() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:missing-tool-call-id")
+    session.add_message("user", "hi")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "tool", "name": "exec", "content": "missing id"},
+            {"role": "assistant", "content": "done"},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]
+
+
+def test_save_turn_keeps_tool_results_declared_in_prior_history() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:prior-declared")
+    session.add_message(
+        "assistant",
+        "working",
+        tool_calls=[{
+            "id": "call_prior",
+            "type": "function",
+            "function": {"name": "exec", "arguments": "{}"},
+        }],
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "tool", "tool_call_id": "call_prior", "name": "exec", "content": "ok"}],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["assistant", "tool"]

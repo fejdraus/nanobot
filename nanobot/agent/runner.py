@@ -6,13 +6,14 @@ import asyncio
 import inspect
 import os
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
 
-from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -43,6 +44,7 @@ from nanobot.utils.progress_events import (
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+    build_budget_exhausted_finalization_message,
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
@@ -52,7 +54,13 @@ from nanobot.utils.runtime import (
     repeated_workspace_violation_error,
 )
 
+GoalContinueMessage = str | Callable[[], str | None]
+
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
+_ARREARAGE_ERROR_MESSAGE = (
+    "The AI provider rejected the request because the API key is out of quota or the "
+    "account is in arrears. Please top up / check the billing status of your API key and try again."
+)
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
@@ -65,6 +73,8 @@ _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
     "web_search", "web_fetch", "list_dir", "list_exec_sessions",
 })
+# read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
+_TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 
 # Backward-compatible module attribute for tests/extensions that monkeypatch
@@ -101,7 +111,8 @@ class AgentRunSpec:
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
-    goal_continue_message: str | None = None
+    goal_continue_message: GoalContinueMessage | None = None
+    finalize_on_max_iterations: bool = True
 
 
 @dataclass(slots=True)
@@ -189,7 +200,7 @@ class AgentRunner:
         if not injections and allow_goal_continue and assistant_message is not None:
             predicate = spec.goal_active_predicate
             if predicate is not None and predicate():
-                injections = [build_goal_continue_message(spec.goal_continue_message)]
+                injections = [self._build_goal_continue_message(spec)]
         if not injections:
             return False, injection_cycles
         if real_injection:
@@ -217,6 +228,16 @@ class AgentRunner:
         else:
             logger.info("Injected sustained-goal continuation {}", phase)
         return True, injection_cycles
+
+    def _build_goal_continue_message(self, spec: AgentRunSpec) -> dict[str, str]:
+        custom = spec.goal_continue_message
+        if callable(custom):
+            try:
+                custom = custom()
+            except Exception:
+                logger.exception("goal_continue_message callback failed")
+                custom = None
+        return build_goal_continue_message(custom)
 
     async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
         """Drain pending user messages via the injection callback.
@@ -248,12 +269,17 @@ class AgentRunner:
             return []
         injected_messages: list[dict[str, Any]] = []
         for item in items:
-            if isinstance(item, dict) and item.get("role") == "user" and "content" in item:
-                injected_messages.append(item)
+            if item is None:
                 continue
-            text = getattr(item, "content", str(item))
-            if text.strip():
-                injected_messages.append({"role": "user", "content": text})
+            if isinstance(item, dict) and item.get("role") == "user" and "content" in item:
+                if self._has_injection_content(item.get("content")):
+                    injected_messages.append(item)
+                continue
+            if isinstance(item, dict):
+                continue
+            content = getattr(item, "content") if hasattr(item, "content") else str(item)
+            if self._has_injection_content(content):
+                injected_messages.append({"role": "user", "content": content})
         if len(injected_messages) > _MAX_INJECTIONS_PER_TURN:
             dropped = len(injected_messages) - _MAX_INJECTIONS_PER_TURN
             logger.warning(
@@ -263,9 +289,70 @@ class AgentRunner:
             injected_messages = injected_messages[:_MAX_INJECTIONS_PER_TURN]
         return injected_messages
 
+    @staticmethod
+    def _has_injection_content(content: Any) -> bool:
+        if content is None:
+            return False
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, list):
+            return bool(content)
+        return True
+
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
+        context = AgentRunHookContext(messages=deepcopy(messages))
+
+        try:
+            await hook.before_run(context)
+            result = await self._run_core(spec, hook, messages)
+        except asyncio.CancelledError as exc:
+            context.messages = deepcopy(messages)
+            context.stop_reason = "cancelled"
+            context.error = None
+            context.exception = exc
+            raise
+        except Exception as exc:
+            context.messages = deepcopy(messages)
+            context.stop_reason = "error"
+            context.error = f"Error: {type(exc).__name__}: {exc}"
+            context.exception = exc
+            await hook.on_error(context)
+            raise
+        else:
+            context.messages = deepcopy(result.messages)
+            context.final_content = result.final_content
+            context.tools_used = list(result.tools_used)
+            context.usage = dict(result.usage)
+            context.stop_reason = result.stop_reason
+            context.error = result.error
+            context.tool_events = deepcopy(result.tool_events)
+            context.had_injections = result.had_injections
+            context.exception = None
+            if context.error is not None:
+                await hook.on_error(context)
+            await hook.after_run(context)
+            return result
+        finally:
+            context.messages = deepcopy(messages)
+            if context.exception is None:
+                await hook.on_finally(context)
+            else:
+                try:
+                    await hook.on_finally(context)
+                except Exception:
+                    logger.exception(
+                        "AgentHook.on_finally error after {}",
+                        context.stop_reason or "run exception",
+                    )
+
+    async def _run_core(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        messages: list[dict[str, Any]],
+    ) -> AgentRunResult:
         final_content: str | None = None
         tools_used: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -305,14 +392,15 @@ class AgentRunner:
                     messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                 except Exception:
                     messages_for_model = messages
-            context = AgentHookContext(iteration=iteration, messages=messages)
+            context = AgentHookContext(
+                iteration=iteration,
+                messages=messages,
+                session_key=spec.session_key,
+            )
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
-            raw_usage = self._usage_dict(response.usage)
             context.response = response
-            context.usage = dict(raw_usage)
             context.tool_calls = list(response.tool_calls)
-            self._accumulate_usage(usage, raw_usage)
 
             reasoning_text, cleaned_content = extract_reasoning(
                 response.reasoning_content,
@@ -320,6 +408,9 @@ class AgentRunner:
                 response.content,
             )
             response.content = cleaned_content
+            raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
+            context.usage = dict(raw_usage)
+            self._accumulate_usage(usage, raw_usage)
             if reasoning_text and not context.streamed_reasoning:
                 await hook.emit_reasoning(reasoning_text)
                 await hook.emit_reasoning_end()
@@ -337,7 +428,6 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
                 messages.append(assistant_message)
-                tools_used.extend(tc.name for tc in response.tool_calls)
                 await self._emit_checkpoint(
                     spec,
                     {
@@ -359,6 +449,11 @@ class AgentRunner:
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                tools_used.extend(
+                    tool_call.name
+                    for tool_call, event in zip(response.tool_calls, new_events)
+                    if event.get("status") == "ok"
+                )
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
@@ -446,8 +541,9 @@ class AgentRunner:
                 )
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=False)
+                retry_messages = self._finalization_retry_messages(messages_for_model)
                 response = await self._request_finalization_retry(spec, messages_for_model)
-                retry_usage = self._usage_dict(response.usage)
+                retry_usage = self._usage_or_estimate(spec, retry_messages, response)
                 self._accumulate_usage(usage, retry_usage)
                 raw_usage = self._merge_usage(raw_usage, retry_usage)
                 context.response = response
@@ -504,7 +600,10 @@ class AgentRunner:
                 continue
 
             if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+                if LLMProvider.is_arrearage_response(response):
+                    final_content = _ARREARAGE_ERROR_MESSAGE
+                else:
+                    final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
                 self._append_model_error_placeholder(messages)
@@ -561,28 +660,28 @@ class AgentRunner:
             break
         else:
             stop_reason = "max_iterations"
-            if spec.max_iterations_message:
-                final_content = spec.max_iterations_message.format(
-                    max_iterations=spec.max_iterations,
-                )
-            else:
-                final_content = render_template(
-                    "agent/max_iterations_message.md",
-                    strip=True,
-                    max_iterations=spec.max_iterations,
-                )
-            self._append_final_message(messages, final_content)
             # Drain any remaining injections so they are appended to the
             # conversation history instead of being re-published as
             # independent inbound messages by _dispatch's finally block.
-            # We ignore should_continue here because the for-loop has already
-            # exhausted all iterations.
+            # We include them before the no-tools finalization pass so the
+            # final response can account for every known follow-up.
             drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
                 spec, messages, None, injection_cycles,
                 phase="after max_iterations",
             )
             if drained_after_max_iterations:
                 had_injections = True
+            final_content = None
+            if spec.finalize_on_max_iterations:
+                final_content = await self._try_finalize_after_max_iterations(
+                    spec,
+                    hook,
+                    messages,
+                    usage,
+                )
+            if final_content is None:
+                final_content = self._max_iterations_fallback(spec)
+            self._append_final_message(messages, final_content)
 
         return AgentRunResult(
             final_content=final_content,
@@ -682,11 +781,15 @@ class AgentRunner:
                 context.streamed_reasoning = True
                 await hook.emit_reasoning(delta)
 
+            async def _stream_recover() -> None:
+                await hook.on_stream_end(context, resuming=True)
+
             coro = self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
                 on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
+                on_stream_recover=_stream_recover,
             )
         elif wants_progress_streaming:
             stream_buf = ""
@@ -760,10 +863,127 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ):
+        retry_messages = self._finalization_retry_messages(messages)
+        return await self._request_no_tools(spec, retry_messages)
+
+    @staticmethod
+    def _finalization_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
-        kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
+        return retry_messages
+
+    async def _try_finalize_after_max_iterations(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        messages: list[dict[str, Any]],
+        usage: dict[str, int],
+    ) -> str | None:
+        retry_messages = self._budget_exhausted_finalization_messages(messages)
+        try:
+            response = await self._request_no_tools(spec, retry_messages)
+        except Exception:
+            logger.exception(
+                "Budget-exhausted finalization failed for {}; using fallback",
+                spec.session_key or "default",
+            )
+            return None
+
+        raw_usage = self._usage_or_estimate(spec, retry_messages, response)
+        self._accumulate_usage(usage, raw_usage)
+        if response.finish_reason == "error" or response.has_tool_calls:
+            logger.warning(
+                "Budget-exhausted finalization returned finish_reason='{}' "
+                "with {} tool call(s) for {}; using fallback",
+                response.finish_reason,
+                len(response.tool_calls),
+                spec.session_key or "default",
+            )
+            return None
+
+        context = AgentHookContext(
+            iteration=spec.max_iterations,
+            messages=messages,
+            response=response,
+            usage=dict(raw_usage),
+            session_key=spec.session_key,
+        )
+        clean = hook.finalize_content(context, response.content)
+        if is_blank_text(clean):
+            return None
+        return clean
+
+    async def _request_no_tools(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> LLMResponse:
+        kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
+
+    @staticmethod
+    def _budget_exhausted_finalization_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        retry_messages = list(messages)
+        retry_messages.append(build_budget_exhausted_finalization_message())
+        return retry_messages
+
+    @staticmethod
+    def _max_iterations_fallback(spec: AgentRunSpec) -> str:
+        if spec.max_iterations_message:
+            return spec.max_iterations_message.format(
+                max_iterations=spec.max_iterations,
+            )
+        return render_template(
+            "agent/max_iterations_message.md",
+            strip=True,
+            max_iterations=spec.max_iterations,
+        )
+
+    def _usage_or_estimate(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        response: LLMResponse,
+    ) -> dict[str, int]:
+        usage = self._usage_dict(response.usage)
+        total = self._usage_total(usage)
+        if total > 0:
+            usage["total_tokens"] = total
+            usage.setdefault("provider_tokens", total)
+            return usage
+        if response.finish_reason == "error":
+            return {}
+        return self._estimate_response_usage(spec, messages, response)
+
+    def _estimate_response_usage(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        response: LLMResponse,
+    ) -> dict[str, int]:
+        try:
+            tools = spec.tools.get_definitions()
+        except Exception:
+            tools = None
+        prompt_tokens, _ = estimate_prompt_tokens_chain(self.provider, spec.model, messages, tools)
+        assistant_message = build_assistant_message(
+            response.content or "",
+            tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        )
+        completion_tokens = estimate_message_tokens(assistant_message)
+        total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+        if total_tokens <= 0:
+            return {}
+        return {
+            "prompt_tokens": max(0, prompt_tokens),
+            "completion_tokens": max(0, completion_tokens),
+            "total_tokens": total_tokens,
+            "estimated_tokens": total_tokens,
+        }
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
@@ -776,6 +996,12 @@ class AgentRunner:
             except (TypeError, ValueError):
                 continue
         return result
+
+    @staticmethod
+    def _usage_total(usage: dict[str, int]) -> int:
+        return max(0, usage.get("total_tokens", 0) or (
+            usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        ))
 
     @staticmethod
     def _accumulate_usage(target: dict[str, int], addition: dict[str, int]) -> None:
@@ -1107,6 +1333,9 @@ class AgentRunner:
         result: Any,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        if tool_name in _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
+            # Exempt tools bound their own output; skip generic offload and truncation.
+            return result
         try:
             content = maybe_persist_tool_result(
                 spec.workspace,
@@ -1273,7 +1502,13 @@ class AgentRunner:
             return messages
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
+        fixed_tokens, _ = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            system_messages,
+            spec.tools.get_definitions(),
+        )
+        remaining_budget = max(0, budget - max(system_tokens, fixed_tokens))
         kept: list[dict[str, Any]] = []
         kept_tokens = 0
         for message in reversed(non_system):

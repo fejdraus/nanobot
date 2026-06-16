@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import pydantic
-from loguru import logger
 from pydantic import BaseModel
 
 from nanobot.config.schema import Config, _resolve_tool_config_refs
@@ -67,8 +66,7 @@ def load_config(config_path: Path | None = None) -> Config:
             data = _migrate_config(data)
             config = Config.model_validate(data)
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
-            logger.warning("Failed to load config from {}: {}", path, e)
-            logger.warning("Using default configuration.")
+            raise ValueError(f"Failed to load config from {path}: {e}") from e
 
     _apply_ssrf_whitelist(config)
     return config
@@ -104,10 +102,9 @@ _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 def resolve_config_env_vars(config: Config) -> Config:
     """Return *config* with ``${VAR}`` env-var references resolved.
 
-    Walks in place so fields declared with ``exclude=True`` (e.g.
-    ``DreamConfig.cron``) survive; returns the same instance when no
-    references are present. Raises ``ValueError`` if a referenced
-    variable is not set.
+    Walks in place so fields declared with ``exclude=True`` survive;
+    returns the same instance when no references are present.
+    Raises ``ValueError`` if a referenced variable is not set.
     """
     return _resolve_in_place(config)
 

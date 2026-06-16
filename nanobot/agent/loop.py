@@ -9,6 +9,7 @@ import time
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -18,40 +19,52 @@ from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.memory import Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
+from nanobot.bus.runtime_events import (
+    RuntimeEventBus,
+    RuntimeEventPublisher,
+    ensure_runtime_event_publisher,
+)
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.cron.session_turns import (
+    cron_history_overrides,
+)
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.security.workspace_access import (
+    WorkspaceScopeResolver,
+    bind_workspace_scope,
+    reset_workspace_scope,
+)
+from nanobot.session import turn_continuation
 from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
 )
+from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
 from nanobot.session.manager import Session, SessionManager
-from nanobot.session.webui_turns import (
-    WebuiTurnCoordinator,
-    build_bus_progress_callback,
-    mark_webui_session,
-)
-from nanobot.utils.document import extract_documents
+from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
-    SUSTAINED_GOAL_CONTINUE_PROMPT,
 )
 
 if TYPE_CHECKING:
@@ -62,8 +75,6 @@ if TYPE_CHECKING:
     )
     from nanobot.cron.service import CronService
 
-
-UNIFIED_SESSION_KEY = "unified:default"
 
 class TurnState(Enum):
     RESTORE = auto()
@@ -106,6 +117,7 @@ class TurnContext:
     save_skip: int = 0
 
     outbound: OutboundMessage | None = None
+    suppress_response: bool = False
 
     on_progress: Callable[..., Awaitable[None]] | None = None
     on_stream: Callable[[str], Awaitable[None]] | None = None
@@ -115,7 +127,11 @@ class TurnContext:
     pending_queue: asyncio.Queue | None = None
     pending_summary: str | None = None
 
+    ephemeral: bool = False
+    tools: ToolRegistry | None = None
+
     turn_wall_started_at: float = field(default_factory=time.time)
+    visible_run_started_at: float | None = None
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
@@ -195,6 +211,7 @@ class AgentLoop:
         model_presets: dict[str, ModelPresetConfig] | None = None,
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
+        runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
@@ -202,6 +219,8 @@ class AgentLoop:
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         self.bus = bus
+        self.runtime_events = runtime_events or RuntimeEventBus()
+        self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
         self.channels_config = channels_config
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
@@ -241,18 +260,16 @@ class AgentLoop:
             self._image_generation_provider_configs["openrouter"] = image_generation_provider_config
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.workspace_scopes = WorkspaceScopeResolver(
+            default_workspace=workspace,
+            default_restrict_to_workspace=restrict_to_workspace,
+        )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
-        self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
-        self._webui_turns = WebuiTurnCoordinator(
-            bus=self.bus,
-            sessions=self.sessions,
-            schedule_background=lambda coro: self._schedule_background(coro),
-        )
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
@@ -285,6 +302,11 @@ class AgentLoop:
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        self._cron_turns = CronTurnCoordinator(
+            publish_inbound=self.bus.publish_inbound,
+            dispatch=self._dispatch,
+            is_running=lambda: self._running,
+        )
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -300,16 +322,12 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            unified_session=unified_session,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
-        )
-        self.dream = Dream(
-            store=self.context.memory,
-            provider=provider,
-            model=self.model,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -399,10 +417,14 @@ class AgentLoop:
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
-        self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
+                self.model,
+                model_preset if model_preset is not None else self.model_preset,
+            )
+        if publish_update:
+            self._runtime_events().runtime_model_changed(
                 self.model,
                 model_preset if model_preset is not None else self.model_preset,
             )
@@ -470,6 +492,8 @@ class AgentLoop:
             provider_snapshot_loader=self._provider_snapshot_loader,
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
+            workspace_sandbox=self.workspace_scopes.sandbox_status,
+            runtime_events=self.runtime_events,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -493,15 +517,13 @@ class AgentLoop:
         session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
-        from nanobot.agent.tools.context import ContextAware, RequestContext
+        from nanobot.agent.tools.context import ContextAware
 
-        if session_key is not None:
-            effective_key = session_key
-        elif self._unified_session:
-            effective_key = UNIFIED_SESSION_KEY
-        else:
-            effective_key = f"{channel}:{chat_id}"
-
+        effective_key = session_key or session_key_for_channel(
+            channel,
+            chat_id,
+            unified_session=self._unified_session,
+        )
         request_ctx = RequestContext(
             channel=channel,
             chat_id=chat_id,
@@ -545,6 +567,15 @@ class AgentLoop:
 
         return _on_retry_wait
 
+    def _runtime_events(self) -> RuntimeEventPublisher:
+        return ensure_runtime_event_publisher(self)
+
+    async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
+        return await self._cron_turns.submit(msg)
+
+    def pending_cron_job_ids_for_session(self, session_key: str) -> set[str]:
+        return self._cron_turns.pending_job_ids_for_session(session_key)
+
     def _persist_user_message_early(
         self,
         msg: InboundMessage,
@@ -555,12 +586,18 @@ class AgentLoop:
 
         Returns True if the message was persisted.
         """
+        if not turn_continuation.should_persist_user_message(msg.metadata):
+            return False
         media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(msg.content, str) and msg.content.strip()
         if has_text or media_paths:
             extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
             extra.update(kwargs)
             text = msg.content if isinstance(msg.content, str) else ""
+            text_override, cron_extra = cron_history_overrides(msg.metadata)
+            if text_override is not None:
+                text = text_override
+            extra.update(cron_extra)
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
@@ -573,8 +610,10 @@ class AgentLoop:
         session: Session,
         history: list[dict[str, Any]],
         pending_summary: str | None,
+        include_memory_recent_history: bool = True,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
+        scope = self.workspace_scopes.for_message(msg, session.metadata)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -583,7 +622,13 @@ class AgentLoop:
             chat_id=self._runtime_chat_id(msg),
             sender_id=msg.sender_id,
             session_summary=pending_summary,
-            session_metadata=session.metadata, current_runtime_lines=agent_context.runtime_lines(self, msg, self.context.workspace),
+            session_metadata=session.metadata,
+            workspace=scope.project_path,
+            runtime_state=self,
+            inbound_message=msg,
+            include_memory_recent_history=include_memory_recent_history,
+            session_key=session.key,
+            unified_session=self._unified_session,
         )
 
     async def _dispatch_command_inline(
@@ -647,6 +692,8 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        ephemeral: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -672,9 +719,9 @@ class AgentLoop:
             set_tool_context=self._set_tool_context,
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
         )
-        hook: AgentHook = (
-            CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
-        )
+        hook: AgentHook = loop_hook
+        if not ephemeral and self._extra_hooks:
+            hook = CompositeHook([loop_hook] + self._extra_hooks)
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -697,7 +744,7 @@ class AgentLoop:
                 content = pending_msg.content
                 media = pending_msg.media if pending_msg.media else None
                 if media:
-                    content, media = extract_documents(content, media)
+                    content, media = self._prepare_message_media(content, media)
                     media = media or None
                 user_content = self.context._build_user_content(content, media)
                 return {"role": "user", "content": user_content}
@@ -733,27 +780,45 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        effective_scope = self.workspace_scopes.for_turn(
+            channel=channel,
+            message_metadata=metadata,
+            session_metadata=session.metadata if session is not None else None,
+        )
+        request_ctx = RequestContext(
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=active_session_key,
+            metadata=dict(metadata or {}),
+        )
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
-        # Build continuation message that embeds the active goal objective so
-        # the LLM can see it even if earlier Runtime Context was truncated.
-        _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
-        _goal_continue = (
-            "You have an active sustained goal:\n\n"
-            + "\n".join(_goal_lines)
-            + "\n\nPlease continue working toward the objective using your tools, "
-            "or call complete_goal if the work is truly finished."
-        ) if _goal_lines else SUSTAINED_GOAL_CONTINUE_PROMPT
+        request_token = bind_request_context(request_ctx)
+        workspace_token = bind_workspace_scope(effective_scope)
+        # Compute lazily because long_task may create goal metadata during this run.
+        def _goal_continue() -> str | None:
+            _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
+            if not _goal_lines:
+                return None
+            return (
+                "You have an active sustained goal:\n\n"
+                + "\n".join(_goal_lines)
+                + "\n\nPlease continue working toward the objective using your tools, "
+                "or call complete_goal if the work is truly finished."
+            )
+
+        session_metadata = session.metadata if session is not None else None
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
-                tools=self.tools,
+                tools=tools or self.tools,
                 model=self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
                 concurrent_tools=True,
-                workspace=self.workspace,
+                workspace=effective_scope.project_path,
                 session_key=session.key if session else None,
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
@@ -768,19 +833,33 @@ class AgentLoop:
                 llm_timeout_s=runner_wall_llm_timeout_s(
                     self.sessions,
                     session.key if session is not None else session_key,
-                    metadata=(session.metadata if session is not None else None),
+                    metadata=session_metadata,
+                    message_metadata=metadata,
                 ),
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
+                finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
+                    pending_queue_available=pending_queue is not None and session is not None,
+                    session_metadata=session_metadata,
+                    message_metadata=metadata,
+                ),
             ))
         finally:
+            reset_workspace_scope(workspace_token)
+            reset_request_context(request_token)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
+            should_stream = turn_continuation.should_stream_budget_response(
+                stop_reason=result.stop_reason,
+                pending_queue_available=pending_queue is not None and session is not None,
+                session_metadata=session_metadata,
+                message_metadata=metadata,
+            )
             # Push final content through stream so streaming channels (e.g. Feishu)
             # update the card instead of leaving it empty.
-            if on_stream and on_stream_end:
+            if on_stream and on_stream_end and should_stream:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
@@ -812,16 +891,26 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            raw = msg.content.strip()
+            effective_key = self._effective_session_key(msg)
             if await agent_context.handle_runtime_control(self, msg, self.tools):
                 continue
-            raw = msg.content.strip()
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
-                    msg, msg.session_key, raw,
+                    msg, effective_key, raw,
                     self.commands.dispatch_priority,
                 )
                 continue
-            effective_key = self._effective_session_key(msg)
+            if self._cron_turns.defer_if_active(
+                msg,
+                session_key=effective_key,
+                active_session_keys=self._pending_queues.keys(),
+            ):
+                logger.info(
+                    "Deferred cron turn for active session {}",
+                    effective_key,
+                )
+                continue
             # If this session already has an active pending queue (i.e. a task
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
@@ -872,13 +961,13 @@ class AgentLoop:
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
-        # Register a pending queue so follow-up messages for this session are
-        # routed here (mid-turn injection) instead of spawning a new task.
-        pending = asyncio.Queue(maxsize=20)
-        self._pending_queues[session_key] = pending
-
+        pending: asyncio.Queue | None = None
         try:
             async with lock, gate:
+                # Only the task that owns the session lock may publish the
+                # active mid-turn injection queue for this session.
+                pending = asyncio.Queue(maxsize=20)
+                self._pending_queues[session_key] = pending
                 try:
                     on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
@@ -916,21 +1005,31 @@ class AgentLoop:
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
+                    completed_channel = msg.channel
+                    completed_chat_id = msg.chat_id
                     if response is not None:
                         await self.bus.publish_outbound(response)
+                        completed_channel = response.channel
+                        completed_chat_id = response.chat_id
                     elif msg.channel == "cli":
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
-                    if msg.channel == "websocket":
-                        turn_lat = self._pending_turn_latency_ms.pop(session_key, None)
-                        await self._webui_turns.handle_turn_end(
-                            msg,
+                    continuing = turn_continuation.internal_continuation_pending(msg.metadata)
+                    if not continuing:
+                        await self._runtime_events().turn_completed(
+                            channel=completed_channel,
+                            chat_id=completed_chat_id,
                             session_key=session_key,
-                            latency_ms=turn_lat,
+                            metadata=msg.metadata,
                         )
+                    self._cron_turns.complete(msg, response=response)
                 except asyncio.CancelledError:
+                    self._cron_turns.complete(
+                        msg,
+                        error=asyncio.CancelledError(),
+                    )
                     logger.info("Task cancelled for session {}", session_key)
                     # Preserve partial context from the interrupted turn so
                     # the user does not lose tool results and assistant
@@ -956,34 +1055,58 @@ class AgentLoop:
                             exc_info=True,
                         )
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.exception("Error processing message for session {}", session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="Sorry, I encountered an error.",
                     ))
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self._runtime_events().turn_completed(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            session_key=session_key,
+                            metadata=msg.metadata,
+                        )
+                    self._cron_turns.complete(msg, error=exc)
+                finally:
+                    # Drain any messages still in the pending queue and re-publish
+                    # them to the bus so they are processed as fresh inbound messages
+                    # rather than silently lost.  Only remove our own queue; a
+                    # later task waiting on the lock must not be able to steal
+                    # cleanup ownership.
+                    queue = None
+                    if self._pending_queues.get(session_key) is pending:
+                        queue = self._pending_queues.pop(session_key, None)
+                    else:
+                        queue = pending
+                    if queue is not None:
+                        leftover = 0
+                        while True:
+                            try:
+                                item = queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            await self.bus.publish_inbound(item)
+                            leftover += 1
+                        if leftover:
+                            logger.info(
+                                "Re-published {} leftover message(s) to bus for session {}",
+                                leftover, session_key,
+                            )
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self._runtime_events().run_status_changed(
+                            msg, session_key, "idle"
+                        )
+                        self._runtime_events().clear_turn(session_key)
+                    await self._cron_turns.publish_next_deferred(session_key)
         finally:
-            # Drain any messages still in the pending queue and re-publish
-            # them to the bus so they are processed as fresh inbound messages
-            # rather than silently lost.
-            queue = self._pending_queues.pop(session_key, None)
-            if queue is not None:
-                leftover = 0
-                while True:
-                    try:
-                        item = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    await self.bus.publish_inbound(item)
-                    leftover += 1
-                if leftover:
-                    logger.info(
-                        "Re-published {} leftover message(s) to bus for session {}",
-                        leftover, session_key,
-                    )
-            await self._webui_turns.publish_run_status(msg, "idle")
-            self._pending_turn_latency_ms.pop(session_key, None)
-            self._webui_turns.discard(session_key)
+            if pending is None:
+                await self._runtime_events().run_status_changed(
+                    msg, session_key, "idle"
+                )
+                self._runtime_events().clear_turn(session_key)
+                await self._cron_turns.publish_next_deferred(session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1052,6 +1175,7 @@ class AgentLoop:
         }
         history = session.get_history(**_hist_kwargs)
         current_role = "assistant" if is_subagent else "user"
+        workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
 
         messages = self.context.build_messages(
             history=history,
@@ -1061,7 +1185,13 @@ class AgentLoop:
             current_role=current_role,
             sender_id=msg.sender_id,
             session_summary=pending,
-            session_metadata=session.metadata, current_runtime_lines=agent_context.runtime_lines(self, msg, self.context.workspace, skip=is_subagent),
+            session_metadata=session.metadata,
+            workspace=workspace_scope.project_path,
+            runtime_state=self,
+            inbound_message=msg,
+            skip_runtime_lines=is_subagent,
+            session_key=key,
+            unified_session=self._unified_session,
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
@@ -1074,9 +1204,10 @@ class AgentLoop:
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
-        if channel == "websocket":
-            self._pending_turn_latency_ms[key] = latency_ms
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        self._runtime_events().record_turn_latency(key, latency_ms)
+        session.enforce_file_cap(
+            on_archive=partial(self.context.memory.raw_archive, session_key=key)
+        )
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(
@@ -1106,6 +1237,8 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
+        ephemeral: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
@@ -1121,16 +1254,23 @@ class AgentLoop:
             )
 
         key = session_key or msg.session_key
+        t0 = time.time()
         ctx = TurnContext(
             msg=msg,
             session=None,
             session_key=key,
             state=TurnState.RESTORE,
             turn_id=f"{key}:{time.time_ns()}",
+            turn_wall_started_at=t0,
+            visible_run_started_at=turn_continuation.internal_continuation_run_started_at(
+                msg.metadata,
+            ),
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             pending_queue=pending_queue,
+            ephemeral=ephemeral,
+            tools=tools,
         )
 
         while ctx.state is not TurnState.DONE:
@@ -1225,7 +1365,7 @@ class AgentLoop:
         msg = ctx.msg
 
         if msg.media:
-            new_content, image_only = extract_documents(msg.content, msg.media)
+            new_content, image_only = self._prepare_message_media(msg.content, msg.media)
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
             msg = ctx.msg
 
@@ -1236,7 +1376,8 @@ class AgentLoop:
         # ensure it exists in case this handler is invoked independently.
         if ctx.session is None:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
-        mark_webui_session(ctx.session, msg.metadata)
+        await self._runtime_events().session_turn_started(msg, ctx.session_key)
+        self.workspace_scopes.persist_message_scope(ctx.session, msg)
 
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
@@ -1244,6 +1385,16 @@ class AgentLoop:
             self.sessions.save(ctx.session)
 
         return "ok"
+
+    def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
+        if self._should_extract_document_text():
+            return extract_documents(content, media)
+        return reference_non_image_attachments(content, media)
+
+    def _should_extract_document_text(self) -> bool:
+        if self.channels_config is None:
+            return True
+        return self.channels_config.extract_document_text
 
     async def _state_compact(self, ctx: TurnContext) -> str:
         ctx.session, pending = self.auto_compact.prepare_session(ctx.session, ctx.session_key)
@@ -1276,10 +1427,11 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        await self.consolidator.maybe_consolidate_by_tokens(
-            ctx.session,
-            replay_max_messages=self._max_messages,
-        )
+        if not ctx.ephemeral:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                ctx.session,
+                replay_max_messages=self._max_messages,
+            )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -1297,14 +1449,17 @@ class AgentLoop:
             "include_timestamps": True,
         }
         ctx.history = ctx.session.get_history(**_hist_kwargs)
-        self._webui_turns.capture_title_context(
+        self._runtime_events().record_turn_runtime(
             ctx.session_key,
-            ctx.msg,
             self.llm_runtime(),
         )
 
         ctx.initial_messages = self._build_initial_messages(
-            ctx.msg, ctx.session, ctx.history, ctx.pending_summary
+            ctx.msg,
+            ctx.session,
+            ctx.history,
+            ctx.pending_summary,
+            include_memory_recent_history=not ctx.ephemeral,
         )
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg, ctx.session
@@ -1318,7 +1473,14 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
-        await self._webui_turns.publish_run_status(ctx.msg, "running")
+        if ctx.visible_run_started_at is None:
+            ctx.visible_run_started_at = time.time()
+        await self._runtime_events().run_status_changed(
+            ctx.msg,
+            ctx.session_key,
+            "running",
+            started_at=ctx.visible_run_started_at,
+        )
         result = await self._run_agent_loop(
             ctx.initial_messages,
             on_progress=ctx.on_progress,
@@ -1332,6 +1494,8 @@ class AgentLoop:
             metadata=ctx.msg.metadata,
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
+            ephemeral=ctx.ephemeral,
+            tools=ctx.tools,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1339,34 +1503,52 @@ class AgentLoop:
         ctx.all_messages = all_msgs
         ctx.stop_reason = stop_reason
         ctx.had_injections = had_injections
+        await turn_continuation.maybe_continue_turn(ctx)
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
-        if ctx.final_content is None or not ctx.final_content.strip():
+        turn_continuation.prepare_save_boundary(ctx)
+
+        if (
+            (ctx.final_content is None or not ctx.final_content.strip())
+            and not ctx.suppress_response
+        ):
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
-        ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
-
-        ctx.turn_latency_ms = max(0, int((time.time() - ctx.turn_wall_started_at) * 1000))
+        latency_started_at = (
+            ctx.visible_run_started_at
+            if turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
+            and ctx.visible_run_started_at is not None
+            else ctx.turn_wall_started_at
+        )
+        ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
         )
-        if ctx.msg.channel == "websocket":
-            self._pending_turn_latency_ms[ctx.session_key] = ctx.turn_latency_ms
-        ctx.session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        self._runtime_events().record_turn_latency(
+            ctx.session_key,
+            ctx.turn_latency_ms,
+        )
+        if not ctx.ephemeral:
+            ctx.session.enforce_file_cap(
+                on_archive=partial(self.context.memory.raw_archive, session_key=ctx.session_key)
+            )
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(
+                    ctx.session,
+                    replay_max_messages=self._max_messages,
+                )
+            )
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
-        self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
-                ctx.session,
-                replay_max_messages=self._max_messages,
-            )
-        )
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
+        if ctx.suppress_response:
+            ctx.outbound = None
+            return "ok"
         ctx.outbound = self._assemble_outbound(
             ctx.msg,
             ctx.final_content,
@@ -1376,6 +1558,8 @@ class AgentLoop:
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
         )
+        if ctx.ephemeral and ctx.outbound is not None:
+            ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
         return "ok"
 
     def _sanitize_persisted_blocks(
@@ -1429,6 +1613,13 @@ class AgentLoop:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
 
+        declared_tool_call_ids = {
+            str(tc["id"])
+            for m in session.messages
+            if m.get("role") == "assistant"
+            for tc in m.get("tool_calls") or []
+            if isinstance(tc, dict) and tc.get("id")
+        }
         last_assistant_idx: int | None = None
         for m in messages[skip:]:
             entry = dict(m)
@@ -1436,12 +1627,24 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":
+                tool_call_id = entry.get("tool_call_id")
+                if not tool_call_id or str(tool_call_id) not in declared_tool_call_ids:
+                    # Undeclared tool results corrupt future provider requests.
+                    logger.warning(
+                        "Dropping orphaned tool result {} from session {} during persistence",
+                        tool_call_id or "(missing id)",
+                        session.key,
+                    )
+                    continue
                 if isinstance(content, str) and len(content) > self.max_tool_result_chars:
                     entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
                 elif isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(content, should_truncate_text=True)
                     if not filtered:
-                        continue
+                        # Preserve the tool_call/result pair after block filtering.
+                        filtered = [
+                            {"type": "text", "text": "[tool result omitted during persistence]"}
+                        ]
                     entry["content"] = filtered
             elif role == "user":
                 if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
@@ -1461,6 +1664,11 @@ class AgentLoop:
             session.messages.append(entry)
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1
+                declared_tool_call_ids.update(
+                    str(tc["id"])
+                    for tc in entry.get("tool_calls") or []
+                    if isinstance(tc, dict) and tc.get("id")
+                )
         if turn_latency_ms is not None and last_assistant_idx is not None:
             session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
         session.updated_at = datetime.now()
@@ -1600,6 +1808,8 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        ephemeral: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -1607,10 +1817,23 @@ class AgentLoop:
             channel=channel, sender_id="user", chat_id=chat_id,
             content=content, media=media or [],
         )
-        return await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-        )
+        # Share the dispatch lock so direct calls serialize with bus turns.
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        try:
+            async with lock:
+                kwargs: dict[str, Any] = {
+                    "session_key": session_key,
+                    "on_progress": on_progress,
+                    "on_stream": on_stream,
+                    "on_stream_end": on_stream_end,
+                    "ephemeral": ephemeral,
+                }
+                if tools is not None:
+                    kwargs["tools"] = tools
+                return await self._process_message(
+                    msg,
+                    **kwargs,
+                )
+        finally:
+            await self._runtime_events().run_status_changed(msg, session_key, "idle")
+            self._runtime_events().clear_turn(session_key)

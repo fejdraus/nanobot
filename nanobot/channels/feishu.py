@@ -1,5 +1,7 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
+from __future__ import annotations
+
 import asyncio
 import importlib.util
 import json
@@ -11,10 +13,8 @@ import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
-from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
@@ -25,7 +25,41 @@ from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.logging_bridge import redirect_lib_logging
 
+if TYPE_CHECKING:
+    from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
+
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+
+
+def _load_lark_runtime() -> tuple[Any, str, str]:
+    """Import the heavy Feishu SDK lazily.
+
+    lark_oapi imports a large generated API surface at module import time, so
+    keep it out of channel discovery and constructor paths.
+    """
+    import sys
+
+    ws_client_already_imported = "lark_oapi.ws.client" in sys.modules
+    import lark_oapi as lark
+    import lark_oapi.ws.client as lark_ws_client
+    from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+
+    if (
+        not ws_client_already_imported
+        and threading.current_thread() is not threading.main_thread()
+    ):
+        import_loop = getattr(lark_ws_client, "loop", None)
+        if (
+            import_loop is not None
+            and not import_loop.is_running()
+            and not import_loop.is_closed()
+        ):
+            import_loop.close()
+        lark_ws_client.loop = None
+        with suppress(Exception):
+            asyncio.set_event_loop(None)
+
+    return lark, FEISHU_DOMAIN, LARK_DOMAIN
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -297,13 +331,11 @@ class FeishuChannel(BaseChannel):
         return FeishuConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
-        import lark_oapi as lark
-
         if isinstance(config, dict):
             config = FeishuConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: FeishuConfig = config
-        self._client: lark.Client = None
+        self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
@@ -329,7 +361,7 @@ class FeishuChannel(BaseChannel):
             self.logger.error("app_id and app_secret not configured")
             return
 
-        import lark_oapi as lark
+        lark, feishu_domain, lark_domain = await asyncio.to_thread(_load_lark_runtime)
 
         redirect_lib_logging("Lark")
 
@@ -337,7 +369,7 @@ class FeishuChannel(BaseChannel):
         self._loop = asyncio.get_running_loop()
 
         # Create Lark client for sending messages
-        domain = LARK_DOMAIN if self.config.domain == "lark" else FEISHU_DOMAIN
+        domain = lark_domain if self.config.domain == "lark" else feishu_domain
         self._client = (
             lark.Client.builder()
             .app_id(self.config.app_id)
@@ -397,6 +429,7 @@ class FeishuChannel(BaseChannel):
 
             import lark_oapi.ws.client as _lark_ws_client
 
+            previous_loop = getattr(_lark_ws_client, "loop", None)
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
             # Patch the module-level loop used by lark's ws Client.start()
@@ -410,6 +443,10 @@ class FeishuChannel(BaseChannel):
                     if self._running:
                         time.sleep(5)
             finally:
+                if getattr(_lark_ws_client, "loop", None) is ws_loop:
+                    _lark_ws_client.loop = previous_loop
+                with suppress(Exception):
+                    asyncio.set_event_loop(None)
                 ws_loop.close()
 
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
@@ -483,7 +520,12 @@ class FeishuChannel(BaseChannel):
 
         for mention in mentions:
             key = mention.key or None
-            if not key or key not in text:
+            if not key:
+                continue
+            # Feishu placeholders are numbered keys like @_user_1. Keep
+            # punctuation-adjacent mentions valid without matching @_user_10.
+            pattern = rf"{re.escape(key)}(?![A-Za-z0-9_])"
+            if not re.search(pattern, text):
                 continue
 
             user_id_obj = mention.id or None
@@ -502,7 +544,40 @@ class FeishuChannel(BaseChannel):
             else:
                 replacement = f"@{name}"
 
-            text = text.replace(key, replacement)
+            text = re.sub(pattern, replacement, text)
+
+        return text
+
+    def _is_bot_mention_event(self, mention: Any) -> bool:
+        mid = getattr(mention, "id", None)
+        if not mid:
+            return False
+
+        mention_open_id = getattr(mid, "open_id", None) or ""
+        bot_open_id = getattr(self, "_bot_open_id", None) or ""
+        if bot_open_id:
+            return mention_open_id == bot_open_id
+
+        # Fallback heuristic when bot open_id is unavailable.
+        return not getattr(mid, "user_id", None) and mention_open_id.startswith("ou_")
+
+    def _strip_leading_bot_mention(
+        self, text: str, mentions: list[MentionEvent] | None
+    ) -> str:
+        """Remove a required leading bot mention before slash command routing."""
+        if not mentions or not text:
+            return text
+
+        candidate = text.lstrip()
+        for mention in mentions:
+            key = getattr(mention, "key", None) or ""
+            if not key or not re.match(rf"{re.escape(key)}(?![A-Za-z0-9_])", candidate):
+                continue
+            if not self._is_bot_mention_event(mention):
+                continue
+
+            stripped = candidate[len(key) :].strip()
+            return stripped or text
 
         return text
 
@@ -513,17 +588,8 @@ class FeishuChannel(BaseChannel):
             return True
 
         for mention in getattr(message, "mentions", None) or []:
-            mid = getattr(mention, "id", None)
-            if not mid:
-                continue
-            mention_open_id = getattr(mid, "open_id", None) or ""
-            if self._bot_open_id:
-                if mention_open_id == self._bot_open_id:
-                    return True
-            else:
-                # Fallback heuristic when bot open_id is unavailable
-                if not getattr(mid, "user_id", None) and mention_open_id.startswith("ou_"):
-                    return True
+            if self._is_bot_mention_event(mention):
+                return True
         return False
 
     def _is_group_message_for_bot(self, message: Any) -> bool:
@@ -1747,6 +1813,7 @@ class FeishuChannel(BaseChannel):
                 text = content_json.get("text", "")
                 if text:
                     mentions = getattr(message, "mentions", None)
+                    text = self._strip_leading_bot_mention(text, mentions)
                     text = self._resolve_mentions(text, mentions)
                     content_parts.append(text)
 

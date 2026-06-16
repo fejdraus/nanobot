@@ -76,7 +76,23 @@ describe("MessageBubble", () => {
 
     expect(row).toHaveClass("ml-auto", "flex");
     expect(pill).toHaveClass("ml-auto", "w-fit", "rounded-[18px]");
-    expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Fork" })).not.toBeInTheDocument();
+  });
+
+  it("renders fork control in completed assistant action rows", () => {
+    const onForkFromHere = vi.fn();
+    const message: UIMessage = {
+      id: "a-fork",
+      role: "assistant",
+      content: "branch after this answer",
+      latencyMs: 1_200,
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} onForkFromHere={onForkFromHere} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Fork" }));
+    expect(onForkFromHere).toHaveBeenCalledTimes(1);
   });
 
   it("renders installed CLI app mentions inside sent user messages", () => {
@@ -99,6 +115,22 @@ describe("MessageBubble", () => {
     expect(screen.getByTestId("message-cli-mention-logo-zoom")).toBeInTheDocument();
     expect(screen.queryByTestId("message-cli-mention-krita")).not.toBeInTheDocument();
     expect(screen.getByText(/not @krita/)).toBeInTheDocument();
+  });
+
+  it("renders a lightweight automation source label for cron replies", () => {
+    const message: UIMessage = {
+      id: "a-cron",
+      role: "assistant",
+      content: "Time to drink water.",
+      source: { kind: "cron", label: "drink water" },
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} />);
+
+    expect(screen.getByText("drink water")).toBeInTheDocument();
+    expect(screen.getByText("Triggered automatically")).toBeInTheDocument();
+    expect(screen.getByText("Time to drink water.")).toBeInTheDocument();
   });
 
   it("renders structured CLI app attachments even without the installed catalog", () => {
@@ -159,12 +191,78 @@ describe("MessageBubble", () => {
 
     render(<MessageBubble message={message} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
 
     expect(writeText).toHaveBeenCalledWith("I can help with the next step.");
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Copied reply" })).toBeInTheDocument(),
+      expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument(),
     );
+  });
+
+  it("copies completed assistant replies with the textarea fallback", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    const message: UIMessage = {
+      id: "a-copy-fallback",
+      role: "assistant",
+      content: "Fallback copy reply.",
+      createdAt: Date.now(),
+    };
+
+    try {
+      render(<MessageBubble message={message} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument(),
+      );
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
+    }
+  });
+
+  it("falls back when the Clipboard API rejects assistant reply copy", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("not allowed"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    const message: UIMessage = {
+      id: "a-copy-reject",
+      role: "assistant",
+      content: "Rejected clipboard copy.",
+      createdAt: Date.now(),
+    };
+
+    try {
+      render(<MessageBubble message={message} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+      expect(writeText).toHaveBeenCalledWith("Rejected clipboard copy.");
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument(),
+      );
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
+    }
   });
 
   it("does not show copy actions for streaming placeholders", () => {
@@ -178,7 +276,7 @@ describe("MessageBubble", () => {
 
     render(<MessageBubble message={message} />);
 
-    expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
   });
 
   it("does not show copy when showAssistantCopyAction is false", () => {
@@ -191,7 +289,7 @@ describe("MessageBubble", () => {
 
     render(<MessageBubble message={message} showAssistantCopyAction={false} />);
 
-    expect(screen.queryByRole("button", { name: "Copy reply" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
   });
 
   it("renders trace messages as collapsible tool groups", () => {
@@ -236,7 +334,10 @@ describe("MessageBubble", () => {
     const video = screen.getByLabelText(/video attachment/i);
     expect(video.tagName).toBe("VIDEO");
     expect(video).toHaveAttribute("src", "/api/media/sig/payload");
+    expect(video).toHaveAttribute("preload", "auto");
     expect(container.querySelector("video[controls]")).toBeInTheDocument();
+    expect(screen.queryByText("Preview")).not.toBeInTheDocument();
+    expect(screen.queryByText("Code")).not.toBeInTheDocument();
   });
 
   it("auto-expands the reasoning trace while streaming with a shimmer header", () => {
@@ -365,5 +466,48 @@ describe("MessageBubble", () => {
     expect(imageButton).toHaveClass("w-[min(100%,34rem)]", "rounded-[20px]");
     expect(imageButton).not.toHaveAttribute("title");
     expect(container.querySelector("img")).toHaveClass("h-auto", "w-full", "object-contain");
+  });
+
+  it("renders mislabeled html assistant media as a file attachment", () => {
+    const message: UIMessage = {
+      id: "a-html",
+      role: "assistant",
+      content: "file ready",
+      createdAt: Date.now(),
+      media: [
+        {
+          kind: "image",
+          url: "/api/media/sig/html",
+          name: "index.html",
+        },
+      ],
+    };
+
+    const { container } = render(<MessageBubble message={message} />);
+
+    expect(screen.getByLabelText("File attachment")).toHaveTextContent("index.html");
+    expect(container.querySelector("img")).not.toBeInTheDocument();
+  });
+
+  it("renders assistant svg media as an image preview", () => {
+    const message: UIMessage = {
+      id: "a-svg",
+      role: "assistant",
+      content: "chart ready",
+      createdAt: Date.now(),
+      media: [
+        {
+          kind: "file",
+          url: "/api/media/sig/svg",
+          name: "growth.svg",
+        },
+      ],
+    };
+
+    const { container } = render(<MessageBubble message={message} />);
+
+    expect(screen.getByRole("button", { name: /view image: growth.svg/i })).toBeInTheDocument();
+    expect(container.querySelector('img[src="/api/media/sig/svg"]')).toBeInTheDocument();
+    expect(screen.queryByLabelText("File attachment")).not.toBeInTheDocument();
   });
 });

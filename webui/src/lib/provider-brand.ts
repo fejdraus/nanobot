@@ -92,9 +92,11 @@ export function logoFallbackUrls(logoUrl: string | null | undefined): string[] {
 export const PROVIDER_BRAND_ALIASES: Record<string, string> = {
   brave_search: "brave",
   byteplus_coding_plan: "byteplus",
+  mimo: "xiaomi_mimo",
   minimaxAnthropic: "minimax",
   minimax_anthropic: "minimax",
   openai_codex: "openai",
+  xiaomi: "xiaomi_mimo",
   volcengine_coding_plan: "volcengine",
 };
 
@@ -111,9 +113,11 @@ const PROVIDER_BRANDS: Record<string, ProviderBrand> = {
   aihubmix: brand("aihubmix.com", "#111827", "AH"),
   ant_ling: brand("ant-ling.com", "#7C3AED", "AL"),
   anthropic: brand("anthropic.com", "#D97757", "A"),
+  assemblyai: brand("assemblyai.com", "#111827", "AA"),
   atomic_chat: brand("atomic.chat", "#111827", "AC"),
   azure_openai: brand("azure.microsoft.com", "#0078D4", "AZ"),
   bedrock: brand("aws.amazon.com", "#FF9900", "AWS"),
+  bocha: brand("bochaai.com", "#2563EB", "B"),
   brave: brand("brave.com", "#FB542B", "B"),
   byteplus: brand("byteplus.com", "#325CFF", "BP"),
   dashscope: brand("dashscope.aliyun.com", "#FF6A00", "DS"),
@@ -127,7 +131,9 @@ const PROVIDER_BRANDS: Record<string, ProviderBrand> = {
   jina: brand("jina.ai", "#7C3AED", "J"),
   kagi: brand("kagi.com", "#FFB319", "K"),
   lm_studio: brand("lmstudio.ai", "#111827", "LM"),
-  longcat: brand("longcat.chat", "#111827", "LC"),
+  longcat: brand("longcatai.org", "#4F8CFF", "LC", [
+    "https://www.longcatai.org/favicon.svg",
+  ]),
   minimax: brand("minimax.io", "#111827", "MM"),
   mistral: brand("mistral.ai", "#FA520F", "M"),
   moonshot: brand("moonshot.ai", "#111827", "MS"),
@@ -142,11 +148,15 @@ const PROVIDER_BRANDS: Record<string, ProviderBrand> = {
   searxng: brand("searxng.org", "#3050FF", "SX"),
   siliconflow: brand("siliconflow.cn", "#111827", "SF"),
   skywork: brand("skywork.ai", "#5B5BF6", "SW"),
-  stepfun: brand("stepfun.com", "#2F6BFF", "SF"),
+  stepfun: brand("stepfun.com", "#2F6BFF", "SF", [
+    "https://www.stepfun.com/step_favicon.svg",
+  ]),
   tavily: brand("tavily.com", "#111827", "T"),
   volcengine: brand("volcengine.com", "#1664FF", "VE"),
   vllm: brand("vllm.ai", "#2563EB", "VL"),
-  xiaomi_mimo: brand("xiaomimimo.com", "#FF6900", "MI"),
+  xiaomi_mimo: brand("mimo.xiaomi.com", "#FF6900", "MI", [
+    "https://mimo.xiaomi.com/mimo-v2-pro/assets/logo.svg",
+  ]),
   zhipu: brand("z.ai", "#155EEF", "Z", [
     "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
     "https://www.google.com/s2/favicons?domain=z.ai&sz=64",
