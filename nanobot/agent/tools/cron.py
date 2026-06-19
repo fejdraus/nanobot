@@ -227,11 +227,15 @@ class CronTool(Tool, ContextAware):
         else:
             return "Error: either delay_seconds, every_seconds, cron_expr, or at is required"
 
+        # NOTE: upstream's migration in cron/service.py treats deliver=True + missing
+        # channel/to as a malformed legacy job and disables it on save. Delivery now
+        # routes through origin_channel/origin_chat_id, so we do not pass `deliver`.
+        # The fork-only `deliver` parameter on the tool is kept for backward
+        # compatibility of the schema but is currently a no-op at the service layer.
         job = self._cron.add_job(
             name=name or message[:30],
             schedule=schedule,
             message=message,
-            deliver=deliver,
             delete_after_run=delete_after,
             session_key=session_key,
             origin_channel=origin_channel,
