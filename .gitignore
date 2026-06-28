@@ -105,3 +105,4 @@ botpy.log
 AGENTS.md
 exp/
 .playwright-mcp/
+bridge/node_modules/

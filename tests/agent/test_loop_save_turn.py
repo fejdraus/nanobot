@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -39,6 +40,7 @@ def _mk_loop() -> AgentLoop:
 def _make_full_loop(tmp_path: Path) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Test title"))
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
     WebuiTurnCoordinator(
@@ -988,6 +990,33 @@ async def test_run_agent_loop_goal_continue_message_reads_latest_metadata(
     assert "Goal created during this runner call." in (seen["goal_continue"] or "")
 
 
+@pytest.mark.asyncio
+async def test_process_direct_skip_user_persist_does_not_save_retry_user(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop._connect_mcp = AsyncMock()
+    session = loop.sessions.get_or_create("api:default")
+    session.add_message("user", "hello")
+    session.add_message("assistant", "previous empty-response attempt")
+    loop.sessions.save(session)
+
+    await loop.process_direct(
+        "hello",
+        session_key=session.key,
+        channel="api",
+        chat_id="default",
+        persist_user_message=False,
+    )
+
+    session = loop.sessions.get_or_create("api:default")
+    assert [(m["role"], m["content"]) for m in session.messages] == [
+        ("user", "hello"),
+        ("assistant", "previous empty-response attempt"),
+        ("assistant", "Test title"),
+    ]
+
+
 def test_set_tool_context_uses_effective_key_for_spawn_tool(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     spawn_tool = loop.tools.get("spawn")
@@ -1193,11 +1222,9 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
     non_system = [m for m in seen["initial_messages"] if m.get("role") != "system"]
     assert "question" in non_system[0]["content"]
     assert "working" in non_system[1]["content"]
-    # User turns carry the timestamp prefix so the model can reason about
-    # relative time. Assistant turns do NOT, otherwise the model treats those
-    # past replies as in-context examples and starts its own outputs with
-    # ``[Message Time: ...]`` (which then leaks back to the user).
-    assert "[Message Time:" in non_system[0]["content"]
+    # Persisted timestamps stay in session records, but replay content is not
+    # rewritten with volatile ``[Message Time: ...]`` prefixes.
+    assert "[Message Time:" not in non_system[0]["content"]
     assert "[Message Time:" not in non_system[1]["content"]
     assert non_system[2]["content"].count("subagent result") == 1
     assert "Current Time:" in non_system[2]["content"]
