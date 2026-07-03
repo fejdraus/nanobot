@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
     IntegerSchema,
@@ -107,7 +107,7 @@ class CronTool(Tool, ContextAware):
         try:
             ZoneInfo(tz)
         except (KeyError, Exception):
-            return f"Error: unknown timezone '{tz}'"
+            return ToolResult.error(f"Error: unknown timezone '{tz}'")
         return None
 
     def _display_timezone(self, schedule: CronSchedule) -> str:
@@ -157,7 +157,7 @@ class CronTool(Tool, ContextAware):
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
-                return "Error: cannot schedule new jobs from within a cron job execution"
+                return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
             return self._add_job(name, message, delay_seconds, every_seconds, cron_expr, tz, at, deliver)
         elif action == "list":
             return self._list_jobs()
@@ -177,20 +177,20 @@ class CronTool(Tool, ContextAware):
         deliver: bool = True,
     ) -> str:
         if not message:
-            return (
+            return ToolResult.error(
                 "Error: cron action='add' requires a non-empty 'message' parameter "
                 "describing what to do when the job triggers "
                 "(e.g. the reminder text). Retry including message=\"...\"."
             )
         session_key = self._session_key.get()
         if not session_key:
-            return "Error: scheduled cron jobs must be created from a chat session"
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         origin_channel = self._origin_channel.get()
         origin_chat_id = self._origin_chat_id.get()
         if not origin_channel or not origin_chat_id:
-            return "Error: scheduled cron jobs must be created from a chat session"
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         if tz and not cron_expr and not at:
-            return "Error: tz can only be used with cron_expr or at"
+            return ToolResult.error("Error: tz can only be used with cron_expr or at")
         if tz:
             if err := self._validate_timezone(tz):
                 return err
@@ -215,7 +215,7 @@ class CronTool(Tool, ContextAware):
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
-                return f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS"
+                return ToolResult.error(f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS")
             if dt.tzinfo is None:
                 effective_tz = tz or self._default_timezone
                 if err := self._validate_timezone(effective_tz):
@@ -225,7 +225,7 @@ class CronTool(Tool, ContextAware):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either delay_seconds, every_seconds, cron_expr, or at is required"
+            return ToolResult.error("Error: either delay_seconds, every_seconds, cron_expr, or at is required")
 
         # NOTE: upstream's migration in cron/service.py treats deliver=True + missing
         # channel/to as a malformed legacy job and disables it on save. Delivery now
@@ -301,7 +301,7 @@ class CronTool(Tool, ContextAware):
 
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
-            return "Error: job_id is required for remove"
+            return ToolResult.error("Error: job_id is required for remove")
         result = self._cron.remove_job(job_id)
         if result == "removed":
             return f"Removed job {job_id}"
