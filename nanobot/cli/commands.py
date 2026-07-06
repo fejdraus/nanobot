@@ -1306,6 +1306,17 @@ def _run_gateway(
         raise typer.Exit(1) from exc
     session_manager = SessionManager(config.workspace_path)
 
+    # Self-heal the gateway state file with the current PID after any restart.
+    from nanobot.gateway.runtime import GatewayRuntime, GatewayRuntimePaths
+    GatewayRuntime.refresh_state_pid(
+        paths=GatewayRuntimePaths.for_instance(
+            workspace=str(config.workspace_path)
+            if not is_default_workspace(config.workspace_path)
+            else None,
+            config_path=config.config_path,
+        )
+    )
+
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
@@ -1397,6 +1408,7 @@ def _run_gateway(
 
             store = agent.context.memory
             resp = None
+            diff_body = ""
             try:
                 result = store.build_dream_prompt()
                 if result is None:
@@ -1411,9 +1423,20 @@ def _run_gateway(
                     tools=store.build_dream_tools(),
                     on_progress=_silent,
                 )
-                if MemoryStore.dream_run_completed(resp):
+                # Ground truth: the real file delta, not the LLM's self-report.
+                diff_body = store.dream_content_diff()
+                productive = bool(diff_body) or (
+                    not store.git.is_initialized()
+                    and MemoryStore.dream_run_completed(resp)
+                )
+                if productive:
                     store.set_last_dream_cursor(last_cursor)
                     logger.info("Dream cron job completed, cursor advanced to {}", last_cursor)
+                elif MemoryStore.dream_run_completed(resp):
+                    logger.info(
+                        "Dream cron job completed with no memory changes; "
+                        "cursor not advanced",
+                    )
                 else:
                     logger.warning(
                         "Dream cron job did not complete; cursor remains at {}",
@@ -1431,7 +1454,7 @@ def _run_gateway(
                 )
                 if store.git.is_initialized():
                     msg = build_dream_commit_message(
-                        "dream: periodic memory consolidation", resp,
+                        "dream: periodic memory consolidation", diff_body,
                     )
                     sha = store.git.auto_commit(msg)
                     if sha:
@@ -1926,6 +1949,17 @@ def agent(
                                 )
                             continue
                         if isinstance(event, StreamedResponseEvent):
+                            if msg.content and renderer and not renderer.streamed:
+                                await renderer.close()
+                                print_kwargs: dict[str, Any] = {}
+                                if renderer.header_printed:
+                                    print_kwargs["show_header"] = False
+                                _print_agent_response(
+                                    msg.content,
+                                    render_markdown=markdown,
+                                    metadata=msg.metadata,
+                                    **print_kwargs,
+                                )
                             turn_done.set()
                             continue
 
@@ -2401,7 +2435,7 @@ def _logout_github_copilot() -> None:
     try:
         from nanobot.providers.github_copilot_provider import get_storage
     except ImportError:
-        console.print("[red]GitHub Copilot provider unavailable. Ensure oauth-cli-kit is installed.[/red]")
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
         raise typer.Exit(1)
 
     storage = get_storage()
