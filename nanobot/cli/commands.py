@@ -1314,7 +1314,7 @@ def _run_gateway(
             workspace=str(config.workspace_path)
             if not is_default_workspace(config.workspace_path)
             else None,
-            config_path=get_config_path(),
+            config_path=str(get_config_path()),
         )
     )
 
