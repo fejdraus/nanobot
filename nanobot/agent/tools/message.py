@@ -267,9 +267,6 @@ class MessageTool(Tool):
             return f"Message acknowledged for {channel}:{chat_id} (not delivered)"
 
         try:
-            # Prevent infinite message loops
-            if self._sent_in_turn:
-                return "OK"
             await self._send_callback(msg)
             if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
