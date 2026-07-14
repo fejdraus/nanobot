@@ -32,13 +32,23 @@ _MAX_CONTEXT_LINES = 24
 
 
 def _brain_db_from_config(config: Any) -> str | None:
-    """Read BRAIN_DB from the bot's brain MCP server config, if present."""
+    """Read BRAIN_DB from the bot's brain MCP server config, if present.
+
+    ``ctx.config`` in ToolContext is the ToolsConfig object directly (i.e.
+    already ``config.tools``), not the full Config. Handle both shapes: look
+    for ``mcp_servers`` on config itself first, then fall back to
+    ``config.tools.mcp_servers`` in case a full Config is ever passed.
+    """
     try:
-        tools = getattr(config, "tools", None)
-        mcp = getattr(tools, "mcp_servers", None) if tools is not None else None
-        if mcp is None:
+        if config is None:
             return None
-        brain = mcp.get("brain") if isinstance(mcp, dict) else getattr(mcp, "brain", None)
+        mcp = getattr(config, "mcp_servers", None)
+        if mcp is None:
+            tools = getattr(config, "tools", None)
+            mcp = getattr(tools, "mcp_servers", None) if tools is not None else None
+        if not mcp:
+            return None
+        brain = mcp.get("brain") if hasattr(mcp, "get") else getattr(mcp, "brain", None)
         if brain is None:
             return None
         env = brain.get("env") if isinstance(brain, dict) else getattr(brain, "env", None)
