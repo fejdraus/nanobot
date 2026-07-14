@@ -70,6 +70,7 @@ from nanobot.webui.http_utils import (
 from nanobot.webui.http_utils import (
     safe_host_header as _safe_host_header,
 )
+from nanobot.webui.ingress_policy import WebUIIngressPolicy
 from nanobot.webui.media_gateway import WebUIMediaGateway
 from nanobot.webui.session_automations import (
     all_automations_payload,
@@ -155,6 +156,7 @@ class GatewayHTTPHandler:
         bus: MessageBus,
         tokens: GatewayTokenStore,
         media: WebUIMediaGateway,
+        ingress: WebUIIngressPolicy,
         workspaces: WebUIWorkspaceController,
         skills_workspace_path: Path,
         disabled_skills: set[str] | None = None,
@@ -162,6 +164,7 @@ class GatewayHTTPHandler:
         local_trigger_store: LocalTriggerStore | None = None,
         cron_pending_job_ids: Callable[[str], set[str]] | None = None,
         local_trigger_pending_ids: Callable[[str], set[str]] | None = None,
+        channel_feature_action: Callable[..., Any] | None = None,
         log: Any = logger,
     ) -> None:
         self.config = config
@@ -171,6 +174,7 @@ class GatewayHTTPHandler:
         self.bus = bus
         self.tokens = tokens
         self.media = media
+        self.ingress = ingress
         self.workspaces = workspaces
         self.skills_workspace_path = skills_workspace_path
         self.disabled_skills = disabled_skills or set()
@@ -194,6 +198,7 @@ class GatewayHTTPHandler:
             error_response=_http_error,
             runtime_surface=runtime_surface,
             runtime_capabilities=self._capabilities,
+            channel_feature_action=channel_feature_action,
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
@@ -338,6 +343,9 @@ class GatewayHTTPHandler:
             "ws_path": expected_path,
             "ws_url": ws_url,
             "expires_in": self.config.token_ttl_s,
+            "limits": self.ingress.bootstrap_limits(
+                max_frame_bytes=self.config.max_message_bytes,
+            ),
             "model_name": _resolve_bootstrap_model_name(self.runtime_model_name),
             "runtime_surface": self._runtime_surface,
             "runtime_capabilities": self._capabilities,
