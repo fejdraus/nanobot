@@ -144,6 +144,35 @@ def _make_wrapper(session: object, *, timeout: float = 0.1) -> MCPToolWrapper:
     return MCPToolWrapper(session, "test", tool_def, tool_timeout=timeout)
 
 
+@pytest.mark.asyncio
+async def test_connect_missing_servers_propagates_external_cancellation(monkeypatch) -> None:
+    started = asyncio.Event()
+
+    async def connect_mcp_servers(_servers: dict, _registry: ToolRegistry) -> dict:
+        started.set()
+        await asyncio.sleep(60)
+        return {}
+
+    class State:
+        pass
+
+    state = State()
+    state._mcp_closing = False
+    state._mcp_servers = {"test": MCPServerConfig(command="fake")}
+    state._mcp_stacks = {}
+    state._mcp_connecting = False
+    monkeypatch.setattr(mcp_mod, "connect_mcp_servers", connect_mcp_servers)
+
+    task = asyncio.create_task(mcp_mod.connect_missing_servers(state, ToolRegistry()))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state._mcp_connecting is False
+
+
 def test_wrapper_preserves_non_nullable_unions() -> None:
     tool_def = SimpleNamespace(
         name="demo",
@@ -205,6 +234,100 @@ def test_wrapper_normalizes_nullable_property_anyof() -> None:
         "description": "optional name",
         "nullable": True,
     }
+
+
+def test_wrapper_hoists_recursive_local_refs_into_defs() -> None:
+    recursive_items_ref = "#/properties/filter/properties/items"
+    tool_def = SimpleNamespace(
+        name="search_dataset",
+        description="search tool",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": recursive_items_ref},
+                        }
+                    },
+                    "required": ["items"],
+                }
+            },
+        },
+    )
+
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    generated_ref = wrapper.parameters["properties"]["filter"]["properties"]["items"][
+        "items"
+    ]["$ref"]
+    assert generated_ref.startswith("#/$defs/ref_")
+    generated_name = generated_ref.removeprefix("#/$defs/")
+    generated_schema = wrapper.parameters["$defs"][generated_name]
+    assert generated_schema["type"] == "array"
+    assert generated_schema["items"]["$ref"] == generated_ref
+
+
+def test_wrapper_hoists_root_self_ref_into_defs() -> None:
+    tool_def = SimpleNamespace(
+        name="tree",
+        description="tree tool",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "children": {"type": "array", "items": {"$ref": "#"}},
+            },
+        },
+    )
+
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    generated_ref = wrapper.parameters["properties"]["children"]["items"]["$ref"]
+    assert generated_ref.startswith("#/$defs/ref_")
+    generated_name = generated_ref.removeprefix("#/$defs/")
+    assert wrapper.parameters["$defs"][generated_name]["properties"]["children"]["items"] == {
+        "$ref": generated_ref
+    }
+
+
+def test_wrapper_preserves_existing_defs_refs() -> None:
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={
+            "type": "object",
+            "$defs": {"value": {"type": "string"}},
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+        },
+    )
+
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    assert wrapper.parameters["properties"]["value"]["$ref"] == "#/$defs/value"
+    assert wrapper.parameters["$defs"]["value"]["type"] == "string"
+
+
+def test_wrapper_resolves_uri_encoded_json_pointer() -> None:
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "space name/value": {"type": "string"},
+                "alias": {"$ref": "#/properties/space%20name~1value"},
+            },
+        },
+    )
+
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    generated_ref = wrapper.parameters["properties"]["alias"]["$ref"]
+    assert generated_ref.startswith("#/$defs/ref_")
+    generated_name = generated_ref.removeprefix("#/$defs/")
+    assert wrapper.parameters["$defs"][generated_name] == {"type": "string"}
 
 
 def test_normalize_windows_stdio_command_is_noop_off_windows(

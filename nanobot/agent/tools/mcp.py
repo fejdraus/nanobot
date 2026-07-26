@@ -30,6 +30,7 @@ from nanobot.security.network import (
     resolve_url_target,
     validate_url_target,
 )
+from nanobot.utils.cancellation import task_is_cancelling
 
 # Transient connection errors that warrant a single retry.
 # These typically happen when an MCP server restarts or a network
@@ -314,13 +315,87 @@ def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None
     return None
 
 
-def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
-    """Normalize only nullable JSON Schema patterns for tool definitions."""
-    if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}}
+def _resolve_local_schema_ref(root: dict[str, Any], ref: str) -> Any:
+    """Resolve a local JSON Pointer without accepting remote references."""
+    if not ref.startswith("#"):
+        raise ValueError("not a local JSON Pointer")
 
+    pointer = urllib.parse.unquote(ref[1:], errors="strict")
+    if not pointer:
+        return root
+    if not pointer.startswith("/"):
+        raise ValueError("not a local JSON Pointer")
+
+    current: Any = root
+    for raw_part in pointer[1:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            current = current[part]
+        elif isinstance(current, list):
+            current = current[int(part)]
+        else:
+            raise KeyError(part)
+    return current
+
+
+def _rewrite_local_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Hoist arbitrary local JSON-Pointer refs into provider-compatible ``$defs``."""
+    rewritten_refs: dict[str, str] = {}
+    generated_defs: dict[str, Any] = {}
+
+    def rewrite(value: Any) -> Any:
+        if isinstance(value, list):
+            return [rewrite(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        rewritten = dict(value)
+        ref = rewritten.get("$ref")
+        is_rewritable_ref = False
+        if isinstance(ref, str) and not ref.startswith("#/$defs/"):
+            try:
+                pointer = urllib.parse.unquote(ref[1:], errors="strict")
+            except (UnicodeDecodeError, ValueError):
+                pass
+            else:
+                is_rewritable_ref = ref.startswith("#") and (
+                    not pointer or pointer.startswith("/")
+                )
+        if is_rewritable_ref:
+            name = rewritten_refs.get(ref)
+            if name is None:
+                try:
+                    target = _resolve_local_schema_ref(schema, ref)
+                except (KeyError, IndexError, TypeError, UnicodeDecodeError, ValueError):
+                    logger.warning("MCP tool schema contains an unresolved local $ref: {}", ref)
+                else:
+                    assert isinstance(ref, str)
+                    name = f"ref_{hashlib.sha256(ref.encode()).hexdigest()[:12]}"
+                    existing_defs = schema.get("$defs")
+                    while isinstance(existing_defs, dict) and name in existing_defs:
+                        name += "_"
+                    rewritten_refs[ref] = name
+                    # Reserve the name before descending so recursive refs terminate.
+                    generated_defs[name] = {}
+                    generated_defs[name] = rewrite(target)
+            if name is not None:
+                rewritten["$ref"] = f"#/$defs/{name}"
+
+        return {key: rewrite(item) for key, item in rewritten.items()}
+
+    result = rewrite(schema)
+    if generated_defs:
+        existing_defs = result.get("$defs")
+        result["$defs"] = {
+            **(existing_defs if isinstance(existing_defs, dict) else {}),
+            **generated_defs,
+        }
+    return result
+
+
+def _normalize_nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize nullable forms in structural subschemas only."""
     normalized = dict(schema)
-
     raw_type = normalized.get("type")
     if isinstance(raw_type, list):
         non_null = [item for item in raw_type if item != "null"]
@@ -338,21 +413,32 @@ def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
             normalized["nullable"] = True
             break
 
-    if "properties" in normalized and isinstance(normalized["properties"], dict):
+    if isinstance(normalized.get("properties"), dict):
         normalized["properties"] = {
-            name: _normalize_schema_for_openai(prop) if isinstance(prop, dict) else prop
+            name: _normalize_nullable_schema(prop) if isinstance(prop, dict) else prop
             for name, prop in normalized["properties"].items()
         }
+    if isinstance(normalized.get("items"), dict):
+        normalized["items"] = _normalize_nullable_schema(normalized["items"])
+    if isinstance(normalized.get("$defs"), dict):
+        normalized["$defs"] = {
+            name: _normalize_nullable_schema(definition)
+            if isinstance(definition, dict)
+            else definition
+            for name, definition in normalized["$defs"].items()
+        }
 
-    if "items" in normalized and isinstance(normalized["items"], dict):
-        normalized["items"] = _normalize_schema_for_openai(normalized["items"])
-
-    if normalized.get("type") != "object":
-        return normalized
-
-    normalized.setdefault("properties", {})
-    normalized.setdefault("required", [])
+    if normalized.get("type") == "object":
+        normalized.setdefault("properties", {})
+        normalized.setdefault("required", [])
     return normalized
+
+
+def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
+    """Normalize MCP JSON Schema patterns for tool definitions."""
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+    return _normalize_nullable_schema(_rewrite_local_schema_refs(schema))
 
 
 class _MCPWrapperBase(Tool):
@@ -487,8 +573,7 @@ class MCPToolWrapper(_MCPWrapperBase):
             except asyncio.CancelledError:
                 # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
                 # Re-raise only if our task was externally cancelled (e.g. /stop).
-                task = asyncio.current_task()
-                if task is not None and task.cancelling() > 0:
+                if task_is_cancelling():
                     raise
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
                 return ToolResult.error("(MCP tool call was cancelled)")
@@ -650,8 +735,7 @@ class MCPResourceWrapper(_MCPWrapperBase):
                 )
                 return f"(MCP resource read timed out after {self._resource_timeout}s)"
             except asyncio.CancelledError:
-                task = asyncio.current_task()
-                if task is not None and task.cancelling() > 0:
+                if task_is_cancelling():
                     raise
                 logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
                 return "(MCP resource read was cancelled)"
@@ -764,8 +848,7 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 )
                 return f"(MCP prompt call timed out after {self._prompt_timeout}s)"
             except asyncio.CancelledError:
-                task = asyncio.current_task()
-                if task is not None and task.cancelling() > 0:
+                if task_is_cancelling():
                     raise
                 logger.warning("MCP prompt '{}' was cancelled by server/SDK", self._name)
                 return "(MCP prompt call was cancelled)"
@@ -1145,6 +1228,8 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
             else:
                 logger.warning("No MCP servers connected successfully (will retry next message)")
         except asyncio.CancelledError:
+            if task_is_cancelling():
+                raise
             logger.warning("MCP connection cancelled (will retry next message)")
         except BaseException as e:
             logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
@@ -1411,7 +1496,7 @@ async def _close_server(state: Any, server_name: str) -> None:
     try:
         await stack.aclose()
     except asyncio.CancelledError:
-        if asyncio.current_task().cancelling() > 0:
+        if task_is_cancelling():
             raise
         logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
     except (RuntimeError, BaseExceptionGroup):
@@ -1428,7 +1513,7 @@ async def close_mcp_servers(state: Any) -> None:
             try:
                 await connection.aclose()
             except asyncio.CancelledError:
-                if asyncio.current_task().cancelling() > 0:
+                if task_is_cancelling():
                     raise
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
             except (RuntimeError, BaseExceptionGroup):

@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cli import commands as cli_commands
 from nanobot.cli.commands import app
@@ -24,6 +25,8 @@ from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.providers.factory import ProviderSnapshot, make_provider, provider_signature
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
+from nanobot.providers.unconfigured_provider import UnconfiguredProvider
+from nanobot.session.webui_turns import WebuiTurnRoutePolicy
 from nanobot.webui.metadata import (
     WEBUI_MESSAGE_SOURCE_METADATA_KEY,
     WEBUI_TURN_METADATA_KEY,
@@ -476,22 +479,30 @@ def test_config_dump_excludes_oauth_provider_blocks():
     providers = config.model_dump(by_alias=True)["providers"]
 
     assert "openaiCodex" not in providers
+    assert "xaiGrok" not in providers
     assert "githubCopilot" not in providers
 
 
 def test_plugins_list_uses_explicit_config(monkeypatch, tmp_path: Path):
+    from nanobot.channels.plugin import ChannelPlugin
+
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps({"channels": {"example": {"enabled": True}}}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        "nanobot.channels.registry.discover_channel_names",
-        lambda: ["example"],
+    plugin = ChannelPlugin(
+        name="example",
+        display_name="Example",
+        runtime="example.runtime:ExampleChannel",
     )
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_plugins",
-        lambda: {},
+        lambda enabled_names=None: (
+            {"example": plugin}
+            if enabled_names is None or "example" in enabled_names
+            else {}
+        ),
     )
     monkeypatch.setattr(
         "nanobot.optional_features.optional_dependency_groups",
@@ -532,6 +543,47 @@ def test_provider_logout_openai_codex_succeeds_when_no_local_oauth_file(monkeypa
     assert "No local OAuth credentials found for OpenAI Codex" in result.stdout
 
 
+def test_provider_logout_xai_grok_removes_instance_credentials(tmp_path, monkeypatch):
+    token_path = tmp_path / "auth" / "xai.json"
+    lock_path = token_path.with_suffix(".lock")
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text("{}", encoding="utf-8")
+    lock_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "nanobot.providers.xai_oauth.get_xai_oauth_storage_path",
+        lambda: token_path,
+    )
+
+    result = runner.invoke(app, ["provider", "logout", "xai-grok"])
+
+    assert result.exit_code == 0
+    assert not token_path.exists()
+    assert "Logged out from xAI Grok" in result.stdout
+
+
+def test_provider_logout_xai_grok_uses_explicit_config_path(tmp_path, monkeypatch):
+    from nanobot.config import loader
+
+    default_config = tmp_path / "default" / "config.json"
+    selected_config = tmp_path / "selected" / "config.json"
+    default_token = default_config.parent / "auth" / "xai.json"
+    selected_token = selected_config.parent / "auth" / "xai.json"
+    for token_path in (default_token, selected_token):
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(loader, "_current_config_path", default_config)
+
+    result = runner.invoke(
+        app,
+        ["provider", "logout", "xai-grok", "--config", str(selected_config)],
+    )
+
+    assert result.exit_code == 0
+    assert default_token.exists()
+    assert not selected_token.exists()
+    assert "Using config:" in result.stdout
+
+
 def test_provider_logout_github_copilot_removes_local_oauth_files(tmp_path, monkeypatch):
     token_path = tmp_path / "auth" / "github-copilot.json"
     lock_path = token_path.with_suffix(".lock")
@@ -570,11 +622,16 @@ def test_provider_logout_paths_resolve_to_expected_files():
     from oauth_cli_kit.storage import FileTokenStorage
 
     from nanobot.providers.github_copilot_provider import get_storage
+    from nanobot.providers.xai_oauth import get_xai_oauth_storage_path
 
     codex_storage = FileTokenStorage(token_filename=OPENAI_CODEX_PROVIDER.token_filename)
     codex_path = codex_storage.get_token_path()
     assert codex_path.name == "codex.json"
     assert codex_path.parent.name == "auth"
+
+    xai_path = get_xai_oauth_storage_path()
+    assert xai_path.name == "xai.json"
+    assert xai_path.parent.name == "auth"
 
     gh_storage = get_storage()
     gh_path = gh_storage.get_token_path()
@@ -652,6 +709,36 @@ def test_provider_login_can_set_github_copilot_as_main_provider(tmp_path):
     assert saved.agents.defaults.model == "github-copilot/gpt-5.4-mini"
     assert saved.agents.defaults.model_preset is None
     assert make_provider(saved).__class__.__name__ == "GitHubCopilotProvider"
+
+
+def test_provider_login_can_set_xai_grok_as_main_provider(tmp_path):
+    config_path = tmp_path / "config.json"
+    original = cli_commands._LOGIN_HANDLERS["xai_grok"]
+    cli_commands._LOGIN_HANDLERS["xai_grok"] = lambda: None
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "provider",
+                "login",
+                "xai-grok",
+                "--set-main",
+                "--config",
+                str(config_path),
+            ],
+        )
+    finally:
+        cli_commands._LOGIN_HANDLERS["xai_grok"] = original
+
+    assert result.exit_code == 0
+    assert "Set xai-grok as the main provider" in result.stdout
+
+    saved = Config.model_validate(json.loads(config_path.read_text(encoding="utf-8")))
+    assert saved.agents.defaults.provider == "xai_grok"
+    assert saved.agents.defaults.model == "xai-grok/grok-4.5"
+    assert saved.agents.defaults.context_window_tokens == 500_000
+    assert saved.agents.defaults.model_preset is None
+    assert make_provider(saved).__class__.__name__ == "XAIGrokProvider"
 
 
 def test_provider_login_model_implies_set_main_provider(tmp_path):
@@ -781,6 +868,33 @@ def test_provider_login_openai_codex_resolves_proxy_env_ref(monkeypatch):
 
     assert result.exit_code == 0
     assert captured["proxy"] == proxy
+
+
+def test_provider_login_xai_grok_runs_browser_flow_with_configured_proxy(monkeypatch):
+    proxy = "http://127.0.0.1:23458"
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda: Config.model_validate({"providers": {"xaiGrok": {"proxy": proxy}}}),
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.xai_oauth.get_xai_oauth_token",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("not signed in")),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_login(*, print_fn, prompt_fn, proxy=None):
+        captured.update(print_fn=print_fn, prompt_fn=prompt_fn, proxy=proxy)
+        return SimpleNamespace(access="access-token", account_id="user@example.com")
+
+    monkeypatch.setattr("nanobot.providers.xai_oauth.login_xai_oauth", fake_login)
+
+    result = runner.invoke(app, ["provider", "login", "xai-grok"])
+
+    assert result.exit_code == 0
+    assert captured["proxy"] == proxy
+    assert callable(captured["print_fn"])
+    assert callable(captured["prompt_fn"])
+    assert "Hosted X Search is enabled automatically when the selected model supports it" in result.stdout
 
 
 def test_config_matches_explicit_ollama_prefix_without_api_key():
@@ -1673,6 +1787,42 @@ def test_heartbeat_target_skips_archived_webui_sessions():
     assert target == ("websocket", "active")
 
 
+def test_heartbeat_target_uses_last_channel_for_unified_session():
+    from nanobot.cli.commands import _pick_heartbeat_target_from_sessions
+    from nanobot.session.keys import LAST_CHANNEL_METADATA_KEY, UNIFIED_SESSION_KEY
+
+    target = _pick_heartbeat_target_from_sessions(
+        enabled_channels=["telegram", "discord"],
+        archived_keys=[],
+        sessions=[{"key": UNIFIED_SESSION_KEY}],
+        unified_session_metadata={LAST_CHANNEL_METADATA_KEY: "discord:chat-42"},
+    )
+
+    assert target == ("discord", "chat-42")
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"last_channel": "telegram:chat-42"},
+        {"last_channel": "cli:direct"},
+        {"last_channel": "invalid"},
+    ],
+)
+def test_heartbeat_target_rejects_unroutable_unified_metadata(metadata):
+    from nanobot.cli.commands import _pick_heartbeat_target_from_sessions
+    from nanobot.session.keys import UNIFIED_SESSION_KEY
+
+    target = _pick_heartbeat_target_from_sessions(
+        enabled_channels=["discord"],
+        archived_keys=[],
+        sessions=[{"key": UNIFIED_SESSION_KEY}],
+        unified_session_metadata=metadata,
+    )
+
+    assert target == ("cli", "direct")
+
+
 def _write_instance_config(tmp_path: Path) -> Path:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -1910,6 +2060,7 @@ def test_webui_yes_creates_config_and_enables_local_websocket(
         "port": 18888,
         "open_browser_url": None,
         "webui_bundle_mode": "auto",
+        "unconfigured_provider_error": None,
     }
     compact_output = re.sub(r"\s+", " ", _strip_ansi(result.stdout))
     assert "bootstrap secret was generated" in compact_output
@@ -1919,19 +2070,92 @@ def test_webui_yes_creates_config_and_enables_local_websocket(
     assert "Press Ctrl+C here to stop nanobot" in compact_output
 
 
-def test_webui_yes_refuses_missing_provider_setup(monkeypatch, tmp_path: Path) -> None:
+def test_webui_yes_starts_first_run_without_provider_setup(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "config.json"
+    seen: dict[str, object] = {}
 
-    def _missing_provider(_config: Config, **_kwargs) -> ProviderSnapshot:
-        raise ValueError("No API key configured for provider 'custom'.")
+    monkeypatch.setattr(
+        "nanobot.cli.commands._provider_setup_error",
+        lambda _config: "No API key configured for provider 'custom'.",
+    )
+    _patch_gateway_ports_free(monkeypatch)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr(
+        "nanobot.cli.commands._run_gateway",
+        lambda config, **kwargs: seen.update(config=config, **kwargs),
+    )
 
-    monkeypatch.setattr("nanobot.providers.factory.build_provider_snapshot", _missing_provider)
+    result = runner.invoke(app, ["webui", "--config", str(config_file), "--yes", "--no-open"])
+
+    assert result.exit_code == 0
+    assert config_file.exists()
+    assert seen["unconfigured_provider_error"] == "No API key configured for provider 'custom'."
+    assert "Configure a provider and model in WebUI Settings → Models." in result.stdout
+
+
+def test_webui_missing_runtime_env_fails_before_starting_gateway(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.json"
+    missing_env = "NANOBOT_TEST_MISSING_WEBUI_SECRET"
+    monkeypatch.delenv(missing_env, raising=False)
+    config_file.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {
+                    "provider": "ollama",
+                    "model": "ollama/qwen3",
+                }
+            },
+            "channels": {
+                "websocket": {
+                    "enabled": True,
+                    "host": "0.0.0.0",
+                    "tokenIssueSecret": f"${{{missing_env}}}",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "nanobot.cli.commands._run_gateway",
+        lambda *_args, **_kwargs: pytest.fail("gateway must not start with unresolved config"),
+    )
+
+    result = runner.invoke(app, ["webui", "--config", str(config_file), "--yes", "--no-open"])
+
+    assert result.exit_code == 1
+    assert missing_env in result.stdout
+    assert f"${{{missing_env}}}" in config_file.read_text(encoding="utf-8")
+
+
+def test_webui_yes_still_refuses_invalid_custom_model_setup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {
+                    "provider": "custom",
+                    "model": "custom/test-model",
+                }
+            },
+            "providers": {
+                "custom": {
+                    "displayName": "Custom",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
 
     result = runner.invoke(app, ["webui", "--config", str(config_file), "--yes"])
 
     assert result.exit_code == 1
     assert "provider/model setup is incomplete" in result.stdout
-    assert not config_file.exists()
 
 
 def test_webui_background_starts_runtime_and_opens_browser(monkeypatch, tmp_path: Path) -> None:
@@ -2662,9 +2886,11 @@ def test_gateway_bound_cron_runs_as_session_turn(
     assert msg.metadata["thread_id"] == "om_root123"
 
 
+@pytest.mark.parametrize("setup_error", [None, "No API key configured"])
 def test_gateway_local_trigger_queue_submits_agent_turns(
     monkeypatch,
     tmp_path: Path,
+    setup_error: str | None,
 ) -> None:
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "config-workspace")
@@ -2730,12 +2956,14 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
             self.context = _FakeContext()
             self.sessions = kwargs["session_manager"]
             self.submit_local_trigger_turn = AsyncMock()
+            self.runtime_resolver = MagicMock()
             seen["agent"] = self
 
         def _schedule_background(self, _coro) -> None:
             return None
 
         async def run(self) -> None:
+            self.runtime_resolver.invalidate.assert_called_once_with()
             await asyncio.Event().wait()
 
         async def close_mcp(self) -> None:
@@ -2749,6 +2977,9 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
 
         def __init__(self, *_args, **_kwargs) -> None:
             return None
+
+        def get_channel(self, name: str) -> object | None:
+            return object() if name == "websocket" else None
 
         async def start_all(self) -> None:
             await asyncio.Event().wait()
@@ -2767,15 +2998,27 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
         _fake_run_local_trigger_queue,
     )
 
-    cli_commands._run_gateway(config, health_server_enabled=False)
+    cli_commands._run_gateway(
+        config,
+        health_server_enabled=False,
+        unconfigured_provider_error=setup_error,
+    )
 
     agent = seen["agent"]
     agent_kwargs = seen["agent_from_config_kwargs"]
     kwargs = seen["local_trigger_queue_kwargs"]
+    assert isinstance(agent_kwargs["provider"], UnconfiguredProvider) is bool(setup_error)
     assert "local_trigger_store" in agent_kwargs
     assert kwargs["store"] is agent_kwargs["local_trigger_store"]
     assert "bus" not in kwargs
     assert kwargs["submit_turn"] is agent.submit_local_trigger_turn
+    assert kwargs["is_channel_enabled"]("websocket") is True
+    assert kwargs["is_channel_enabled"]("telegram") is False
+    turn_delivery_factory = agent_kwargs["turn_delivery_factory"]
+    assert isinstance(turn_delivery_factory, TurnDeliveryFactory)
+    assert turn_delivery_factory.bus is bus
+    assert isinstance(turn_delivery_factory.route_policy, WebuiTurnRoutePolicy)
+    assert turn_delivery_factory.route_policy.sessions is agent.sessions
 
 
 def test_gateway_workspace_override_does_not_migrate_legacy_cron(
@@ -2959,6 +3202,7 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
             self.model = "test-model"
             self.provider = object()
             self.sessions = _FakeSessionManager()
+            self.runtime_resolver = MagicMock()
 
         def llm_runtime(self) -> None:
             return None
@@ -3152,6 +3396,7 @@ def test_gateway_shutdown_lets_agent_task_own_mcp_cleanup(
             self.model = "test-model"
             self.provider = object()
             self.sessions = _FakeSessionManager()
+            self.runtime_resolver = MagicMock()
 
         def llm_runtime(self) -> None:
             return None
@@ -3250,6 +3495,7 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
             self.model = "test-model"
             self.provider = object()
             self.sessions = _FakeSessionManager()
+            self.runtime_resolver = MagicMock()
 
         def llm_runtime(self) -> None:
             return None

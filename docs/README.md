@@ -15,11 +15,11 @@ Repository docs follow the current source tree and can be newer than the latest 
 The recommended first-run path is:
 
 1. Install nanobot.
-2. Choose **Quick Start** in `nanobot onboard --wizard`.
-3. Run `nanobot gateway` and open `http://127.0.0.1:8765`.
+2. Let the installer open `nanobot webui` on a fresh local desktop.
+3. Configure a provider and model in **Settings → Models**.
 4. Send `Hello!` before configuring anything else.
 
-Most people do not need to edit JSON for the first run. The wizard handles the initial provider, model, and local WebUI settings. Current source versions also provide `nanobot webui` to start the gateway and open the browser in one step. After the WebUI opens, use **Settings** for models and built-in capabilities, **Settings → Channels** for chat apps, and **Apps** for CLI App or MCP integrations.
+Most people do not need to edit JSON for the first run. The WebUI handles the initial provider, model, and local browser settings. SSH, headless, existing-config, and older-release installs retain `nanobot onboard --wizard` as a terminal fallback. After the WebUI opens, use **Settings** for models and built-in capabilities, **Settings → Channels** for chat apps, and **Apps** for CLI App or MCP integrations.
 
 ## Add One Capability
 
@@ -78,7 +78,7 @@ These pages explain implementation and extension points. You do not need them to
 |---|---|
 | Understand source ownership and runtime flow | [Architecture](./architecture.md) |
 | Set up a development environment | [Development](./development.md) and [CONTRIBUTING.md](../CONTRIBUTING.md) |
-| Add a channel package | [Channel Plugin Guide](./channel-plugin-guide.md) |
+| Add a channel package | [Channel Package Guide](./channel-package-guide.md) |
 | Build the WebUI source | [WebUI Development](../webui/README.md) |
 
 If a command or screen no longer matches these docs, please [open an issue](https://github.com/HKUDS/nanobot/issues) with your nanobot version, operating system, and the page that needs correction.

@@ -6,6 +6,8 @@ import asyncio
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
@@ -82,6 +84,8 @@ class ExecToolConfig(Base):
     path_prepend: str = ""
     path_append: str = ""
     sandbox: str = ""
+    sandbox_ro_binds: list[str] = Field(default_factory=list)
+    sandbox_rw_binds: list[str] = Field(default_factory=list)
     allowed_env_keys: list[str] = Field(default_factory=list)
     allow_patterns: list[str] = Field(default_factory=list)
     deny_patterns: list[str] = Field(default_factory=list)
@@ -185,9 +189,12 @@ class ExecTool(Tool):
             sandbox=cfg.sandbox,
             path_prepend=cfg.path_prepend,
             path_append=cfg.path_append,
+            sandbox_ro_binds=cfg.sandbox_ro_binds,
+            sandbox_rw_binds=cfg.sandbox_rw_binds,
             allowed_env_keys=cfg.allowed_env_keys,
             allow_patterns=cfg.allow_patterns,
             deny_patterns=cfg.deny_patterns,
+            session_manager=getattr(ctx, "exec_session_manager", None),
         )
 
     def __init__(
@@ -202,6 +209,8 @@ class ExecTool(Tool):
         sandbox: str = "",
         path_prepend: str = "",
         path_append: str = "",
+        sandbox_ro_binds: list[str] | None = None,
+        sandbox_rw_binds: list[str] | None = None,
         allowed_env_keys: list[str] | None = None,
         session_manager: Any | None = None,
     ):
@@ -234,6 +243,8 @@ class ExecTool(Tool):
         self.webui_allow_local_service_access = webui_allow_local_service_access
         self.path_prepend = path_prepend
         self.path_append = path_append
+        self.sandbox_ro_binds = self._normalize_bind_roots(sandbox_ro_binds)
+        self.sandbox_rw_binds = self._normalize_bind_roots(sandbox_rw_binds)
         self.allowed_env_keys = allowed_env_keys or []
         self._session_manager = session_manager or DEFAULT_EXEC_SESSION_MANAGER
 
@@ -461,7 +472,14 @@ class ExecTool(Tool):
                 )
             else:
                 workspace = workspace_root or cwd
-                command = wrap_command(self.sandbox, command, workspace, cwd)
+                command = wrap_command(
+                    self.sandbox,
+                    command,
+                    workspace,
+                    cwd,
+                    sandbox_ro_binds=[str(p) for p in self.sandbox_ro_binds],
+                    sandbox_rw_binds=[str(p) for p in self.sandbox_rw_binds],
+                )
                 cwd = str(Path(workspace).resolve())
 
         effective_timeout = self._resolve_timeout(timeout)
@@ -515,6 +533,7 @@ class ExecTool(Tool):
         login: bool = False,
         *,
         stdin: int = asyncio.subprocess.DEVNULL,
+        process_tree: bool = False,
     ) -> asyncio.subprocess.Process:
         """Launch *command* in a platform-appropriate shell."""
         if _IS_WINDOWS:
@@ -562,6 +581,7 @@ class ExecTool(Tool):
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            **({"start_new_session": True} if process_tree else {}),
         )
 
     @staticmethod
@@ -654,6 +674,39 @@ class ExecTool(Tool):
         finally:
             _reap_pid(process.pid)
 
+    @staticmethod
+    async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+        """Kill a session process and descendants, then reap the root process."""
+        if process.returncode is not None:
+            _reap_pid(process.pid)
+            return
+        try:
+            if _IS_WINDOWS:
+                with suppress(OSError, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            subprocess.run,
+                            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ),
+                        timeout=5.0,
+                    )
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            _reap_pid(process.pid)
+
     def _build_env(self) -> dict[str, str]:
         """Build a minimal environment for subprocess execution.
 
@@ -717,9 +770,12 @@ class ExecTool(Tool):
 
         # allow_patterns take priority over deny_patterns so that users can
         # exempt specific commands (e.g. "rm -rf" inside a build directory)
-        # from the hardcoded deny list via configuration.
-        explicitly_allowed = bool(self.allow_patterns) and any(
-            re.fullmatch(p, lower) for p in self.allow_patterns
+        # from the hardcoded deny list via configuration. A chained command is
+        # only explicitly allowed when every top-level shell segment matches.
+        segments = self._split_shell_segments(lower)
+        explicitly_allowed = bool(self.allow_patterns) and bool(segments) and all(
+            any(re.fullmatch(pattern, segment) for pattern in self.allow_patterns)
+            for segment in segments
         )
         if not explicitly_allowed:
             for pattern in self.deny_patterns:
@@ -753,6 +809,9 @@ class ExecTool(Tool):
                 if workspace_root
                 else None
             )
+            sandbox_bind_roots = self._active_sandbox_bind_roots(
+                resolved_workspace or cwd_path
+            )
 
             for raw in self._extract_absolute_paths(cmd):
                 try:
@@ -776,6 +835,8 @@ class ExecTool(Tool):
                 )
                 if not allowed and resolved_workspace is not None:
                     allowed = is_path_within(p, resolved_workspace)
+                if not allowed and sandbox_bind_roots:
+                    allowed = any(is_path_within(p, root) for root in sandbox_bind_roots)
                 if p.is_absolute() and not allowed:
                     return ToolResult.error(
                         "Error: Command blocked by safety guard (path outside working dir)"
@@ -783,6 +844,84 @@ class ExecTool(Tool):
                     )
 
         return None
+
+    @staticmethod
+    def _split_shell_segments(command: str) -> list[str]:
+        """Split shell commands on top-level chaining operators."""
+        segments: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        escaped = False
+        paren_depth = 0
+        i = 0
+
+        while i < len(command):
+            ch = command[i]
+
+            if escaped:
+                current.append(ch)
+                escaped = False
+                i += 1
+                continue
+
+            if ch == "\\" and quote != "'":
+                current.append(ch)
+                escaped = True
+                i += 1
+                continue
+
+            if quote is not None:
+                current.append(ch)
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+
+            if ch in {"'", '"', "`"}:
+                current.append(ch)
+                quote = ch
+                i += 1
+                continue
+
+            if ch == "(":
+                paren_depth += 1
+                current.append(ch)
+                i += 1
+                continue
+
+            if ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+                current.append(ch)
+                i += 1
+                continue
+
+            operator_len = 0
+            if paren_depth == 0:
+                if command.startswith(("&&", "||"), i):
+                    operator_len = 2
+                elif ch == "&" and not (
+                    (i > 0 and command[i - 1] in "<>") or command.startswith("&>", i)
+                ):
+                    current.append(ch)
+                    operator_len = 1
+                elif ch in {";", "|"}:
+                    operator_len = 1
+
+            if operator_len:
+                segment = "".join(current).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                i += operator_len
+                continue
+
+            current.append(ch)
+            i += 1
+
+        segment = "".join(current).strip()
+        if segment:
+            segments.append(segment)
+        return segments
 
     @classmethod
     def _is_benign_device_path(cls, path: str) -> bool:
@@ -799,6 +938,41 @@ class ExecTool(Tool):
             r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
             command
         )
-        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
-        home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
+        posix_paths = re.findall(r"(?:^|[\s|>='\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
+        home_paths = re.findall(r"(?:^|[\s>='\"])(~[/+][^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~/ or ~+
         return win_paths + posix_paths + home_paths
+
+    @staticmethod
+    def _normalize_bind_roots(paths: list[str] | None) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for raw in paths or []:
+            value = str(raw).strip()
+            if not value:
+                continue
+            path = Path(os.path.expandvars(value)).expanduser()
+            if not path.is_absolute():
+                continue
+            with suppress(OSError, RuntimeError, ValueError):
+                resolved = path.resolve(strict=False)
+                key = os.path.normcase(os.fspath(resolved))
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(resolved)
+        return roots
+
+    def _active_sandbox_bind_roots(
+        self,
+        workspace_root: Path | None = None,
+    ) -> list[Path]:
+        if self.sandbox != "bwrap" or _IS_WINDOWS:
+            return []
+        roots = [*self.sandbox_ro_binds, *self.sandbox_rw_binds]
+        if workspace_root is None:
+            return roots
+        return [
+            root
+            for root in roots
+            if not is_path_within(workspace_root, root)
+        ]

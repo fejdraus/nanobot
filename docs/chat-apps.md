@@ -16,7 +16,7 @@ a focused setup path for one platform, start with a guide:
 | Email | [Build an Email AI Agent with nanobot](./guides/email-ai-agent.md) |
 | Mattermost | [Build a Mattermost AI Agent with nanobot](./guides/mattermost-ai-agent.md) |
 
-Want to build your own channel? See the [Channel Plugin Guide](./channel-plugin-guide.md).
+Want to build your own channel? See the [Channel Package Guide](./channel-package-guide.md).
 
 Before configuring a chat app, make sure the local CLI path works:
 
@@ -46,8 +46,8 @@ The sections below explain what each chat platform requires and provide manual c
 
 > [!NOTE]
 > If you are upgrading from a version where chat app SDKs were installed by default,
-> install the channel extra in the same Python environment before enabling or
-> restarting that channel:
+> enable the channel in the same Python environment so nanobot installs its
+> manifest-declared dependencies:
 >
 > ```bash
 > nanobot plugins enable <channel>
@@ -109,7 +109,24 @@ If `nanobot channels status` does not show the channel as enabled, the config sn
 <details>
 <summary><b>Telegram</b></summary>
 
-**Install the optional channel dependency**
+**Recommended WebUI setup**
+
+1. Create a bot with `@BotFather` and copy its token.
+2. Run `nanobot webui`, then open **Settings → Channels → Telegram**.
+3. Paste the token. If the gateway cannot reach Telegram directly, expand
+   **Advanced** and add an HTTP or SOCKS proxy.
+4. Save and enable Telegram, then send the bot a direct message.
+
+The configuration badge means nanobot found a saved token. The live connection
+check is separate, so a temporary Telegram or proxy outage does not make an
+existing configuration disappear. Saved tokens and proxy URLs remain masked.
+
+See the [step-by-step Telegram guide](./guides/telegram-ai-agent.md) for pairing
+and troubleshooting.
+
+**Manual setup**
+
+Install the optional channel dependency:
 
 ```bash
 nanobot plugins enable telegram
@@ -133,6 +150,21 @@ nanobot plugins enable telegram
   }
 }
 ```
+
+If the gateway cannot reach Telegram directly, add a proxy to the same section:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "proxy": "http://127.0.0.1:7890"
+    }
+  }
+}
+```
+
+HTTP, HTTPS, SOCKS5, and SOCKS5H proxy URLs are accepted. Treat a proxy URL
+containing a username or password as a secret.
 
 > You can find your **User ID** in Telegram settings. It is shown as `@yourUserId`. Copy this value **without the `@` symbol** and paste it into the config file.
 >
@@ -185,7 +217,7 @@ Uses **Socket.IO WebSocket** by default, with HTTP polling fallback.
 nanobot plugins enable mochat
 ```
 
-Without this extra, Mochat still works through HTTP polling.
+Without these dependencies, Mochat still works through HTTP polling.
 
 **1. Ask nanobot to set up Mochat for you**
 
@@ -392,6 +424,10 @@ nanobot channels login whatsapp
   }
 }
 ```
+
+For groups, `allowFrom` can contain either a participant sender ID/LID or a
+group JID/bare group ID. A participant entry allows that sender wherever the bot
+can see them; a group entry allows replies in that group.
 
 Optional session database path:
 

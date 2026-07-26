@@ -114,6 +114,22 @@ class TestSpawnUnix:
         kwargs = mock_exec.call_args[1]
         assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
 
+    @pytest.mark.asyncio
+    async def test_process_tree_starts_new_session(self):
+        with (
+            patch("nanobot.agent.tools.shell._IS_WINDOWS", False),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+        ):
+            mock_exec.return_value = AsyncMock()
+            await ExecTool._spawn(
+                "echo hi",
+                "/tmp",
+                {"HOME": "/tmp"},
+                process_tree=True,
+            )
+
+        assert mock_exec.call_args.kwargs["start_new_session"] is True
+
 
 class TestSpawnWindows:
 
@@ -456,6 +472,37 @@ class TestSandboxPlatform:
         mock_wrap.assert_called_once()
         spawned_cmd = mock_spawn.call_args[0][0]
         assert "bwrap" in spawned_cmd
+
+    @pytest.mark.asyncio
+    async def test_bwrap_receives_configured_bind_roots(self, tmp_path):
+        """Configured bwrap bind roots should be forwarded to the sandbox wrapper."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"sandboxed", b"")
+        mock_proc.returncode = 0
+        tool_bin = tmp_path / "tool-bin"
+        tool_cache = tmp_path / "tool-cache"
+
+        with (
+            patch("nanobot.agent.tools.shell._IS_WINDOWS", False),
+            patch("nanobot.agent.tools.shell.wrap_command", return_value="bwrap -- sh -c ls") as mock_wrap,
+            patch.object(ExecTool, "_spawn", return_value=mock_proc),
+            patch.object(ExecTool, "_guard_command", return_value=None),
+        ):
+            tool = ExecTool(
+                sandbox="bwrap",
+                working_dir="/workspace",
+                sandbox_ro_binds=[str(tool_bin)],
+                sandbox_rw_binds=[str(tool_cache)],
+            )
+            await tool.execute(command="ls")
+
+        kwargs = mock_wrap.call_args.kwargs
+        assert kwargs["sandbox_ro_binds"] == [
+            str(tool_bin.resolve(strict=False))
+        ]
+        assert kwargs["sandbox_rw_binds"] == [
+            str(tool_cache.resolve(strict=False))
+        ]
 
 
 # ---------------------------------------------------------------------------

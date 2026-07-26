@@ -106,3 +106,4 @@ AGENTS.md
 exp/
 .playwright-mcp/
 bridge/node_modules/
+webui/.verify-*

@@ -58,17 +58,11 @@ def _make_loop(tmp_path):
     return loop
 
 
-async def test_runner_uses_raw_messages_when_context_governance_fails():
+async def test_runner_propagates_context_governance_failure():
     from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock()
-    captured_messages: list[dict] = []
-
-    async def chat_with_retry(*, messages, **kwargs):
-        captured_messages[:] = messages
-        return LLMResponse(content="done", tool_calls=[], usage={})
-
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_with_retry = AsyncMock()
     tools = MagicMock()
     tools.get_definitions.return_value = []
     initial_messages = [
@@ -80,16 +74,16 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
     runner.context_governor.prepare_for_model = MagicMock(  # type: ignore[method-assign]
         side_effect=RuntimeError("boom")
     )
-    result = await runner.run(make_run_spec(provider,
-        initial_messages=initial_messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-    ))
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner.run(make_run_spec(provider,
+            initial_messages=initial_messages,
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        ))
 
-    assert result.final_content == "done"
-    assert captured_messages == initial_messages
+    provider.chat_with_retry.assert_not_awaited()
 
 
 def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch):
@@ -574,7 +568,7 @@ def test_microcompact_overflow_compacts_to_low_watermark(monkeypatch):
 
 
 def test_microcompact_compacts_newest_when_it_alone_overflows(monkeypatch):
-    """The newest result is preserved only while the request can still fit."""
+    """An unfit newest result tells the model to retry narrowly or report the limit."""
     provider = MagicMock()
     provider.generation = SimpleNamespace(max_tokens=0)
     tools = MagicMock()
@@ -611,6 +605,9 @@ def test_microcompact_compacts_newest_when_it_alone_overflows(monkeypatch):
 
     tool_msg = next(m for m in result if m.get("role") == "tool")
     assert "compacted to fit context" in tool_msg["content"]
+    assert "Do not repeat the same call unchanged" in tool_msg["content"]
+    assert "Retry with a narrower path, query, range, or result limit" in tool_msg["content"]
+    assert "tell the user the task cannot fit" in tool_msg["content"]
     assert compacted_tool_call_ids == {"c0"}
 
 
