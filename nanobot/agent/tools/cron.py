@@ -38,8 +38,9 @@ _CRON_PARAMETERS = tool_parameters_schema(
     ),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
     tz=StringSchema(
-        "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
-        "When omitted with cron_expr, the tool's default timezone applies."
+        "Optional IANA timezone for cron_expr and at (e.g. 'America/Vancouver'). "
+        "When omitted, the tool's default timezone applies. Ignored for "
+        "delay_seconds/every_seconds, which are relative to now."
     ),
     at=StringSchema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
@@ -182,8 +183,12 @@ class CronTool(Tool):
             return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         if not origin_channel or not origin_chat_id:
             return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
+        # tz only affects wall-clock schedules (cron_expr / at). For relative ones
+        # (delay_seconds / every_seconds) it carries no meaning, so ignore it instead
+        # of rejecting the call: models pass tz on every cron call, and the hard error
+        # silently swallowed the timer while they still reported success to the user.
         if tz and not cron_expr and not at:
-            return ToolResult.error("Error: tz can only be used with cron_expr or at")
+            tz = None
         if tz:
             if err := self._validate_timezone(tz):
                 return err
