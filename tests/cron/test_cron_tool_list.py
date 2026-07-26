@@ -439,6 +439,65 @@ def test_add_job_captures_owner_and_origin_without_legacy_delivery_fields(tmp_pa
     assert jobs[0].payload.channel_meta == {}
 
 
+def test_add_relative_timer_ignores_tz_instead_of_failing(tmp_path) -> None:
+    """Regression: tz alongside delay_seconds used to abort before the job existed.
+
+    Agents pass tz on every cron call, so "set a timer for 2 minutes" produced no
+    job at all while the agent still told the user the timer was set.
+    """
+    tool = _make_tool(tmp_path)
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Two minutes are up", 120, None, None, "Europe/Kyiv", None)
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.schedule.kind == "at"
+    assert job.schedule.tz is None
+    assert job.delete_after_run is True
+
+
+def test_add_recurring_timer_ignores_tz(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Hourly ping", None, 3600, None, "Europe/Kyiv", None)
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.schedule.kind == "every"
+    assert job.schedule.every_ms == 3_600_000
+
+
+def test_relative_timer_tolerates_unusable_tz(tmp_path) -> None:
+    """A tz that cannot apply must not fail the call — it is dropped, not validated."""
+    tool = _make_tool(tmp_path)
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Timer", 60, None, None, "Not/AZone", None)
+
+    assert result.startswith("Created job")
+
+
+def test_explicit_tz_still_applies_to_at_schedules(tmp_path) -> None:
+    """The fix must not loosen tz handling for wall-clock schedules."""
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(
+            None, "Alarm", None, None, None, "Europe/Kyiv", "2026-07-26T22:00:00"
+        )
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    expected = int(datetime(2026, 7, 26, 19, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert job.schedule.at_ms == expected
+
+
 def test_list_excludes_disabled_jobs(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     job = tool._cron.add_job(
