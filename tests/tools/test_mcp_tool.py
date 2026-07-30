@@ -26,6 +26,14 @@ from nanobot.config.schema import MCPServerConfig
 _PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
+def test_type_checking_only_mcp_annotations_are_deferred() -> None:
+    assert mcp_mod._MCPWrapperBase.__annotations__["_session"] == "ClientSession"
+    assert MCPToolWrapper.__init__.__annotations__["session"] == "ClientSession"
+    assert MCPResourceWrapper.__init__.__annotations__["resource_def"] == "Resource"
+    assert MCPPromptWrapper.__init__.__annotations__["prompt_def"] == "Prompt"
+    assert connect_mcp_servers.__annotations__["mcp_servers"] == "dict[str, MCPServerConfig]"
+
+
 class _FakeTextContent:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -449,7 +457,7 @@ async def test_execute_wraps_mcp_is_error_result() -> None:
     result = await wrapper.execute()
 
     assert result == "Error: server-side MCP failure"
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
 
 
 @pytest.mark.asyncio
@@ -462,7 +470,7 @@ async def test_execute_contains_malformed_success_result() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool returned malformed content: TypeError)"
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
 
 
 @pytest.mark.asyncio
@@ -476,7 +484,7 @@ async def test_registry_adds_retry_hint_to_malformed_mcp_result() -> None:
 
     result = await registry.execute(wrapper.name, {})
 
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
     assert "MCP tool returned malformed content" in result
     assert "Analyze the error above and try a different approach" in result
 
@@ -494,7 +502,7 @@ async def test_execute_preserves_success_text_that_starts_with_error() -> None:
     result = await wrapper.execute()
 
     assert result == "Error: generated report successfully"
-    assert not is_tool_error_result(wrapper.name, result)
+    assert not is_tool_error_result(result)
 
 
 # Smallest valid 1x1 PNG, base64 without the data: prefix.
@@ -562,7 +570,7 @@ async def test_execute_returns_timeout_message() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call timed out after 0.01s)"
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
 
 
 @pytest.mark.asyncio
@@ -575,7 +583,7 @@ async def test_execute_handles_server_cancelled_error() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call was cancelled)"
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
 
 
 @pytest.mark.asyncio
@@ -607,7 +615,7 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
-    assert is_tool_error_result(wrapper.name, result)
+    assert is_tool_error_result(result)
 
 
 def _make_tool_def(name: str) -> SimpleNamespace:
@@ -1631,7 +1639,7 @@ def test_long_server_name_tools_are_matched_by_server_name() -> None:
     assert wrapper._reconnect is not None
     assert other_wrapper._reconnect is None
 
-    removed = mcp_mod._unregister_server_tools(SimpleNamespace(), registry, server_name)
+    removed = mcp_mod._unregister_server_tools(registry, server_name)
 
     assert removed == 1
     assert wrapper.name not in registry.tool_names

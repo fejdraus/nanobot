@@ -21,6 +21,15 @@ class ProviderSnapshot:
     model_preset: str | None = None
 
 
+@dataclass(frozen=True)
+class _ProviderSetup:
+    model: str
+    provider_name: str
+    provider_config: ProviderConfig | None
+    spec: ProviderSpec | None
+    backend: str
+
+
 def _resolve_model_preset(
     config: Config,
     *,
@@ -40,20 +49,20 @@ def _provider_extra_headers(
     return headers or None
 
 
-def _make_provider_core(
+def _resolve_provider_setup(
     config: Config,
     *,
-    preset_name: str | None = None,
-    preset: ModelPresetConfig | None = None,
+    preset: ModelPresetConfig,
     model: str | None = None,
-) -> LLMProvider:
-    """Create a plain LLM provider without failover wrapping."""
-    resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
-    model = model or resolved.model
-    provider_name = config.get_provider_name(model, preset=resolved)
-    p = config.get_provider(model, preset=resolved)
-    spec = find_by_name(provider_name) if provider_name else None
-    if provider_name and not spec and p:
+) -> _ProviderSetup:
+    """Resolve and validate provider configuration without constructing a client."""
+    model = model or preset.model
+    provider_name = config.get_provider_name(model, preset=preset)
+    p = config.get_provider(model, preset=preset)
+    if not provider_name:
+        raise ValueError(f"No provider is configured for model '{model}'.")
+    spec = find_by_name(provider_name)
+    if not spec and p:
         if not p.api_base:
             raise ValueError(f"Provider '{provider_name}' requires api_base in config.")
         spec = create_dynamic_spec(
@@ -81,11 +90,56 @@ def _make_provider_core(
         and not (p and p.api_base)
     ):
         raise ValueError(f"Provider '{provider_name}' requires api_base in config.")
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
+    elif backend in {"anthropic", "openai_compat"} and not (
+        backend == "openai_compat" and model.startswith("bedrock/")
+    ):
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
+
+    return _ProviderSetup(
+        model=model,
+        provider_name=provider_name,
+        provider_config=p,
+        spec=spec,
+        backend=backend,
+    )
+
+
+def validate_provider_setup(
+    config: Config,
+    *,
+    preset_name: str | None = None,
+    preset: ModelPresetConfig | None = None,
+    model: str | None = None,
+) -> None:
+    """Validate local provider/model settings without loading a provider client."""
+    resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
+    _resolve_provider_setup(
+        config,
+        preset=resolved,
+        model=model,
+    )
+
+
+def _make_provider_core(
+    config: Config,
+    *,
+    preset: ModelPresetConfig,
+    model: str | None = None,
+) -> LLMProvider:
+    """Create a plain LLM provider without failover wrapping."""
+    setup = _resolve_provider_setup(
+        config,
+        preset=preset,
+        model=model,
+    )
+    model = setup.model
+    provider_name = setup.provider_name
+    p = setup.provider_config
+    spec = setup.spec
+    backend = setup.backend
 
     if backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
@@ -106,6 +160,8 @@ def _make_provider_core(
     elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
+        if p is None or p.api_base is None:
+            raise RuntimeError("validated Azure provider setup is missing api_base")
         provider = AzureOpenAIProvider(
             api_key=p.api_key or "",
             api_base=p.api_base,
@@ -120,7 +176,7 @@ def _make_provider_core(
 
         provider = AnthropicProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model, preset=resolved),
+            api_base=config.get_api_base(model, preset=preset),
             default_model=model,
             extra_headers=_provider_extra_headers(spec, p),
         )
@@ -140,7 +196,7 @@ def _make_provider_core(
 
         provider = OpenAICompatProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model, preset=resolved),
+            api_base=config.get_api_base(model, preset=preset),
             default_model=model,
             extra_headers=_provider_extra_headers(spec, p),
             spec=spec,
@@ -150,7 +206,7 @@ def _make_provider_core(
             proxy=p.proxy if p else None,
         )
 
-    provider.generation = resolved.to_generation_settings()
+    provider.generation = preset.to_generation_settings()
     return provider
 
 
@@ -197,16 +253,14 @@ def make_provider(
     the failover path to create providers for fallback models.
     """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
-    provider = _make_provider_core(config, preset_name=preset_name, preset=preset, model=model)
+    provider = _make_provider_core(config, preset=resolved, model=model)
     fallback_presets = _resolve_fallback_presets(config, resolved)
 
     if fallback_presets:
         provider = FallbackProvider(
             primary=provider,
             fallback_presets=fallback_presets,
-            provider_factory=lambda fb: _make_provider_core(
-                config, preset_name=preset_name, preset=fb
-            ),
+            provider_factory=lambda fb: _make_provider_core(config, preset=fb),
         )
 
     return provider
@@ -319,6 +373,9 @@ def load_provider_snapshot(
     from nanobot.config.loader import load_config, resolve_config_env_vars
 
     return build_provider_snapshot(
-        resolve_config_env_vars(load_config(config_path)),
+        resolve_config_env_vars(
+            load_config(config_path),
+            config_path=config_path,
+        ),
         preset_name=preset_name,
     )

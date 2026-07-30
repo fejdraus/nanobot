@@ -334,27 +334,36 @@ def test_write_stdin_can_wait_for_expected_output(tmp_path):
 
 
 def test_write_stdin_wait_for_reports_timeout_without_killing_session(tmp_path):
-    async def run() -> tuple[str, str, str]:
+    async def run() -> tuple[str, str, str, str]:
         manager = ExecSessionManager()
         exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
         stdin_tool = WriteStdinTool(manager=manager)
-        command = _waiting_shell_command("booting")
+        command = _waiting_shell_command("booting", delayed="ready")
 
-        initial = await exec_tool.execute(command=command, yield_time_ms=100)
+        initial = await exec_tool.execute(command=command, yield_time_ms=0)
         sid = _session_id(initial)
+        # Synchronize on an stdin-gated marker before exercising the immediate timeout below.
+        ready = await stdin_tool.execute(
+            session_id=sid,
+            chars="\n",
+            wait_for="ready",
+            wait_timeout_ms=10000,
+            yield_time_ms=0,
+        )
         waited = await stdin_tool.execute(
             session_id=sid,
             wait_for="never-ready",
-            wait_timeout_ms=200,
+            wait_timeout_ms=0,
             yield_time_ms=0,
         )
         cleanup = await stdin_tool.execute(session_id=sid, terminate=True, yield_time_ms=0)
-        return initial, waited, cleanup
+        return initial, ready, waited, cleanup
 
-    initial, waited, cleanup = asyncio.run(run())
+    initial, ready, waited, cleanup = asyncio.run(run())
 
     assert "Process running" in initial
-    assert "booting" in initial + waited
+    assert "booting" in initial + ready
+    assert "ready" in ready
     assert "Process running" in waited
     assert "Wait target not observed: 'never-ready'" in waited
     assert "Session terminated." in cleanup
@@ -380,7 +389,7 @@ def test_write_stdin_reports_missing_session(tmp_path):
     result = asyncio.run(tool.execute(session_id="missing\nExit code: 0", chars=""))
 
     assert result == "Error: exec session not found: 'missing\\nExit code: 0'"
-    assert is_tool_error_result("write_stdin", result)
+    assert is_tool_error_result(result)
 
 
 def test_list_exec_sessions_reports_running_commands(tmp_path):
@@ -584,7 +593,7 @@ def test_agent_loop_shutdown_closes_exec_sessions(tmp_path, monkeypatch):
 
         monkeypatch.setattr(agent_context, "close_mcp", lambda _state: asyncio.sleep(0))
         loop = object.__new__(AgentLoop)
-        loop._background_tasks = []
+        loop._background_tasks = set()
         loop._exec_session_manager = manager
         loop.subagents = SimpleNamespace(close=AsyncMock())
 
@@ -601,7 +610,7 @@ def test_agent_loop_shutdown_closes_exec_sessions(tmp_path, monkeypatch):
 def test_agent_loop_shutdown_attempts_all_cleanup_after_errors(monkeypatch):
     async def run() -> None:
         loop = object.__new__(AgentLoop)
-        loop._background_tasks = []
+        loop._background_tasks = set()
         loop.subagents = SimpleNamespace(
             close=AsyncMock(side_effect=RuntimeError("subagent cleanup failed")),
         )
@@ -754,7 +763,7 @@ def test_terminate_by_owner_skips_sessions_without_owner_key(tmp_path):
 def test_agent_loop_shutdown_preserves_single_cleanup_error(monkeypatch):
     async def run() -> None:
         loop = object.__new__(AgentLoop)
-        loop._background_tasks = []
+        loop._background_tasks = set()
         loop.subagents = SimpleNamespace(
             close=AsyncMock(side_effect=RuntimeError("subagent cleanup failed")),
         )

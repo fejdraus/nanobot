@@ -1,5 +1,7 @@
 """Provider wrapper that transparently fails over to fallback models on error."""
 
+# pyright: reportIncompatibleMethodOverride=false, reportIncompatibleVariableOverride=false
+
 from __future__ import annotations
 
 import time
@@ -8,12 +10,11 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
 
 # Circuit breaker tuned to match OpenAICompatProvider's Responses API breaker.
 _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
-_MISSING = object()
 _FALLBACK_ERROR_KINDS = frozenset({
     "timeout",
     "connection",
@@ -122,11 +123,11 @@ class FallbackProvider(LLMProvider):
         self._primary_tripped_at: float | None = None
 
     @property
-    def generation(self):
+    def generation(self) -> GenerationSettings:
         return self._primary.generation
 
     @generation.setter
-    def generation(self, value):
+    def generation(self, value: GenerationSettings) -> None:
         self._primary.generation = value
 
     def get_default_model(self) -> str:
@@ -279,25 +280,17 @@ class FallbackProvider(LLMProvider):
 
             await self._notify_fallback_model(fallback_model)
 
-            original_values = {
-                name: kwargs.get(name, _MISSING)
-                for name in ("model", "max_tokens", "temperature", "reasoning_effort")
+            fallback_kwargs = {
+                **kwargs,
+                "model": fallback_model,
+                "max_tokens": fallback.max_tokens,
+                "temperature": fallback.temperature,
             }
-            kwargs["model"] = fallback_model
-            kwargs["max_tokens"] = fallback.max_tokens
-            kwargs["temperature"] = fallback.temperature
             if fallback.reasoning_effort is None:
-                kwargs.pop("reasoning_effort", None)
+                fallback_kwargs.pop("reasoning_effort", None)
             else:
-                kwargs["reasoning_effort"] = fallback.reasoning_effort
-            try:
-                fallback_response = await call(fallback_provider, kwargs)
-            finally:
-                for name, value in original_values.items():
-                    if value is _MISSING:
-                        kwargs.pop(name, None)
-                    else:
-                        kwargs[name] = value
+                fallback_kwargs["reasoning_effort"] = fallback.reasoning_effort
+            fallback_response = await call(fallback_provider, fallback_kwargs)
 
             if fallback_response.finish_reason != "error":
                 logger.info(

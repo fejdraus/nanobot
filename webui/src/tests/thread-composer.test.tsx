@@ -446,6 +446,9 @@ describe("ThreadComposer", () => {
     );
 
     expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    const modelPill = screen.getByText("gpt-4o").closest(".composer-model-pill");
+    expect(modelPill).toHaveClass("font-medium", "text-foreground/70");
+    expect(modelPill).not.toHaveClass("font-semibold");
     expect(screen.getByTestId("composer-model-logo-openai")).toBeInTheDocument();
     const input = screen.getByPlaceholderText("Type your message...");
     expect(input.className).toContain("min-h-[50px]");
@@ -822,10 +825,10 @@ describe("ThreadComposer", () => {
     expect(onTranscribeAudio).not.toHaveBeenCalled();
   });
 
-  it("warns during recording when microphone input is silent", async () => {
+  it("transcribes recorded audio even when waveform samples are silent", async () => {
     mockVoiceRecorder();
     mockVoiceAudioInput();
-    const onTranscribeAudio = vi.fn(async () => "should not appear");
+    const onTranscribeAudio = vi.fn(async () => "quiet voice");
     render(
       <ThreadComposer
         onSend={vi.fn()}
@@ -840,9 +843,11 @@ describe("ThreadComposer", () => {
       await new Promise((resolve) => setTimeout(resolve, 1_150));
     });
 
-    expect(screen.getByText("No microphone input detected.")).toBeInTheDocument();
+    expect(screen.queryByText("No microphone input detected.")).not.toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: "Stop recording" }));
-    expect(onTranscribeAudio).not.toHaveBeenCalled();
+
+    await waitFor(() => expect(onTranscribeAudio).toHaveBeenCalledTimes(1));
+    expect(screen.getByDisplayValue("quiet voice")).toBeInTheDocument();
   });
 
   it("does not treat unavailable microphone levels as silence", async () => {
@@ -1475,12 +1480,29 @@ describe("ThreadComposer", () => {
         <ThreadComposer
           onSend={vi.fn()}
           placeholder="Type your message..."
-          skills={[{
-            name: skillName,
-            description: "Fetch and summarize the latest AI research papers every day",
-            source: "builtin",
-            available: true,
-          }]}
+          skills={[
+            {
+              name: skillName,
+              description: "Fetch and summarize the latest AI research papers every day",
+              source: "builtin",
+              enabled: true,
+              available: true,
+            },
+            {
+              name: "arxiv-disabled",
+              description: "Disabled research workflow",
+              source: "builtin",
+              enabled: false,
+              available: true,
+            },
+            {
+              name: "arxiv-unavailable",
+              description: "Unavailable research workflow",
+              source: "builtin",
+              enabled: true,
+              available: false,
+            },
+          ]}
           slashCommands={COMMANDS}
         />,
     );
@@ -1496,11 +1518,87 @@ describe("ThreadComposer", () => {
     const name = within(option).getByText(skillName);
     expect(name).not.toHaveClass("truncate");
     expect(within(option).queryByText(`$${skillName}`)).not.toBeInTheDocument();
+    expect(within(palette).queryByText("arxiv-disabled")).not.toBeInTheDocument();
+    expect(within(palette).queryByText("arxiv-unavailable")).not.toBeInTheDocument();
     expect(within(palette).queryByText("/model")).not.toBeInTheDocument();
 
     fireEvent.keyDown(input, { key: "Tab" });
 
     expect(input).toHaveValue(`please use $${skillName} `);
+  });
+
+  it("ranks skill name matches ahead of earlier description matches", () => {
+    render(
+      <ThreadComposer
+        onSend={vi.fn()}
+        placeholder="Type your message..."
+        skills={[
+          {
+            name: "skill-creator",
+            description: "Create or update AgentSkills",
+            source: "builtin",
+            available: true,
+          },
+          {
+            name: "setup-update",
+            description: "Configure upgrades",
+            source: "builtin",
+            available: true,
+          },
+          {
+            name: "update-setup",
+            description: "One-time setup wizard",
+            source: "builtin",
+            available: true,
+          },
+          {
+            name: "up",
+            description: "Exact match",
+            source: "workspace",
+            available: true,
+          },
+        ]}
+      />,
+    );
+
+    const input = screen.getByLabelText("Message input");
+    fireEvent.change(input, { target: { value: "$up", selectionStart: 3 } });
+
+    const options = within(screen.getByRole("listbox", { name: "Slash commands" }))
+      .getAllByRole("option");
+    expect(options.map((option) => option.textContent)).toEqual([
+      "upExact match",
+      "update-setupOne-time setup wizard",
+      "setup-updateConfigure upgrades",
+      "skill-creatorCreate or update AgentSkills",
+    ]);
+  });
+
+  it("keeps a recently selected skill visible at the top of the blank skill menu", () => {
+    const skills = Array.from({ length: 9 }, (_, index) => ({
+      name: `skill-${index}`,
+      description: `Skill ${index}`,
+      source: "builtin",
+      available: true,
+    }));
+    render(
+      <ThreadComposer
+        onSend={vi.fn()}
+        placeholder="Type your message..."
+        skills={skills}
+      />,
+    );
+
+    const input = screen.getByLabelText("Message input");
+    fireEvent.change(input, { target: { value: "$skill-8", selectionStart: 8 } });
+    fireEvent.keyDown(input, { key: "Tab" });
+    fireEvent.change(input, { target: { value: "$", selectionStart: 1 } });
+
+    const options = within(screen.getByRole("listbox", { name: "Slash commands" }))
+      .getAllByRole("option");
+    expect(options).toHaveLength(8);
+    expect(options[0]).toHaveTextContent("skill-8");
+    expect(options[0]).toHaveTextContent("Recent");
   });
 
   it("shows right-side source badges so users can distinguish CLI apps from MCP servers", () => {

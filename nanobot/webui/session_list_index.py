@@ -11,19 +11,19 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.manager import (
-    _SESSION_LIST_PREVIEW_MAX_CHARS,
-    _SESSION_LIST_PREVIEW_MAX_RECORDS,
+    _SESSION_LIST_PREVIEW_MAX_CHARS,  # pyright: ignore[reportPrivateUsage]
+    _SESSION_LIST_PREVIEW_MAX_RECORDS,  # pyright: ignore[reportPrivateUsage]
     Session,
     SessionManager,
-    _message_preview_text,
-    _metadata_title,
+    _message_preview_text,  # pyright: ignore[reportPrivateUsage]
+    _metadata_title,  # pyright: ignore[reportPrivateUsage]
 )
 from nanobot.session.model_selection import model_preset_from_metadata
 
@@ -54,7 +54,11 @@ def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, An
         for row in existing_rows or []
         if isinstance(row.get("file"), str)
     }
-    paths = sorted(session_manager.sessions_dir.glob("*.jsonl"))
+    paths = sorted(
+        path
+        for path in session_manager.sessions_dir.glob("*.jsonl")
+        if SessionManager._session_key_from_path(path) is not None  # pyright: ignore[reportPrivateUsage]
+    )
     rows: list[dict[str, Any]] = []
     changed = existing_rows is None
 
@@ -88,12 +92,18 @@ def _read_index_rows(sessions_dir: Path) -> list[dict[str, Any]] | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(data, dict) or data.get("version") != _INDEX_VERSION:
+    if not isinstance(data, dict):
         return None
-    rows = data.get("sessions")
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+    index_data = cast(dict[str, Any], data)
+    if index_data.get("version") != _INDEX_VERSION:
         return None
-    return rows
+    rows = index_data.get("sessions")
+    if not isinstance(rows, list):
+        return None
+    index_rows = cast(list[Any], rows)
+    if not all(isinstance(row, dict) for row in index_rows):
+        return None
+    return [cast(dict[str, Any], row) for row in index_rows]
 
 
 def _write_index_rows(sessions_dir: Path, rows: list[dict[str, Any]]) -> None:
@@ -268,8 +278,9 @@ def _indexed_row_for_session(session: Session, path: Path) -> dict[str, Any]:
 
 
 def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, Any] | None:
-    storage_key = SessionManager._decode_storage_key(path.stem)
-    fallback_key = storage_key or path.stem.replace("_", ":", 1)
+    storage_key = SessionManager._session_key_from_path(path)  # pyright: ignore[reportPrivateUsage]
+    if storage_key is None:
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             first_line = f.readline().strip()
@@ -320,7 +331,7 @@ def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, 
                 fallback_time = datetime.fromtimestamp(signature["mtime_ns"] / 1e9).isoformat()
                 created_at_s = created_at_s or fallback_time
                 updated_at_s = updated_at_s or fallback_time
-            key = data.get("key") or fallback_key
+            key = data.get("key") or storage_key
             activity_signature = _webui_activity_signature(key)
             activity_updated_at = _webui_activity_updated_at(activity_signature)
             return {
@@ -340,7 +351,7 @@ def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, 
                 **activity_signature,
             }
     except Exception:
-        repaired = session_manager._repair(fallback_key)
+        repaired = session_manager._repair(storage_key)  # pyright: ignore[reportPrivateUsage]
         if repaired is None:
             return None
         return _indexed_row_for_session(repaired, path)

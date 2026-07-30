@@ -7,7 +7,7 @@ import pytest
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.loop import AgentLoop, TurnState
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
@@ -34,7 +34,7 @@ from nanobot.session.keys import (
     LAST_CHANNEL_METADATA_KEY,
     UNIFIED_SESSION_KEY,
 )
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import Session
 from nanobot.session.turn_continuation import (
     INTERNAL_CONTINUATION_META,
     INTERNAL_CONTINUATION_RUN_STARTED_AT_META,
@@ -49,7 +49,6 @@ from nanobot.session.webui_turns import (
     maybe_generate_webui_title,
 )
 from nanobot.triggers.local_session_turns import LOCAL_TRIGGER_META
-from nanobot.utils.llm_runtime import LLMRuntime
 
 
 def _mk_loop() -> AgentLoop:
@@ -79,7 +78,7 @@ def _make_full_loop(tmp_path: Path) -> AgentLoop:
     WebuiTurnCoordinator(
         bus=loop.bus,
         sessions=loop.sessions,
-        schedule_background=lambda coro: loop._schedule_background(coro),
+        schedule_background=lambda coro: loop.schedule_background(coro),
     ).subscribe(loop.runtime_events)
     return loop
 
@@ -314,55 +313,6 @@ async def test_generate_webui_title_ignores_cron_internal_turns(tmp_path: Path) 
     loop.provider.chat_with_retry.assert_not_awaited()
 
 
-def test_webui_title_update_uses_captured_llm_runtime(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bus = MessageBus()
-    sessions = SessionManager(tmp_path)
-    scheduled: list[object] = []
-    captured: dict[str, object] = {}
-
-    async def fake_title_after_turn(**kwargs: object) -> bool:
-        captured.update(kwargs)
-        return False
-
-    monkeypatch.setattr(
-        "nanobot.session.webui_turns.maybe_generate_webui_title_after_turn",
-        fake_title_after_turn,
-    )
-    coordinator = WebuiTurnCoordinator(
-        bus=bus,
-        sessions=sessions,
-        schedule_background=lambda coro: scheduled.append(coro),
-    )
-    provider = MagicMock()
-    msg = InboundMessage(
-        channel="websocket",
-        sender_id="u1",
-        chat_id="chat1",
-        content="say hello",
-        metadata={"webui": True},
-    )
-
-    coordinator.capture_title_context(
-        "websocket:chat1",
-        msg,
-        LLMRuntime.capture(provider, "turn-model", context_window_tokens=32_768),
-    )
-    asyncio.run(coordinator.handle_turn_end(
-        msg,
-        session_key="websocket:chat1",
-        latency_ms=None,
-    ))
-
-    assert len(scheduled) == 1
-    asyncio.run(scheduled[0])  # type: ignore[arg-type]
-
-    assert captured["provider"] is provider
-    assert captured["model"] == "turn-model"
-
-
 def test_save_turn_keeps_multimodal_runtime_context_for_model_replay() -> None:
     loop = _mk_loop()
     session = Session(key="test:runtime-only")
@@ -451,7 +401,6 @@ def test_build_and_save_preserves_user_text_containing_goal_guidance_tag(tmp_pat
         [],
         user_text,
         channel="cli",
-        chat_id="direct",
     )
     assert "_meta" not in messages[-1]
 
@@ -476,7 +425,6 @@ def test_build_and_save_preserves_multimodal_user_block_starting_with_runtime_ta
         user_text,
         media=[str(image)],
         channel="cli",
-        chat_id="direct",
     )
 
     loop._save_turn(session, messages, skip=1)
@@ -765,10 +713,9 @@ def test_unified_session_route_ignores_non_user_destinations(
     assert session.metadata[LAST_CHANNEL_METADATA_KEY] == "telegram:existing"
 
 
-# 1x1 PNG used by the media-persistence tests. ``extract_documents`` runs
-# at the top of ``_process_message`` and filters ``msg.media`` down to
-# paths that magic-byte-sniff as images, so the test fixture needs real
-# bytes on disk (not just placeholder paths).
+# 1x1 PNG used by the media-persistence tests. Attachment preparation filters
+# ``msg.media`` down to paths that magic-byte-sniff as images, so the test
+# fixture needs real bytes on disk (not just placeholder paths).
 _PNG_1X1 = (
     b"\x89PNG\r\n\x1a\n"
     b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -1101,7 +1048,7 @@ async def test_websocket_internal_continuation_keeps_single_visible_run(
 
 
 @pytest.mark.asyncio
-async def test_process_message_uses_context_chat_id_for_runtime_prompt(tmp_path: Path) -> None:
+async def test_process_message_keeps_delivery_chat_for_thread_session(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
     loop.context.build_messages = MagicMock(  # type: ignore[method-assign]
@@ -1135,12 +1082,11 @@ async def test_process_message_uses_context_chat_id_for_runtime_prompt(tmp_path:
 
     assert result is not None
     assert result.chat_id == "thread-777"
-    assert loop.context.build_messages.call_args.kwargs["chat_id"] == "parent-456"
     assert loop._run_agent_loop.call_args.kwargs["chat_id"] == "thread-777"
 
 
 @pytest.mark.asyncio
-async def test_process_message_uses_explicit_session_metadata_for_goal_context(
+async def test_process_message_uses_explicit_session_for_goal_context(
     tmp_path: Path,
 ) -> None:
     loop = _make_full_loop(tmp_path)
@@ -1185,10 +1131,10 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
 
     assert result is not None
     assert result.content == "ok"
-    kwargs = loop.context.build_messages.call_args.kwargs
-    assert kwargs["chat_id"] == "chat-with-goal"
-    assert kwargs["session_metadata"] is system_session.metadata
-    assert GOAL_STATE_KEY not in kwargs["session_metadata"]
+    kwargs = loop._run_agent_loop.call_args.kwargs
+    assert kwargs["session"] is system_session
+    assert kwargs["session_key"] == "system"
+    assert GOAL_STATE_KEY not in kwargs["session"].metadata
 
 
 @pytest.mark.asyncio
@@ -1389,7 +1335,7 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
 
     first_msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c4", content="keep progress")
     task = asyncio.create_task(loop._process_message(first_msg))
-    loop._active_tasks[first_msg.session_key] = [task]
+    loop._active_tasks[first_msg.session_key] = {task}
     await asyncio.wait_for(checkpoint_saved.wait(), timeout=1.0)
 
     stop_msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c4", content="/stop")
@@ -1454,7 +1400,7 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
 
     runtime = loop.llm_runtime()
     seen: dict[str, object] = {}
-    record_runtime = MagicMock(wraps=loop._runtime_events().record_turn_runtime)
+    record_runtime = MagicMock(wraps=loop.runtime_event_publisher.record_turn_runtime)
     loop.runtime_event_publisher.record_turn_runtime = record_runtime
 
     async def fake_run_agent_loop(initial_messages, **kwargs):
@@ -1570,27 +1516,26 @@ async def test_system_subagent_followup_does_not_log_content(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_system_subagent_followup_uses_common_turn_state_machine(tmp_path: Path) -> None:
+async def test_system_subagent_followup_uses_common_turn_lifecycle(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(  # type: ignore[method-assign]
         return_value=False
     )
-    visited: list[TurnState] = []
+    visited: list[str] = []
 
-    for state in (
-        TurnState.RESTORE,
-        TurnState.COMPACT,
-        TurnState.COMMAND,
-        TurnState.BUILD,
-        TurnState.RUN,
-        TurnState.SAVE,
-        TurnState.RESPOND,
+    for name in (
+        "_restore_turn",
+        "_compact_session",
+        "_dispatch_command",
+        "_build_turn",
+        "_run_turn",
+        "_persist_turn",
+        "_prepare_outbound",
     ):
-        name = f"_state_{state.name.lower()}"
         original = getattr(loop, name)
 
-        async def record(ctx, *, _original=original, _state=state):
-            visited.append(_state)
+        async def record(ctx, *, _original=original, _name=name):
+            visited.append(_name)
             return await _original(ctx)
 
         setattr(loop, name, record)
@@ -1606,25 +1551,33 @@ async def test_system_subagent_followup_uses_common_turn_state_machine(tmp_path:
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
 
-    await loop._process_message(
-        InboundMessage(
-            channel="system",
-            sender_id="subagent",
-            chat_id="cli:test",
-            content="subagent result",
-            metadata={"subagent_task_id": "sub-1"},
+    logs: list[str] = []
+    sink_id = logger.add(logs.append, level="DEBUG", format="{message}")
+    try:
+        await loop._process_message(
+            InboundMessage(
+                channel="system",
+                sender_id="subagent",
+                chat_id="cli:test",
+                content="subagent result",
+                metadata={"subagent_task_id": "sub-1"},
+            )
         )
-    )
+    finally:
+        logger.remove(sink_id)
 
     assert visited == [
-        TurnState.RESTORE,
-        TurnState.COMPACT,
-        TurnState.COMMAND,
-        TurnState.BUILD,
-        TurnState.RUN,
-        TurnState.SAVE,
-        TurnState.RESPOND,
+        "_restore_turn",
+        "_compact_session",
+        "_dispatch_command",
+        "_build_turn",
+        "_run_turn",
+        "_persist_turn",
+        "_prepare_outbound",
     ]
+    logged = "".join(logs)
+    for stage in ("restore", "compact", "command", "build", "run", "save", "respond"):
+        assert f"Stage {stage} completed in" in logged
 
 
 @pytest.mark.asyncio
@@ -1687,9 +1640,7 @@ def test_subagent_followup_uses_user_model_input_and_assistant_history(tmp_path:
     projected = builder.build_messages(
         history=history,
         current_message="subagent result",
-        current_role="user",
         channel="cli",
-        chat_id="merge",
     )
 
     non_system = [m for m in projected if m.get("role") != "system"]

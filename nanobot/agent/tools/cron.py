@@ -1,13 +1,15 @@
 """Cron tool for scheduling reminders and tasks."""
 
+# pyright: reportIncompatibleMethodOverride=false
+
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import current_request_context
+from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.agent.tools.schema import (
     IntegerSchema,
     StringSchema,
@@ -29,11 +31,9 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "Not used for action='list' or action='remove'."
     ),
     delay_seconds=IntegerSchema(
-        0,
         description="One-time timer: fire once after N seconds (e.g. 300 for 5 min). Use for 'remind me in X minutes'",
     ),
     every_seconds=IntegerSchema(
-        0,
         description="Recurring: repeat every N seconds. Use ONLY for 'remind me every X hours'",
     ),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
@@ -69,12 +69,15 @@ class CronTool(Tool):
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
     @classmethod
-    def enabled(cls, ctx: Any) -> bool:
+    def enabled(cls, ctx: ToolContext) -> bool:
         return ctx.cron_service is not None
 
     @classmethod
-    def create(cls, ctx: Any) -> Tool:
-        return cls(cron_service=ctx.cron_service, default_timezone=ctx.timezone)
+    def create(cls, ctx: ToolContext) -> Tool:
+        cron_service = ctx.cron_service
+        if cron_service is None:
+            raise RuntimeError("CronTool requires an initialized cron service")
+        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:
@@ -88,11 +91,11 @@ class CronTool(Tool):
         )
         return session_key, ctx.channel or "", ctx.chat_id or "", dict(ctx.metadata or {})
 
-    def set_cron_context(self, active: bool):
+    def set_cron_context(self, active: bool) -> Token[bool]:
         """Mark whether the tool is executing inside a cron job callback."""
         return self._in_cron_context.set(active)
 
-    def reset_cron_context(self, token) -> None:
+    def reset_cron_context(self, token: Token[bool]) -> None:
         """Restore previous cron context."""
         self._in_cron_context.reset(token)
 
@@ -148,8 +151,6 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
-        deliver: bool = True,
-        **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
@@ -286,7 +287,7 @@ class CronTool(Tool):
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
-        lines = []
+        lines: list[str] = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]

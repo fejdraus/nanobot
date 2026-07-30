@@ -4,7 +4,7 @@ import base64
 import mimetypes
 import platform
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -69,7 +69,8 @@ class ContextBuilder:
 
     def build_system_prompt(
         self,
-        skill_names: list[str] | None = None,
+        *,
+        active_skill_names: Sequence[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
         workspace: Path | None = None,
@@ -87,17 +88,22 @@ class ContextBuilder:
 
         parts.append(render_template("agent/tool_contract.md"))
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+        memory = self.memory.read_memory()
+        if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        active_skills = self.skills.get_always_skills()
+        active_skills.extend(
+            name
+            for name in (active_skill_names or ())
+            if name not in active_skills
+        )
+        if active_skills:
+            active_content = self.skills.load_skills_for_context(active_skills)
+            if active_content:
+                parts.append(f"# Active Skills\n\n{active_content}")
 
-        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
+        skills_summary = self.skills.build_skills_summary(exclude=set(active_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
@@ -148,7 +154,12 @@ class ContextBuilder:
 
         def _to_blocks(value: Any) -> list[dict[str, Any]]:
             if isinstance(value, list):
-                return [item if isinstance(item, dict) else {"type": "text", "text": str(item)} for item in value]
+                return [
+                    cast(dict[str, Any], item)
+                    if isinstance(item, dict)
+                    else {"type": "text", "text": str(item)}
+                    for item in cast(list[Any], value)
+                ]
             if value is None:
                 return []
             return [{"type": "text", "text": str(value)}]
@@ -157,7 +168,7 @@ class ContextBuilder:
 
     def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
         """Load project instructions plus the agent's global profile files."""
-        parts = []
+        parts: list[str] = []
         project_root = workspace or self.workspace
         sources = [
             ("AGENTS.md", project_root),
@@ -196,14 +207,11 @@ class ContextBuilder:
         self,
         history: list[dict[str, Any]],
         current_message: str,
-        skill_names: list[str] | None = None,
+        *,
         media: list[str] | None = None,
         channel: str | None = None,
-        chat_id: str | None = None,
         current_role: str = "user",
-        sender_id: str | None = None,
         session_summary: str | None = None,
-        session_metadata: Mapping[str, Any] | None = None,
         runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
         workspace: Path | None = None,
         include_memory_recent_history: bool = True,
@@ -212,14 +220,19 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
-        user_content = self._build_user_content(current_message, media)
+        active_skill_names = (
+            self.skills.get_explicitly_invoked_skills(current_message)
+            if current_role == "user"
+            else []
+        )
+        user_content = self.build_user_content(current_message, image_paths=media)
         blocks = list(runtime_context_blocks or ()) if current_role == "user" else []
         merged, runtime_context_meta = append_runtime_context(user_content, blocks)
-        messages = [
+        messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": self.build_system_prompt(
-                    skill_names,
+                    active_skill_names=active_skill_names,
                     channel=channel,
                     session_summary=session_summary,
                     workspace=root,
@@ -239,47 +252,43 @@ class ContextBuilder:
                 last["_meta"] = internal_meta
             messages[-1] = last
             return messages
-        current = {"role": current_role, "content": merged}
+        current: dict[str, Any] = {"role": current_role, "content": merged}
         if current_role == "user" and runtime_context_meta is not None:
             current["_meta"] = {RUNTIME_CONTEXT_MESSAGE_META: runtime_context_meta}
         messages.append(current)
         return messages
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+    def build_user_content(
+        self,
+        text: str,
+        image_paths: list[str] | None,
+    ) -> str | list[dict[str, Any]]:
+        """Build user message content from prefiltered image paths."""
         from loguru import logger
 
-        if not media:
+        if not image_paths:
             return text
 
-        images = []
-        for path in media:
+        image_blocks: list[dict[str, Any]] = []
+        for path in image_paths:
             p = Path(path)
             if not p.is_file():
                 logger.warning("Media file not found: {}", path)
                 continue
             raw = p.read_bytes()
+            # Re-detect from the bytes used for the request: the file may have
+            # changed since attachment routing, and the data URL needs its MIME.
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({
+            image_blocks.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
                 "_meta": {"path": str(p)},
             })
             logger.debug("Image attached to LLM request: {} ({}, {} bytes)", path, mime, len(raw))
 
-        if not images:
+        if not image_blocks:
             return text
-        return images + [{"type": "text", "text": text}]
-
-    def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
-    ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append(
-            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
-        )
-        return messages
+        return image_blocks + [{"type": "text", "text": text}]

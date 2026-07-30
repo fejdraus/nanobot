@@ -28,7 +28,10 @@ from nanobot.utils.progress_events import (
     invoke_file_edit_progress,
     on_progress_accepts_file_edit_events,
 )
-from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
+from nanobot.webui.metadata import (
+    WEBSOCKET_TURN_OWNER_METADATA_KEY,
+    WEBUI_TURN_METADATA_KEY,
+)
 
 
 def _make_loop(tmp_path: Path) -> AgentLoop:
@@ -49,7 +52,7 @@ def _attach_webui_runtime_events(loop: AgentLoop, bus: MessageBus) -> None:
     coordinator = WebuiTurnCoordinator(
         bus=bus,
         sessions=loop.sessions,
-        schedule_background=lambda coro: loop._schedule_background(coro),
+        schedule_background=lambda coro: loop.schedule_background(coro),
     )
     coordinator.subscribe(loop.runtime_events)
 
@@ -903,6 +906,12 @@ class TestToolEventProgress:
         turn_id = turn_ids.pop()
         assert isinstance(turn_id, str)
         assert turn_id.startswith("subagent:")
+        owners = {
+            message.metadata.get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+            for message in visible_events
+        }
+        assert len(owners) == 1
+        assert isinstance(owners.pop(), str)
         assert all(
             (message.channel, message.chat_id) == ("websocket", "chat-a")
             and message.metadata.get("webui") is True
@@ -910,6 +919,7 @@ class TestToolEventProgress:
             and set(message.metadata) <= {
                 "webui",
                 "_wants_stream",
+                WEBSOCKET_TURN_OWNER_METADATA_KEY,
                 WEBUI_TURN_METADATA_KEY,
                 "latency_ms",
             }
@@ -1193,7 +1203,7 @@ class TestToolEventProgress:
             elif hasattr(coro, "close"):
                 coro.close()
 
-        loop._schedule_background = schedule_background  # type: ignore[method-assign]
+        loop.schedule_background = schedule_background  # type: ignore[method-assign]
 
         await loop._dispatch(InboundMessage(
             channel="websocket",
@@ -1239,7 +1249,7 @@ class TestToolEventProgress:
             fake_title_after_turn,
         )
         scheduled: list[object] = []
-        loop._schedule_background = scheduled.append  # type: ignore[method-assign]
+        loop.schedule_background = scheduled.append  # type: ignore[method-assign]
 
         await loop._dispatch(InboundMessage(
             channel="websocket",

@@ -272,14 +272,12 @@ def test_channels_config_has_no_per_channel_fields():
     assert cfg.send_tool_hints is True
     assert cfg.extract_document_text is True
 
-    opted_out = ChannelsConfig.model_validate({"sendToolHints": False})
+    opted_out = ChannelsConfig.model_validate({
+        "sendToolHints": False,
+        "extractDocumentText": False,
+    })
     assert opted_out.send_tool_hints is False
-
-
-def test_channels_config_extract_document_text_accepts_camel_alias():
-    cfg = ChannelsConfig.model_validate({"extractDocumentText": False})
-
-    assert cfg.extract_document_text is False
+    assert opted_out.extract_document_text is False
 
 
 @pytest.mark.parametrize(
@@ -788,35 +786,6 @@ def test_discover_plugins_skips_names_outside_enabled_set():
     assert loaded == []
 
 
-def test_discover_plugins_warns_once_for_legacy_entry_points():
-    from nanobot.channels.registry import _warn_legacy_channel_entry_points, discover_plugins
-
-    legacy_entry_points = [SimpleNamespace(name="z-old"), SimpleNamespace(name="a-old")]
-    _warn_legacy_channel_entry_points.cache_clear()
-    try:
-        with (
-            patch(
-                "nanobot.channels.registry.entry_points",
-                return_value=legacy_entry_points,
-            ) as metadata_entry_points,
-            patch("nanobot.channels.registry._channel_package_names", return_value=[]),
-            patch("nanobot.channels.registry.logger.warning") as warning,
-        ):
-            discover_plugins()
-            discover_plugins()
-    finally:
-        _warn_legacy_channel_entry_points.cache_clear()
-
-    metadata_entry_points.assert_called_once_with(group="nanobot.channels")
-    warning.assert_called_once_with(
-        "Legacy channel entry points were detected but will not be loaded: {}. "
-        "The '{}' entry-point group is no longer supported; use a built-in channel or "
-        "migrate it into nanobot/channels/<channel>/.",
-        "a-old, z-old",
-        "nanobot.channels",
-    )
-
-
 def test_channel_manifest_rejects_invalid_dependency_metadata():
     with pytest.raises(TypeError, match="tuple of requirements"):
         ChannelPlugin(
@@ -1248,6 +1217,7 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
         async def login(self, force: bool = False) -> bool:
             seen["force"] = force
             seen["config"] = self.config
+            seen["bus"] = self.bus
             return True
 
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda config_path=None: Config())
@@ -1260,6 +1230,7 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
 
     assert result.exit_code == 0
     assert seen["force"] is True
+    assert isinstance(seen["bus"], MessageBus)
 
 
 def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
@@ -1523,12 +1494,197 @@ def test_repository_dependency_installer_selects_all_channel_manifests(monkeypat
     monkeypatch.setattr(dependencies, "discover_plugins", lambda: plugins)
     monkeypatch.setattr(
         dependencies,
-        "ensure_enabled_channel_dependencies",
+        "ensure_repository_channel_dependencies",
         lambda names, discovered: prepared.append((names, discovered)) or {},
     )
 
     assert dependencies.main(["--all-channels"]) == 0
     assert prepared == [(set(plugins), plugins)]
+
+
+def test_repository_dependency_installer_batches_missing_manifests(monkeypatch):
+    from nanobot.optional_features import InstallResult
+    from scripts import install_channel_dependencies as dependencies
+
+    plugins = {
+        "second": ChannelPlugin(
+            name="second",
+            display_name="Second",
+            runtime="missing.second.runtime:SecondChannel",
+            dependencies=("shared-sdk>=1", "second-sdk>=2"),
+        ),
+        "first": ChannelPlugin(
+            name="first",
+            display_name="First",
+            runtime="missing.first.runtime:FirstChannel",
+            dependencies=("first-sdk>=1", "shared-sdk>=1"),
+        ),
+        "ready": ChannelPlugin(
+            name="ready",
+            display_name="Ready",
+            runtime="missing.ready.runtime:ReadyChannel",
+            dependencies=("ready-sdk>=1",),
+        ),
+    }
+    batch_installed = False
+    installs: list[tuple[str, list[str]]] = []
+
+    def extra_installed(name: str, _requirements: list[str]) -> bool:
+        return name == "ready" or batch_installed
+
+    def install_extra(name: str, requirements: list[str]) -> InstallResult:
+        nonlocal batch_installed
+        installs.append((name, requirements))
+        batch_installed = True
+        return InstallResult(True, name, ["pip"])
+
+    monkeypatch.setattr(dependencies, "extra_installed", extra_installed)
+    monkeypatch.setattr(dependencies, "install_extra", install_extra)
+    monkeypatch.setattr(
+        dependencies,
+        "ensure_enabled_channel_dependencies",
+        lambda _names, _plugins: pytest.fail("verified batch must not use the fallback"),
+    )
+
+    failures = dependencies.ensure_repository_channel_dependencies(set(plugins), plugins)
+
+    assert failures == {}
+    assert installs == [
+        (
+            "channel-dependencies",
+            ["first-sdk>=1", "shared-sdk>=1", "second-sdk>=2"],
+        )
+    ]
+
+
+def test_repository_dependency_installer_falls_back_after_batch_failure(monkeypatch):
+    from nanobot.optional_features import InstallResult
+    from scripts import install_channel_dependencies as dependencies
+
+    plugins = {
+        name: ChannelPlugin(
+            name=name,
+            display_name=name.title(),
+            runtime=f"missing.{name}.runtime:Channel",
+            dependencies=(f"{name}-sdk>=1",),
+        )
+        for name in ("first", "second")
+    }
+    fallbacks: list[set[str]] = []
+    fallback_finished = False
+
+    def extra_installed(name: str, _requirements: list[str]) -> bool:
+        return fallback_finished and name == "first"
+
+    def fallback(names: set[str], _plugins: dict[str, ChannelPlugin]) -> dict[str, str]:
+        nonlocal fallback_finished
+        fallbacks.append(names)
+        fallback_finished = True
+        return {"second": "install failed"}
+
+    monkeypatch.setattr(dependencies, "extra_installed", extra_installed)
+    monkeypatch.setattr(
+        dependencies,
+        "install_extra",
+        lambda name, _requirements: InstallResult(False, name, ["pip"]),
+    )
+    monkeypatch.setattr(
+        dependencies,
+        "ensure_enabled_channel_dependencies",
+        fallback,
+    )
+
+    failures = dependencies.ensure_repository_channel_dependencies(set(plugins), plugins)
+
+    assert failures == {"second": "install failed"}
+    assert fallbacks == [set(plugins)]
+
+
+def test_repository_dependency_installer_rechecks_each_channel_after_batch(monkeypatch):
+    from nanobot.optional_features import InstallResult
+    from scripts import install_channel_dependencies as dependencies
+
+    plugins = {
+        name: ChannelPlugin(
+            name=name,
+            display_name=name.title(),
+            runtime=f"missing.{name}.runtime:Channel",
+            dependencies=(f"{name}-sdk>=1",),
+        )
+        for name in ("first", "second")
+    }
+    batch_finished = False
+    fallback_finished = False
+    fallbacks: list[set[str]] = []
+
+    def extra_installed(name: str, _requirements: list[str]) -> bool:
+        if fallback_finished:
+            return True
+        if batch_finished:
+            return name == "second"
+        return name == "first"
+
+    def install_extra(name: str, _requirements: list[str]) -> InstallResult:
+        nonlocal batch_finished
+        batch_finished = True
+        return InstallResult(True, name, ["pip"])
+
+    def fallback(names: set[str], _plugins: dict[str, ChannelPlugin]) -> dict[str, str]:
+        nonlocal fallback_finished
+        fallbacks.append(names)
+        fallback_finished = True
+        return {}
+
+    monkeypatch.setattr(dependencies, "extra_installed", extra_installed)
+    monkeypatch.setattr(dependencies, "install_extra", install_extra)
+    monkeypatch.setattr(
+        dependencies,
+        "ensure_enabled_channel_dependencies",
+        fallback,
+    )
+
+    failures = dependencies.ensure_repository_channel_dependencies(set(plugins), plugins)
+
+    assert failures == {}
+    assert fallbacks == [{"first"}]
+
+
+def test_repository_dependency_installer_reports_conflict_after_fallback(monkeypatch):
+    from nanobot.optional_features import InstallResult
+    from scripts import install_channel_dependencies as dependencies
+
+    plugins = {
+        name: ChannelPlugin(
+            name=name,
+            display_name=name.title(),
+            runtime=f"missing.{name}.runtime:Channel",
+            dependencies=(f"{name}-sdk>=1",),
+        )
+        for name in ("first", "second")
+    }
+    fallback_finished = False
+
+    def extra_installed(name: str, _requirements: list[str]) -> bool:
+        return fallback_finished and name == "second"
+
+    def fallback(_names: set[str], _plugins: dict[str, ChannelPlugin]) -> dict[str, str]:
+        nonlocal fallback_finished
+        fallback_finished = True
+        return {}
+
+    monkeypatch.setattr(dependencies, "extra_installed", extra_installed)
+    monkeypatch.setattr(
+        dependencies,
+        "install_extra",
+        lambda name, _requirements: InstallResult(False, name, ["pip"]),
+    )
+    monkeypatch.setattr(dependencies, "ensure_enabled_channel_dependencies", fallback)
+
+    failures = dependencies.ensure_repository_channel_dependencies(set(plugins), plugins)
+
+    assert failures == {
+        "first": "Channel dependencies could not be installed. Check gateway logs."
+    }
 
 
 def test_repository_dependency_installer_rejects_unknown_channel(monkeypatch, capsys):
@@ -1551,7 +1707,7 @@ def test_repository_dependency_installer_propagates_install_failure(monkeypatch,
     monkeypatch.setattr(dependencies, "discover_plugins", lambda: {"demo": plugin})
     monkeypatch.setattr(
         dependencies,
-        "ensure_enabled_channel_dependencies",
+        "ensure_repository_channel_dependencies",
         lambda _names, _plugins: {"demo": "dependency install failed"},
     )
 
@@ -2419,6 +2575,12 @@ def test_optional_dependency_metadata_for_enable():
     ]
     assert deps["pdf"] == ["pypdf>=5.0.0,<6.0.0"]
     assert deps["langfuse"] == ["langfuse>=3.0.0,<4.0.0"]
+    assert deps["olostep"] == ["olostep>=0.1.0; python_version < '3.14'"]
+    expected_olostep_args = [] if sys.version_info >= (3, 14) else ["olostep>=0.1.0"]
+    assert optional_features.install_args_for_extra("olostep", deps["olostep"]) == (
+        expected_olostep_args,
+        "olostep support",
+    )
     channel_names = {
         "dingtalk",
         "discord",
