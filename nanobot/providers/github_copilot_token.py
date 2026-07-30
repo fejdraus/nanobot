@@ -14,18 +14,18 @@ REFRESH_THRESHOLD_SECONDS = 300
 
 class CopilotTokenManager:
     """Manages GitHub Copilot tokens with proactive refresh."""
-    
+
     def __init__(self):
         self._auth = Authenticator()
-    
+
     @property
     def token_dir(self) -> str:
         return self._auth.token_dir
-    
+
     @property
     def api_key_file(self) -> str:
         return self._auth.api_key_file
-    
+
     def is_token_usable(self) -> bool:
         """Check if token is valid with 5-minute buffer (like OpenClaw)."""
         try:
@@ -37,7 +37,7 @@ class CopilotTokenManager:
             return (expires_at - now) > REFRESH_THRESHOLD_SECONDS
         except Exception:
             return False
-    
+
     def get_token_info(self) -> dict | None:
         """Get current token info."""
         try:
@@ -45,10 +45,10 @@ class CopilotTokenManager:
                 return json.load(f)
         except Exception:
             return None
-    
+
     def ensure_valid_token(self) -> str:
         """Ensure we have a valid token, refreshing proactively if needed.
-        
+
         Returns the token string.
         Raises exception if unable to get valid token.
         """
@@ -56,28 +56,28 @@ class CopilotTokenManager:
             info = self.get_token_info()
             if info:
                 return info.get("token", "")
-        
+
         # Token expired or expiring soon — refresh
         return self._auth.get_api_key()
-    
+
     def needs_refresh(self) -> tuple[bool, int]:
         """Check if token needs refresh.
-        
+
         Returns (needs_refresh, seconds_until_expiry).
         """
         info = self.get_token_info()
         if not info:
             return True, 0
-        
+
         expires_at = info.get("expires_at", 0)
         now = datetime.now().timestamp()
         seconds_left = int(expires_at - now)
-        
+
         return seconds_left <= REFRESH_THRESHOLD_SECONDS, seconds_left
-    
+
     def refresh(self) -> str:
         """Force refresh the token.
-        
+
         Returns the new token.
         """
         return self._auth.get_api_key()
