@@ -228,7 +228,7 @@ class MessageTool(Tool):
 
         if media:
             try:
-                media = self._resolve_media(media)
+                media = self._resolve_media(cast(list[str], media))
             except (OSError, PermissionError, ValueError) as e:
                 return ToolResult.error(f"Error: media path is not allowed: {str(e)}")
 

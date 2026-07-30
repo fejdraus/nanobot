@@ -1,3 +1,4 @@
+# pyright: basic
 """GitHub Copilot token manager with proactive refresh (like OpenClaw).
 
 Refreshes token 5 minutes before expiry, not after.

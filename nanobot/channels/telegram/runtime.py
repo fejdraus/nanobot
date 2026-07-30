@@ -1586,7 +1586,7 @@ class TelegramChannel(BaseChannel):
         )
 
         metadata = self._build_message_metadata(
-            message, user, is_admin=is_admin, chat_allowed=chat_allowed
+            message, user, is_admin=bool(is_admin), chat_allowed=chat_allowed
         )
         session_key = self._derive_topic_session_key(message)
 

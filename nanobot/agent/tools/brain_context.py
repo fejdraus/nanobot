@@ -1,3 +1,4 @@
+# pyright: basic
 """Auto-recall: inject relevant brain memory into each turn's context.
 
 Fork-only tool. It owns a ``RuntimeContextProvider`` that runs
