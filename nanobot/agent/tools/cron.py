@@ -150,6 +150,7 @@ class CronTool(Tool):
         cron_expr: str | None = None,
         tz: str | None = None,
         at: str | None = None,
+        deliver: bool = True,
         job_id: str | None = None,
     ) -> str:
         if action == "add":
