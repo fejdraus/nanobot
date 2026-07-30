@@ -7,7 +7,7 @@ Refreshes token 5 minutes before expiry, not after.
 import json
 from datetime import datetime
 
-from litellm.llms.github_copilot.authenticator import Authenticator
+from litellm.llms.github_copilot.authenticator import Authenticator  # type: ignore
 
 # Refresh token 5 minutes before expiry (like OpenClaw)
 REFRESH_THRESHOLD_SECONDS = 300
