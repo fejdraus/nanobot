@@ -307,9 +307,47 @@ class Tool(ABC):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": _sanitize_tool_schema(deepcopy(self.parameters)),
             },
         }
+
+
+def _sanitize_tool_schema(node: Any) -> Any:
+    """Ensure every JSON-Schema property carries a ``type``.
+
+    Some MCP servers emit property schemas without a ``type`` (e.g. searxng's
+    ``count``). Strict function-calling backends such as Mistral choke on that
+    and leak the tool call into message content instead of returning a
+    structured ``tool_calls``. We fill a best-effort ``type`` recursively so
+    the outgoing schema is always valid. Operates on a caller-owned copy.
+    """
+    if isinstance(node, dict):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            for pdef in props.values():
+                if isinstance(pdef, dict) and not (
+                    pdef.keys() & {"type", "$ref", "anyOf", "oneOf", "allOf"}
+                ):
+                    enum = pdef.get("enum")
+                    if enum:
+                        v = enum[0]
+                        pdef["type"] = (
+                            "boolean" if isinstance(v, bool)
+                            else "integer" if isinstance(v, int)
+                            else "number" if isinstance(v, float)
+                            else "string"
+                        )
+                    elif "properties" in pdef:
+                        pdef["type"] = "object"
+                    elif "items" in pdef:
+                        pdef["type"] = "array"
+                    else:
+                        pdef["type"] = "string"
+                _sanitize_tool_schema(pdef)
+        for key in ("items", "additionalProperties"):
+            if isinstance(node.get(key), dict):
+                _sanitize_tool_schema(node[key])
+    return node
 
 
 def tool_parameters(schema: dict[str, Any]) -> Callable[[type[_ToolT]], type[_ToolT]]:
