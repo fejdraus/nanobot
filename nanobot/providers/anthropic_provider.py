@@ -31,6 +31,36 @@ def _gen_tool_id() -> str:
 
 _VALID_TOOL_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+_CLAUDE_MODEL_VERSION = re.compile(
+    r"claude-(?P<family>[a-z]+)-(?P<major>\d+)"
+    r"(?:-(?P<minor>\d{1,2})(?=-|$))?"
+)
+_ADAPTIVE_ONLY_MIN_VERSIONS = {
+    "opus": (4, 7),
+    "sonnet": (5, 0),
+    "fable": (5, 0),
+    "mythos": (5, 0),
+}
+_THINKING_DISABLE_MIN_VERSIONS = {
+    "opus": (5, 0),
+    "sonnet": (5, 0),
+}
+_SAMPLING_DEPRECATED_MODELS = {"claude-mythos-preview"}
+
+
+def _model_version_at_least(
+    model_name: str,
+    minimum_versions: dict[str, tuple[int, int]],
+) -> bool:
+    match = _CLAUDE_MODEL_VERSION.search(model_name.lower())
+    if match is None:
+        return False
+    minimum = minimum_versions.get(match.group("family"))
+    if minimum is None:
+        return False
+    version = (int(match.group("major")), int(match.group("minor") or 0))
+    return version >= minimum
+
 
 def _sanitize_tool_id(tid: str) -> str:
     """Ensure tool_use/tool_result IDs match Anthropic's required pattern.
@@ -562,13 +592,13 @@ class AnthropicProvider(LLMProvider):
             )
 
         max_tokens = max(1, max_tokens)
-        thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
-
-        # Several Anthropic models (opus-4-7, opus-4-8, sonnet-5, fable) deprecated the
-        # `temperature` parameter — the API returns 400 if it is present.
-        _model_lower = model_name.lower()
-        omit_temperature = any(
-            m in _model_lower for m in ("opus-4-7", "opus-4-8", "sonnet-5", "fable")
+        reasoning_effort_lower = reasoning_effort.lower() if reasoning_effort else None
+        thinking_enabled = reasoning_effort_lower not in (None, "", "none")
+        adaptive_only = _model_version_at_least(model_name, _ADAPTIVE_ONLY_MIN_VERSIONS)
+        # Mythos Preview rejects sampling parameters but still accepts manual
+        # thinking budgets, so it is not part of the adaptive-only capability.
+        omit_temperature = (
+            adaptive_only or model_name.lower() in _SAMPLING_DEPRECATED_MODELS
         )
 
         kwargs: dict[str, Any] = {
@@ -580,16 +610,26 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        if reasoning_effort == "adaptive":
+        if reasoning_effort_lower == "none" and _model_version_at_least(
+            model_name, _THINKING_DISABLE_MIN_VERSIONS
+        ):
+            # These models think by default, so omission would not honor an
+            # explicit request to disable thinking.
+            kwargs["thinking"] = {"type": "disabled"}
+        elif reasoning_effort_lower == "adaptive":
             # Adaptive thinking: model decides when and how much to think
-            # Supported on claude-sonnet-4-6 and claude-opus-4-6.
             # Also auto-enables interleaved thinking between tool calls.
             kwargs["thinking"] = {"type": "adaptive"}
             if not omit_temperature:
                 kwargs["temperature"] = 1.0
+        elif thinking_enabled and adaptive_only:
+            # Newer Claude models removed manual token budgets. Their effort
+            # control is independent from the adaptive thinking mode.
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": reasoning_effort_lower}
         elif thinking_enabled:
             budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
-            budget = budget_map.get(cast(str, reasoning_effort).lower(), 4096)
+            budget = budget_map.get(reasoning_effort_lower, 4096)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
             if not omit_temperature:
@@ -742,67 +782,68 @@ class AnthropicProvider(LLMProvider):
         idle_timeout_s = resolve_stream_idle_timeout_s()
         try:
             async with self._client.messages.stream(**kwargs) as stream:
-                if on_content_delta or on_thinking_delta or on_tool_call_delta:
-                    # Idle timeout must track *any* SSE chunk (thinking_delta,
-                    # tool JSON deltas, etc.), not only text_stream tokens.
-                    # Otherwise extended thinking can stall text_stream for minutes
-                    # while the connection is healthy (e.g. MiniMax Anthropic).
-                    tool_blocks: dict[int, dict[str, str]] = {}
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(
-                                stream.__anext__(),
-                                timeout=idle_timeout_s,
-                            )
-                        except StopAsyncIteration:
-                            break
-                        if chunk.type == "content_block_start":
-                            block = getattr(chunk, "content_block", None)
-                            if getattr(block, "type", None) == "tool_use":
-                                index = int(getattr(chunk, "index", 0) or 0)
-                                state = {
-                                    "call_id": str(getattr(block, "id", "") or ""),
-                                    "name": str(getattr(block, "name", "") or ""),
-                                }
-                                tool_blocks[index] = state
-                                if on_tool_call_delta:
-                                    await on_tool_call_delta({
-                                        "index": index,
-                                        **state,
-                                        "arguments_delta": "",
-                                    })
-                        elif (
-                            chunk.type == "content_block_delta"
-                            and getattr(chunk.delta, "type", None) == "thinking_delta"
-                        ):
-                            piece = getattr(chunk.delta, "thinking", None) or ""
-                            if piece and on_thinking_delta:
-                                await on_thinking_delta(piece)
-                        elif (
-                            chunk.type == "content_block_delta"
-                            and getattr(chunk.delta, "type", None) == "text_delta"
-                        ):
-                            text = getattr(chunk.delta, "text", None) or ""
-                            if text and on_content_delta:
-                                await on_content_delta(text)
-                        elif (
-                            chunk.type == "content_block_delta"
-                            and getattr(chunk.delta, "type", None) == "input_json_delta"
-                        ):
-                            partial = getattr(chunk.delta, "partial_json", None) or ""
-                            if partial and on_tool_call_delta:
-                                index = int(getattr(chunk, "index", 0) or 0)
-                                state = tool_blocks.get(index, {})
+                # Idle timeout must track *any* SSE chunk (thinking_delta,
+                # tool JSON deltas, etc.), not only text_stream tokens.
+                # Otherwise extended thinking can stall text_stream for minutes
+                # while the connection is healthy (e.g. MiniMax Anthropic).
+                # Drain the whole stream with per-chunk idle waits so the
+                # timeout measures inactivity, not total generation time: a
+                # long but continuously-active stream must never be killed.
+                # The SDK accumulates the final message snapshot during
+                # iteration, so get_final_message() below returns instantly.
+                tool_blocks: dict[int, dict[str, str]] = {}
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            stream.__anext__(),
+                            timeout=idle_timeout_s,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    if chunk.type == "content_block_start":
+                        block = getattr(chunk, "content_block", None)
+                        if getattr(block, "type", None) == "tool_use":
+                            index = int(getattr(chunk, "index", 0) or 0)
+                            state = {
+                                "call_id": str(getattr(block, "id", "") or ""),
+                                "name": str(getattr(block, "name", "") or ""),
+                            }
+                            tool_blocks[index] = state
+                            if on_tool_call_delta:
                                 await on_tool_call_delta({
                                     "index": index,
-                                    "call_id": state.get("call_id", ""),
-                                    "name": state.get("name", ""),
-                                    "arguments_delta": partial,
+                                    **state,
+                                    "arguments_delta": "",
                                 })
-                response = await asyncio.wait_for(
-                    stream.get_final_message(),
-                    timeout=idle_timeout_s,
-                )
+                    elif (
+                        chunk.type == "content_block_delta"
+                        and getattr(chunk.delta, "type", None) == "thinking_delta"
+                    ):
+                        piece = getattr(chunk.delta, "thinking", None) or ""
+                        if piece and on_thinking_delta:
+                            await on_thinking_delta(piece)
+                    elif (
+                        chunk.type == "content_block_delta"
+                        and getattr(chunk.delta, "type", None) == "text_delta"
+                    ):
+                        text = getattr(chunk.delta, "text", None) or ""
+                        if text and on_content_delta:
+                            await on_content_delta(text)
+                    elif (
+                        chunk.type == "content_block_delta"
+                        and getattr(chunk.delta, "type", None) == "input_json_delta"
+                    ):
+                        partial = getattr(chunk.delta, "partial_json", None) or ""
+                        if partial and on_tool_call_delta:
+                            index = int(getattr(chunk, "index", 0) or 0)
+                            state = tool_blocks.get(index, {})
+                            await on_tool_call_delta({
+                                "index": index,
+                                "call_id": state.get("call_id", ""),
+                                "name": state.get("name", ""),
+                                "arguments_delta": partial,
+                            })
+                response = await stream.get_final_message()
             return self._parse_response(response)
         except asyncio.TimeoutError:
             return LLMResponse(

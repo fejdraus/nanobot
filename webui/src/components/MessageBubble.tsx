@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
 } from "react";
 import {
@@ -51,6 +52,10 @@ import type {
 
 interface MessageBubbleProps {
   message: UIMessage;
+  /** The containing agent turn has not received turn_end yet. */
+  isTurnStreaming?: boolean;
+  /** Give temporary-chat user turns the dashed private-mode treatment. */
+  temporary?: boolean;
   /** When false, hide this message's copy button. Default true. */
   showCopyAction?: boolean;
   cliApps?: CliAppInfo[];
@@ -77,6 +82,42 @@ function ForkArrowIcon({ className }: { className?: string }) {
       <path d="m21 3-7.536 7.536A5 5 0 0 0 12 14.07V21" />
       <path d="m3 3 7.536 7.536A5 5 0 0 1 12 14.07V15" />
     </svg>
+  );
+}
+
+type MessageTimestampProps = Omit<
+  ComponentPropsWithoutRef<"time">,
+  "dateTime" | "title"
+> & {
+  timestamp: number;
+  tooltipLabel: string;
+};
+
+function MessageTimestamp({
+  timestamp,
+  tooltipLabel,
+  className,
+  children,
+  ...props
+}: MessageTimestampProps) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <time
+          {...props}
+          dateTime={new Date(timestamp).toISOString()}
+          tabIndex={0}
+          className={cn(
+            "cursor-help text-[11px] leading-none text-muted-foreground/70 tabular-nums",
+            "focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            className,
+          )}
+        >
+          {children}
+        </time>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="center">{tooltipLabel}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -221,6 +262,8 @@ function UserDeliveryStatus({
 /** Render user turns as compact bubbles and assistant turns as document-like prose. */
 export function MessageBubble({
   message,
+  isTurnStreaming = false,
+  temporary = false,
   showCopyAction = true,
   cliApps = [],
   mcpPresets = [],
@@ -229,7 +272,6 @@ export function MessageBubble({
   onForkFromHere,
 }: MessageBubbleProps) {
   const { t } = useTranslation();
-  const baseAnim = "animate-in fade-in-0 slide-in-from-bottom-1 duration-300";
   const mentionCliApps = useMemo(
     () => mergeCliMentionApps(cliApps, message.cliApps),
     [cliApps, message.cliApps],
@@ -240,7 +282,7 @@ export function MessageBubble({
   );
 
   if (message.kind === "trace") {
-    return <TraceGroup message={message} animClass={baseAnim} />;
+    return <TraceGroup message={message} />;
   }
 
   if (message.role === "user") {
@@ -253,6 +295,9 @@ export function MessageBubble({
     const hasText = userContent.trim().length > 0;
     const showDeliveryStatus =
       message.deliveryStatus === "sending" || message.deliveryStatus === "failed";
+    const createdAtLabel = formatMessageEndTime(message.createdAt);
+    const showCreatedAt = createdAtLabel.length > 0;
+    const createdAtTitle = showCreatedAt ? fmtDateTime(message.createdAt) : "";
     const quotedContext = parsedMessage.quotedContext;
     const slashCommand = matchingSlashCommand(userContent, slashCommands);
     const messageText = slashCommand ? (
@@ -262,6 +307,7 @@ export function MessageBubble({
           text={userContent.slice(slashCommand.command.length)}
           cliApps={mentionCliApps}
           mcpPresets={mentionMcpPresets}
+          sessionMentions={message.sessionMentions}
         />
       </>
     ) : (
@@ -269,15 +315,11 @@ export function MessageBubble({
         text={userContent}
         cliApps={mentionCliApps}
         mcpPresets={mentionMcpPresets}
+        sessionMentions={message.sessionMentions}
       />
     );
     return (
-      <div
-        className={cn(
-          "group ml-auto flex max-w-[min(85%,36rem)] flex-col items-end gap-1.5",
-          baseAnim,
-        )}
-      >
+      <div className="group ml-auto flex max-w-[min(85%,36rem)] flex-col items-end gap-1.5">
         {hasImages ? <UserImages images={images} align="right" /> : null}
         {!hasImages && hasMedia ? (
           <MessageMedia media={media} align="right" />
@@ -290,17 +332,30 @@ export function MessageBubble({
         ) : null}
         {hasText ? (
           <p
+            data-temporary-message={temporary ? "true" : undefined}
             className={cn(
-              "ml-auto w-fit max-w-full min-w-0 rounded-[18px] bg-secondary/70 px-4 py-2",
+              "ml-auto w-fit max-w-full min-w-0 rounded-floating px-4 py-2",
               "text-left text-[16px]/[1.75] whitespace-pre-wrap [overflow-wrap:anywhere]",
+              temporary
+                ? "border border-dashed border-muted-foreground/40 bg-transparent"
+                : "bg-secondary/70",
             )}
           >
             {messageText}
           </p>
         ) : null}
-        {showDeliveryStatus || (hasText && showCopyAction) ? (
+        {showDeliveryStatus || showCreatedAt || (hasText && showCopyAction) ? (
           <TooltipProvider delayDuration={220} skipDelayDuration={80}>
             <div className="flex min-h-8 items-center justify-end gap-1.5 text-muted-foreground">
+              {showCreatedAt ? (
+                <MessageTimestamp
+                  data-message-created-at
+                  timestamp={message.createdAt}
+                  tooltipLabel={createdAtTitle}
+                >
+                  {createdAtLabel}
+                </MessageTimestamp>
+              ) : null}
               <UserDeliveryStatus
                 status={message.deliveryStatus}
                 errorKind={message.deliveryErrorKind}
@@ -329,7 +384,8 @@ export function MessageBubble({
     : "";
   const automationTriggeredLabel = t("message.automationTriggered");
 
-  const showAssistantActions = message.role === "assistant" && !message.isStreaming && !empty;
+  const showAssistantActions =
+    message.role === "assistant" && !message.isStreaming && !isTurnStreaming && !empty;
   const showCopyButton = showCopyAction && showAssistantActions;
   const showForkButton = showAssistantActions && !!onForkFromHere;
   const forkLabel = t("message.forkFromHere");
@@ -338,16 +394,28 @@ export function MessageBubble({
     message.role === "assistant" && !message.isStreaming
       ? formatMessageEndTime(completedAt)
       : "";
+  const assistantTimestamp =
+    typeof completedAt === "number" && Number.isFinite(completedAt)
+      ? completedAt
+      : message.createdAt;
+  const assistantTimestampLabel =
+    message.role === "assistant" && !message.isStreaming
+      ? formatMessageEndTime(assistantTimestamp)
+      : "";
   const showCompletedAt =
     completedAtLabel.length > 0
     && (!empty || hasReasoning || media.length > 0);
-  const completedAtTitle = showCompletedAt ? fmtDateTime(completedAt) : "";
-  const showAssistantFooterRow = showCopyButton || showForkButton || showCompletedAt;
+  const showAssistantTimestamp =
+    assistantTimestampLabel.length > 0
+    && (!empty || hasReasoning || media.length > 0);
+  const assistantTimestampTitle = showAssistantTimestamp ? fmtDateTime(assistantTimestamp) : "";
+  const showAutomationTrigger = showAssistantTimestamp && automationSourceLabel.length > 0;
+  const showAssistantFooterRow = showCopyButton || showForkButton || showAssistantTimestamp;
   const showAssistantFooterSlot =
     message.role === "assistant"
     && (!empty || hasReasoning || media.length > 0);
   return (
-    <div className={cn("w-full text-[15px]", baseAnim)} style={{ lineHeight: "var(--cjk-line-height)" }}>
+    <div className="w-full text-[15px]" style={{ lineHeight: "var(--cjk-line-height)" }}>
       {hasReasoning ? (
         <ReasoningBubble
           text={reasoning}
@@ -359,12 +427,6 @@ export function MessageBubble({
         <ThinkingState />
       ) : empty && message.isStreaming ? null : (
         <>
-          {automationSourceLabel ? (
-            <AutomationSourceBadge
-              label={automationSourceLabel}
-              triggerLabel={automationTriggeredLabel}
-            />
-          ) : null}
           <div data-assistant-selectable={message.isStreaming ? undefined : "true"}>
             {/* A mode switch rebuilds Streamdown's subtree and moves the scroll anchor. */}
             <MarkdownText
@@ -414,15 +476,21 @@ export function MessageBubble({
                 <TooltipContent side="top" align="center">{forkLabel}</TooltipContent>
               </Tooltip>
             ) : null}
-            {showCompletedAt ? (
-              <time
-                data-assistant-completed-at
-                dateTime={new Date(completedAt!).toISOString()}
-                className="text-[11px] leading-none text-muted-foreground/70 tabular-nums"
-                title={completedAtTitle}
+            {showAssistantTimestamp ? (
+              <MessageTimestamp
+                {...(showCompletedAt ? { "data-assistant-completed-at": true } : {})}
+                data-message-timestamp
+                timestamp={assistantTimestamp}
+                tooltipLabel={assistantTimestampTitle}
               >
-                {completedAtLabel}
-              </time>
+                {assistantTimestampLabel}
+              </MessageTimestamp>
+            ) : null}
+            {showAutomationTrigger ? (
+              <AutomationTriggerMeta
+                label={automationTriggeredLabel}
+                sourceLabel={automationSourceLabel}
+              />
             ) : null}
           </div>
         </TooltipProvider>
@@ -435,7 +503,7 @@ function UserQuotedContext({ text, label }: { text: string; label: string }) {
   return (
     <blockquote
       className={cn(
-        "ml-auto flex w-fit max-w-full min-w-0 items-start gap-2 rounded-[14px]",
+        "ml-auto flex w-fit max-w-full min-w-0 items-start gap-2 rounded-control",
         "border border-border/60 bg-muted/35 px-3 py-2 text-left text-muted-foreground",
       )}
       aria-label={label}
@@ -449,22 +517,23 @@ function UserQuotedContext({ text, label }: { text: string; label: string }) {
   );
 }
 
-function AutomationSourceBadge({ label, triggerLabel }: { label: string; triggerLabel: string }) {
+function AutomationTriggerMeta({ label, sourceLabel }: { label: string; sourceLabel: string }) {
   return (
-    <div
-      className={cn(
-        "mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full px-2 py-1",
-        "border border-sky-500/15 bg-sky-500/[0.06]",
-        "text-[11px] font-medium leading-none text-sky-700",
-        "dark:border-sky-300/15 dark:bg-sky-300/[0.08] dark:text-sky-200/80",
-      )}
-      title={triggerLabel}
-    >
-      <Clock3 className="h-3 w-3 shrink-0" aria-hidden />
-      <span className="min-w-0 truncate">{label}</span>
-      <span className="text-current/45" aria-hidden>·</span>
-      <span className="shrink-0">{triggerLabel}</span>
-    </div>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-automation-trigger
+          tabIndex={0}
+          className={cn(
+            "shrink-0 cursor-help text-[11px] leading-none text-muted-foreground/70 tabular-nums",
+            "focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          )}
+        >
+          {label}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="center">{sourceLabel}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -653,8 +722,8 @@ function UserImageCell({
   const tileClasses = cn(
     "relative overflow-hidden border border-border/60 bg-muted/40",
     size === "large"
-      ? "w-[min(100%,34rem)] rounded-[20px] bg-transparent"
-      : "h-24 w-24 rounded-[14px]",
+      ? "w-[min(100%,34rem)] rounded-panel bg-transparent"
+      : "h-24 w-24 rounded-control",
     "shadow-[0_6px_18px_-14px_rgba(0,0,0,0.45)]",
   );
 
@@ -666,8 +735,7 @@ function UserImageCell({
         aria-label={image.name ? `${openLabel}: ${image.name}` : openLabel}
         className={cn(
           tileClasses,
-          "block cursor-zoom-in p-0 transition-transform duration-150 motion-reduce:transition-none",
-          "hover:scale-[1.01] hover:ring-2 hover:ring-primary/25",
+          "block cursor-zoom-in p-0",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
         )}
       >
@@ -772,7 +840,6 @@ export function ReasoningBubble({
 
 interface TraceGroupProps {
   message: UIMessage;
-  animClass: string;
 }
 
 /**
@@ -780,13 +847,13 @@ interface TraceGroupProps {
  * collapsed because tool traces are supporting evidence, not the answer.
  * A single click expands the exact calls when the user wants details.
  */
-export function TraceGroup({ message, animClass }: TraceGroupProps) {
+export function TraceGroup({ message }: TraceGroupProps) {
   const { t } = useTranslation();
   const lines = message.traces ?? [message.content];
   const count = lines.length;
   const [open, setOpen] = useState(false);
   return (
-    <div className={cn("w-full", animClass)}>
+    <div className="w-full">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}

@@ -302,6 +302,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Stop active task and start a fresh session."""
     loop = ctx.loop
     await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
+    loop.discard_session_file_state(ctx.key)
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
     runtime = None
@@ -374,16 +375,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
             metadata=metadata,
         )
 
-    parts = args.split()
-    if len(parts) != 1:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Usage: `/model [preset]`",
-            metadata=metadata,
-        )
-
-    name = parts[0]
+    name = args
     try:
         runtime = loop.set_session_model_preset(ctx.key, name)
     except (KeyError, ValueError) as exc:
@@ -490,7 +482,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 if sha:
                     content += f" (commit {sha})"
             store.compact_history()
-            prune_dream_sessions(loop.sessions.sessions_dir)
+            prune_dream_sessions(loop.sessions)
         await loop.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))

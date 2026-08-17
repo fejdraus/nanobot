@@ -26,9 +26,6 @@ from nanobot.cron.types import (
     CronStore,
 )
 from nanobot.utils.run_records import (
-    safe_run_record_name,
-)
-from nanobot.utils.run_records import (
     write_run_record as write_automation_run_record,
 )
 
@@ -76,13 +73,22 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
     if schedule.tz and schedule.kind not in ("cron", "at"):
         raise ValueError("tz can only be used with cron or at schedules")
 
-    if schedule.kind == "cron" and schedule.tz:
+    if schedule.kind == "cron":
+        if not schedule.expr or not schedule.expr.strip():
+            raise ValueError("cron schedule requires a non-empty 'expr'")
         try:
-            from zoneinfo import ZoneInfo
+            from croniter import croniter
 
-            ZoneInfo(schedule.tz)
-        except Exception:
-            raise ValueError(f"unknown timezone '{schedule.tz}'") from None
+            croniter(schedule.expr)
+        except Exception as exc:
+            raise ValueError(f"invalid cron expression '{schedule.expr}': {exc}") from None
+        if schedule.tz:
+            try:
+                from zoneinfo import ZoneInfo
+
+                ZoneInfo(schedule.tz)
+            except Exception:
+                raise ValueError(f"unknown timezone '{schedule.tz}'") from None
 
 
 def _has_legacy_delivery_context(payload: CronPayload) -> bool:
@@ -164,8 +170,13 @@ class CronService:
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task[None] | None = None
         self._running = False
-        self._timer_active = False
+        self._active_executions = 0
+        self._store_dirty = False
         self.max_sleep_ms = max_sleep_ms
+
+    def _should_persist_store(self) -> bool:
+        """Return whether this instance currently owns the live store."""
+        return self._running or self._active_executions > 0
 
     def _is_unbound_agent_job(self, job: CronJob) -> bool:
         return job.payload.kind == "agent_turn" and not is_bound_cron_job(job)
@@ -279,23 +290,29 @@ class CronService:
                         logger.exception("load action line error")
                         continue
             self._store.jobs = list(jobs_map.values())  # pyright: ignore[reportOptionalMemberAccess]
-            if self._running and changed:
+            if self._should_persist_store() and changed:
                 self._action_path.write_text("", encoding="utf-8")
                 self._save_store()
         return
 
-    def _load_store(self) -> CronStore | None:
+    def _load_store(self, *, reload_during_execution: bool = False) -> CronStore | None:
         """Load jobs from disk. Reloads automatically if file was modified externally.
         - Reload every time because it needs to merge operations on the jobs object from other instances.
-        - During _on_timer execution, return the existing store to prevent concurrent
+        - During job execution, return the existing store to prevent concurrent
           _load_store calls (e.g. from list_jobs polling) from replacing it mid-execution.
+          The first execution explicitly reloads once when it takes ownership.
         - When the on-disk store exists but is unreadable: keep using the
           previous in-memory ``self._store`` if we already have one (so a
           transient corruption does not drop live jobs); only the very first
           load (during ``start``) can return ``None`` to signal an unrecoverable
           state to the caller.
         """
-        if self._timer_active and self._store:
+        # Never replace state that a previous save failed to persist.  Reloading
+        # the older on-disk snapshot here could make an already executed job due
+        # again and repeat its side effect.
+        if self._store_dirty and self._store:
+            return self._store
+        if self._active_executions > 0 and self._store and not reload_during_execution:
             return self._store
         loaded = self._load_jobs()
         if loaded is None:
@@ -308,12 +325,12 @@ class CronService:
         jobs, version = loaded
         self._store = CronStore(version=version, jobs=jobs)
         self._merge_action()
-        if self._enforce_store_agent_bindings() and self._running:
+        if self._enforce_store_agent_bindings() and self._should_persist_store():
             self._save_store()
 
         return self._store
 
-    def _require_store(self) -> CronStore:
+    def _require_store(self, *, reload_during_execution: bool = False) -> CronStore:
         """Return a usable store or raise a clear error.
 
         ``_load_store`` deliberately returns ``None`` when the first load sees
@@ -323,7 +340,7 @@ class CronService:
         ``AttributeError`` and, more importantly, prevents follow-up saves from
         treating a corrupt store as an empty one.
         """
-        store = self._load_store()
+        store = self._load_store(reload_during_execution=reload_during_execution)
         if store is None:
             raise RuntimeError(
                 f"cron store at {self.store_path} could not be loaded and was preserved "
@@ -337,6 +354,9 @@ class CronService:
         if not self._store:
             return
 
+        # Set this before serialization/write so every exceptional exit keeps
+        # the in-memory snapshot authoritative until a later save succeeds.
+        self._store_dirty = True
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
@@ -389,6 +409,7 @@ class CronService:
         }
 
         self._atomic_write(self.store_path, json.dumps(data, indent=2, ensure_ascii=False))
+        self._store_dirty = False
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
@@ -426,10 +447,6 @@ class CronService:
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
-
-    @staticmethod
-    def _safe_run_record_name(run_id: str) -> str:
-        return safe_run_record_name(run_id)
 
     def write_run_record(self, run_id: str, record: dict[str, Any]) -> None:
         """Write an internal audit record for one cron execution."""
@@ -508,19 +525,26 @@ class CronService:
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
-        self._load_store()
-        # If a hot reload found a corrupt store on disk, ``self._store`` may
-        # still hold the previous, known-good in-memory snapshot.  Keep using
-        # it rather than crashing the timer or wiping live jobs.
-        if not self._store:
-            self._arm_timer()
-            return
-
-        self._timer_active = True
+        reload_store = self._active_executions == 0
+        self._active_executions += 1
         try:
+            # A prior tick may have completed external side effects but failed
+            # to persist their advanced schedule.  Persist that exact snapshot
+            # before reloading or executing anything else; otherwise the older
+            # disk state can replay the same job.
+            if self._store_dirty:
+                self._save_store()
+                return
+
+            store = self._load_store(reload_during_execution=reload_store)
+            # If a hot reload found a corrupt store on disk, ``self._store``
+            # may still hold the previous, known-good in-memory snapshot.
+            if store is None:
+                return
+
             now = _now_ms()
             due_jobs = [
-                j for j in self._store.jobs
+                j for j in store.jobs
                 if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
             ]
 
@@ -528,9 +552,21 @@ class CronService:
                 await self._execute_job(job)
 
             self._save_store()
+        except Exception:
+            # A load/persist failure must not kill the scheduler: keep the
+            # in-memory store and retry on the next tick.  This mirrors the
+            # read-path defense in ``_load_jobs`` (``.corrupt-<ts>`` backups);
+            # ``_load_store`` may also persist (agent-binding migrations).
+            logger.exception(
+                "Cron: tick failed ({}); "
+                "keeping in-memory state and retrying on next tick",
+                self.store_path,
+            )
         finally:
-            self._timer_active = False
-        self._arm_timer()
+            self._active_executions -= 1
+            # Always re-arm the timer, even on unexpected failures, so a
+            # single bad tick cannot silently stop all future jobs.
+            self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
@@ -661,7 +697,7 @@ class CronService:
         )
         _normalize_agent_turn_job(job)
         self._enforce_agent_binding(job)
-        if self._running:
+        if self._should_persist_store():
             store = self._require_store()
             store.jobs.append(job)
             self._save_store()
@@ -701,7 +737,7 @@ class CronService:
         removed = len(store.jobs) < before
 
         if removed:
-            if self._running:
+            if self._should_persist_store():
                 self._save_store()
                 self._arm_timer()
             else:
@@ -723,7 +759,7 @@ class CronService:
                     job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
                 else:
                     job.state.next_run_at_ms = None
-                if self._running:
+                if self._should_persist_store():
                     self._save_store()
                     self._arm_timer()
                 else:
@@ -779,7 +815,7 @@ class CronService:
         else:
             job.state.next_run_at_ms = None
 
-        if self._running:
+        if self._should_persist_store():
             self._save_store()
             self._arm_timer()
         else:
@@ -790,10 +826,15 @@ class CronService:
 
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job without disturbing the service's running state."""
-        was_running = self._running
-        self._running = True
+        reload_store = self._active_executions == 0
+        self._active_executions += 1
         try:
-            store = self._require_store()
+            # A manual run is another side-effecting entrypoint.  Do not start
+            # it while the result of a previous timer execution is still only
+            # in memory.
+            if self._store_dirty:
+                self._save_store()
+            store = self._require_store(reload_during_execution=reload_store)
             for job in store.jobs:
                 if job.id == job_id:
                     if self._is_unbound_agent_job(job):
@@ -807,8 +848,8 @@ class CronService:
                     return True
             return False
         finally:
-            self._running = was_running
-            if was_running:
+            self._active_executions -= 1
+            if self._running and self._active_executions == 0:
                 self._arm_timer()
 
     def get_job(self, job_id: str) -> CronJob | None:
