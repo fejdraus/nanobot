@@ -368,6 +368,11 @@ class AnthropicProvider(LLMProvider):
                 if converted:
                     result.append(converted)
                 continue
+            if content_block.get("type") == "video_url":
+                converted = AnthropicProvider._convert_video_block(content_block)
+                if converted:
+                    result.append(converted)
+                continue
             if not content_block.get("type"):
                 # Anthropic requires every content block to declare a "type".
                 # A tool that returned a bare dict (or a list of dicts) lands
@@ -402,6 +407,36 @@ class AnthropicProvider(LLMProvider):
             "type": "image",
             "source": {"type": "url", "url": url},
         }
+
+    @staticmethod
+    def _convert_video_block(block: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert an OpenAI ``video_url`` block to an Anthropic ``video`` block.
+
+        MiniMax-M3 accepts video on its Anthropic-compatible endpoint as
+        ``{"type": "video", "source": {...}}`` — base64 up to 50 MB, or a URL
+        the provider fetches itself. Anthropic's own models have no video
+        input, so this only ever fires on a provider that documents it.
+        """
+        video_url = cast(dict[str, Any], block.get("video_url") or {})
+        url = cast(str, video_url.get("url", ""))
+        if not url:
+            return None
+        m = re.match(r"data:(video/[\w.+-]+);base64,(.+)", url, re.DOTALL)
+        if m:
+            converted: dict[str, Any] = {
+                "type": "video",
+                "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)},
+            }
+        else:
+            converted = {
+                "type": "video",
+                "source": {"type": "url", "url": url},
+            }
+        # Frame sampling rate rides along when the caller set one; MiniMax
+        # defaults to 1 frame per second when it is absent.
+        if video_url.get("fps") is not None:
+            converted["fps"] = video_url["fps"]
+        return converted
 
     @staticmethod
     def _has_tool_use(msg: dict[str, Any]) -> bool:
