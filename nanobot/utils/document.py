@@ -435,21 +435,36 @@ def _canonical_local_media_path(path: str) -> str:
     return path
 
 
+def is_video_file(path: str) -> bool:
+    """Check whether *path* looks like a video file.
+
+    Extension-based only: unlike images there is no shared magic-byte probe
+    here, and the container zoo (mp4/mov/webm/mkv) all differ. A wrong guess is
+    cheap — the caller re-checks the MIME on the bytes it actually sends.
+    """
+    mime = mimetypes.guess_type(path)[0]
+    return bool(mime and mime.startswith("video/"))
+
+
 def reference_non_image_attachments(
-    content: str, media: list[str],
+    content: str, media: list[str], *, allow_video: bool = False,
 ) -> tuple[str, list[str]]:
     """Reference non-image attachments without reading file content.
 
-    Image paths are preserved for downstream vision-block construction.
-    Non-image paths are appended as ``[Attachment: path]`` references so the
-    model can inspect them on demand with ``read_file`` or pass the original
+    Image paths are preserved for downstream vision-block construction, and
+    video paths too when *allow_video* is set — the caller turns that on only
+    for a model that accepts a ``video_url`` block, since providers without it
+    reject the entire request rather than skipping the block.
+
+    Everything else is appended as an ``[Attachment: path]`` reference so the
+    model can inspect it on demand with ``read_file`` or pass the original
     path to another tool that needs exact file bytes.
     """
     image_paths: list[str] = []
     attachment_refs: list[str] = []
     for path in media:
         path = _canonical_local_media_path(path)
-        if is_image_file(path):
+        if is_image_file(path) or (allow_video and is_video_file(path)):
             image_paths.append(path)
         else:
             attachment_refs.append(f"[Attachment: {path}]")

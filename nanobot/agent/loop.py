@@ -265,6 +265,8 @@ class AgentLoop:
         context_window_tokens: int | None = None,
         context_block_limit: int | None = None,
         max_tool_result_chars: int | None = None,
+        video_input: bool | None = None,
+        video_fps: float | None = None,
         fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
         tool_hint_max_length: int | None = None,
@@ -350,6 +352,10 @@ class AgentLoop:
             if max_tool_result_chars is not None
             else defaults.max_tool_result_chars
         )
+        self.video_input = (
+            video_input if video_input is not None else defaults.video_input
+        )
+        self.video_fps = video_fps if video_fps is not None else defaults.video_fps
         self.provider_retry_mode = provider_retry_mode
         self.tool_hint_max_length = (
             tool_hint_max_length if tool_hint_max_length is not None
@@ -507,6 +513,8 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
+            video_input=defaults.video_input,
+            video_fps=defaults.video_fps,
             fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
@@ -1003,11 +1011,13 @@ class AgentLoop:
                     content, image_paths = reference_non_image_attachments(
                         content,
                         image_paths,
+                        allow_video=self.video_input,
                     )
                     image_paths = image_paths or None
                 user_content = self.context.build_user_content(
                     content,
                     image_paths=image_paths,
+                    video_fps=self.video_fps if self.video_input else None,
                 )
                 row: dict[str, Any] = {"role": "user", "content": user_content}
                 metadata_value = cast(object, pending_msg.metadata)
@@ -1691,6 +1701,7 @@ class AgentLoop:
             new_content, image_paths = reference_non_image_attachments(
                 msg.content,
                 msg.media,
+                allow_video=self.video_input,
             )
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_paths)
             msg = ctx.msg
@@ -1862,6 +1873,7 @@ class AgentLoop:
                 ctx.msg.content,
                 media=ctx.msg.media if ctx.kind is TurnKind.USER and ctx.msg.media else None,
                 runtime_context_blocks=ctx.runtime_context_blocks,
+                video_fps=self.video_fps if self.video_input else None,
             )
             task_id = ctx.msg.metadata.get("subagent_task_id") if is_subagent else None
             already_staged = False

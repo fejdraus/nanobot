@@ -131,6 +131,15 @@ class AgentDefaults(Base):
     max_concurrent_subagents: int = Field(default=1, ge=1)
     fail_on_tool_error: bool = True
     max_tool_result_chars: int = 16_000
+    # Attach video files to the model request instead of only naming their path.
+    # Off by default: the ``video_url`` content block is not part of the common
+    # OpenAI-compatible surface, and a provider that does not know it rejects the
+    # whole request. Turn on only for a model documented to accept video —
+    # MiniMax-M3 does, via a base64 data URL up to 50 MB.
+    video_input: bool = False
+    # Frames sampled per second of video. Higher catches quick scene changes at a
+    # higher token cost; MiniMax accepts 0.2-5 and defaults to 1.
+    video_fps: float = Field(default=1.0, ge=0.2, le=5.0)
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     tool_hint_max_length: int = Field(
         default=40,

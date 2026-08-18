@@ -32,6 +32,11 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.prompt_templates import render_template
 
+# MiniMax rejects a base64 video data URL over 50 MB (the Files API route allows
+# 512 MB but needs a separate upload). Telegram hands bots at most 20 MB, so this
+# only trips on media that arrived some other way.
+_MAX_INLINE_VIDEO_BYTES = 50 * 1024 * 1024
+
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
@@ -271,9 +276,12 @@ class ContextBuilder:
         media: list[str] | None = None,
         current_role: str = "user",
         runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
+        video_fps: float | None = None,
     ) -> dict[str, Any]:
         """Build only the fresh turn message without merging it into history."""
-        content = self.build_user_content(current_message, image_paths=media)
+        content = self.build_user_content(
+            current_message, image_paths=media, video_fps=video_fps
+        )
         blocks = list(runtime_context_blocks or ()) if current_role == "user" else []
         merged, runtime_context_meta = append_runtime_context(content, blocks)
         current: dict[str, Any] = {"role": current_role, "content": merged}
@@ -287,8 +295,15 @@ class ContextBuilder:
         self,
         text: str,
         image_paths: list[str] | None,
+        *,
+        video_fps: float | None = None,
     ) -> str | list[dict[str, Any]]:
-        """Build user message content from prefiltered image paths."""
+        """Build user message content from prefiltered media paths.
+
+        Images become ``image_url`` blocks. Video becomes ``video_url`` — only
+        reachable when the caller already decided the model accepts it, since
+        the routing step drops video paths otherwise.
+        """
         from loguru import logger
 
         if not image_paths:
@@ -304,7 +319,32 @@ class ContextBuilder:
             # Re-detect from the bytes used for the request: the file may have
             # changed since attachment routing, and the data URL needs its MIME.
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
+            if not mime:
+                continue
+            if mime.startswith("video/"):
+                # MiniMax caps a base64 data URL at 50 MB; past that the request
+                # is rejected outright, so leave the path as text instead of
+                # sending a body that cannot succeed.
+                if len(raw) > _MAX_INLINE_VIDEO_BYTES:
+                    logger.warning(
+                        "Video too large to inline ({} bytes > {}): {}",
+                        len(raw), _MAX_INLINE_VIDEO_BYTES, path,
+                    )
+                    continue
+                b64 = base64.b64encode(raw).decode()
+                block: dict[str, Any] = {
+                    "type": "video_url",
+                    "video_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                }
+                if video_fps is not None:
+                    block["video_url"]["fps"] = video_fps
+                image_blocks.append(block)
+                logger.debug(
+                    "Video attached to LLM request: {} ({}, {} bytes)", path, mime, len(raw)
+                )
+                continue
+            if not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
             image_blocks.append({
