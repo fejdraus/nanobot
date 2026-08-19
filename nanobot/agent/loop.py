@@ -88,7 +88,7 @@ from nanobot.session.model_selection import (
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import reference_non_image_attachments
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import image_placeholder_text, video_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
@@ -2068,6 +2068,17 @@ class AgentLoop:
                 path = cast(str, internal_meta.get("path", ""))
                 filtered.append(
                     {"type": "text", "text": image_placeholder_text(path)}
+                )
+                continue
+
+            video_url = cast(dict[str, Any], block_data.get("video_url", {}))
+            if block_data.get("type") == "video_url" and str(
+                video_url.get("url", "")
+            ).startswith("data:video/"):
+                internal_meta = cast(dict[str, Any], block_data.get("_meta") or {})
+                path = cast(str, internal_meta.get("path", ""))
+                filtered.append(
+                    {"type": "text", "text": video_placeholder_text(path)}
                 )
                 continue
 

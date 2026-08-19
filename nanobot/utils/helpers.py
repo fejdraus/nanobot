@@ -377,6 +377,17 @@ def image_placeholder_text(path: str | None, *, empty: str = "[image]") -> str:
     return f"[image: {path}]" if path else empty
 
 
+def video_placeholder_text(path: str | None, *, empty: str = "[video]") -> str:
+    """Build a video placeholder string.
+
+    Same contract as the image one, and for a sharper reason: a clip is
+    megabytes of base64. Kept in history it would ride along in every later
+    request of the session — what the video showed is already in the reply
+    that answered it, so the path is all that needs to survive.
+    """
+    return f"[video: {path}]" if path else empty
+
+
 def content_with_media_breadcrumbs(
     role: str | None,
     content: Any,
