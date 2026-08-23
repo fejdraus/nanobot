@@ -203,11 +203,16 @@ def _usage_from_response_obj(response: object) -> dict[str, int]:
         usage.get("output_tokens") or usage.get("completion_tokens") or 0
     )
     total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
-    return {
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+    input_details = _response_object(usage.get("input_tokens_details"))
+    cached_tokens = int(input_details.get("cached_tokens") or 0) if input_details else 0
+    if cached_tokens > 0:
+        result["cached_tokens"] = cached_tokens
+    return result
 
 
 def _parse_tool_call_arguments(args_raw: Any, name: str | None) -> Any:
@@ -244,6 +249,26 @@ def _refusal_event_key(
             else None
         ),
     )
+
+
+def _reasoning_summary_event_key(
+    item_id: object,
+    summary_index: object,
+) -> tuple[str | None, int] | None:
+    """Identify one reasoning summary part across its text deltas."""
+    if not isinstance(summary_index, int) or isinstance(summary_index, bool):
+        return None
+    return (
+        item_id if isinstance(item_id, str) else None,
+        summary_index,
+    )
+
+
+def _separate_reasoning_part(content: str | None, part: str) -> str:
+    """Separate summary parts only when the provider supplied no whitespace."""
+    if content and not content[-1].isspace() and not part[0].isspace():
+        return "\n" + part
+    return part
 
 
 def _remaining_refusal_text(streamed_text: str, refusal_text: str) -> str:
@@ -337,6 +362,7 @@ async def consume_sse_with_reasoning(
     usage: dict[str, int] = {}
     reasoning_content: str | None = None
     streamed_reasoning = False
+    reasoning_summary_key: tuple[str | None, int] | None = None
     refusal_seen = False
     refusal_deltas: dict[tuple[str | None, int | None], str] = {}
     emitted_refusal_text = ""
@@ -401,6 +427,18 @@ async def consume_sse_with_reasoning(
         elif event_type == "response.reasoning_summary_text.delta":
             delta_text = event.get("delta") or ""
             if delta_text:
+                summary_key = _reasoning_summary_event_key(
+                    event.get("item_id"),
+                    event.get("summary_index"),
+                )
+                if (
+                    summary_key is not None
+                    and reasoning_summary_key is not None
+                    and summary_key != reasoning_summary_key
+                ):
+                    delta_text = _separate_reasoning_part(reasoning_content, delta_text)
+                if summary_key is not None:
+                    reasoning_summary_key = summary_key
                 reasoning_content = (reasoning_content or "") + delta_text
                 streamed_reasoning = True
                 if on_reasoning_delta:
@@ -533,7 +571,10 @@ def _extract_reasoning_summary_from_output(output: object) -> str | None:
                 text = summary.get("text")
                 if isinstance(text, str):
                     parts.append(text)
-    return "".join(parts) or None
+    content = ""
+    for part in parts:
+        content += _separate_reasoning_part(content, part)
+    return content or None
 
 
 def parse_response_output(
@@ -789,6 +830,13 @@ async def consume_sdk_stream(
                         "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
                         "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
                     }
+                    usage_data = _response_object(usage_obj) or {}
+                    input_details = _response_object(usage_data.get("input_tokens_details"))
+                    cached_tokens = (
+                        int(input_details.get("cached_tokens") or 0) if input_details else 0
+                    )
+                    if cached_tokens > 0:
+                        usage["cached_tokens"] = cached_tokens
                 if not reasoning_content:
                     reasoning_content = _extract_reasoning_summary_from_output(
                         getattr(resp, "output", None)

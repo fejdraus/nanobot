@@ -31,6 +31,7 @@ from nanobot.bus.outbound_events import (
     SessionUpdatedEvent,
     TurnEndEvent,
     TurnModelUpdatedEvent,
+    UserInputEvent,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.websocket.runtime import (
@@ -47,6 +48,7 @@ from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.session import webui_turns as wth
 from nanobot.session.manager import SessionManager
 from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+from nanobot.session.session_handles import session_handle_for_name
 from nanobot.webui.gateway_services import GatewayServices, build_gateway_services
 from nanobot.webui.http_utils import (
     http_error as _http_error,
@@ -2007,6 +2009,41 @@ async def test_send_broadcasts_runtime_model_updates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_projects_external_user_input_to_existing_wire_event() -> None:
+    bus = MessageBus()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-1",
+            content="",
+            event=UserInputEvent(
+                content="hello from another session",
+                created_at_ms=1234,
+                provenance={"name": "luma"},
+            ),
+        )
+    )
+
+    payload = json.loads(mock_ws.send.call_args.args[0])
+    assert payload == {
+        "event": "user_message",
+        "chat_id": "chat-1",
+        "text": "hello from another session",
+        "created_at_ms": 1234,
+        "starts_turn": False,
+        "provenance": {"name": "luma"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_send_scopes_turn_model_updates_to_the_subscribed_chat() -> None:
     bus = MessageBus()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
@@ -2036,6 +2073,21 @@ async def test_send_scopes_turn_model_updates_to_the_subscribed_chat() -> None:
         "model_preset": "Deep Research",
         "context_window_tokens": 128_000,
     }
+
+    await channel.send(
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-1",
+            content="",
+            event=TurnModelUpdatedEvent(
+                model="deepseek/deepseek-chat",
+                model_preset="Deep Research",
+                fallback=True,
+            ),
+        )
+    )
+    fallback_payload = json.loads(chat_one.send.call_args.args[0])
+    assert fallback_payload["fallback"] is True
     chat_two.send.assert_not_awaited()
 
 
@@ -2311,8 +2363,9 @@ async def test_send_delta_preserves_webui_source_metadata() -> None:
     assert second["event"] == "stream_end"
     assert second["source"] == source
     lines = read_transcript_lines("websocket:chat-source-stream")
-    assert lines[-2]["source"] == source
     assert lines[-1]["source"] == source
+    assert lines[-1]["event"] == "stream_end"
+    assert lines[-1]["text"] == "done"
 
 
 @pytest.mark.asyncio
@@ -2337,6 +2390,8 @@ async def test_send_delta_marks_resuming_stream_end() -> None:
 
 @pytest.mark.asyncio
 async def test_send_delta_keeps_buffer_across_merged_stream_boundary() -> None:
+    from nanobot.webui.transcript import build_webui_thread_response, read_transcript_lines
+
     bus = MagicMock()
     channel = WebSocketChannel(
         {"enabled": True, "allowFrom": ["*"], "streaming": True},
@@ -2366,6 +2421,12 @@ async def test_send_delta_keeps_buffer_across_merged_stream_boundary() -> None:
         "second",
     ]
     assert ("chat-1", "sid") not in channel._stream_text_buffers
+    lines = read_transcript_lines("websocket:chat-1")
+    assert [line["event"] for line in lines] == ["stream_end", "stream_end"]
+    assert [line["text"] for line in lines] == ["first ", "first second"]
+    body = build_webui_thread_response("websocket:chat-1")
+    assert body is not None
+    assert body["messages"][-1]["content"] == "first second"
 
 
 @pytest.mark.asyncio
@@ -2559,12 +2620,84 @@ async def test_stream_transcript_persists_without_subscribers() -> None:
 
     assert channel._subs == {}
     lines = read_transcript_lines("websocket:chat-1")
-    assert [line["event"] for line in lines] == ["delta", "delta", "stream_end", "turn_end"]
+    assert [line["event"] for line in lines] == ["stream_end", "turn_end"]
+    assert lines[0]["text"] == "hello world"
     body = build_webui_thread_response("websocket:chat-1")
     assert body is not None
     assert body["messages"][-1]["role"] == "assistant"
     assert body["messages"][-1]["content"] == "hello world"
     assert body["messages"][-1]["latencyMs"] == 42
+
+
+@pytest.mark.asyncio
+async def test_stream_transcript_writes_once_per_completed_segment(monkeypatch) -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "streaming": True},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    append = MagicMock()
+    monkeypatch.setattr("nanobot.webui.transcript.append_transcript_object", append)
+
+    await channel.send_delta("chat-write-rate", "one", stream_id="s1")
+    await channel.send_delta("chat-write-rate", " two", stream_id="s1")
+    await channel.send_delta("chat-write-rate", " three", stream_id="s1")
+
+    append.assert_not_called()
+
+    await channel.send_delta("chat-write-rate", "", stream_id="s1", stream_end=True)
+
+    append.assert_called_once()
+    persisted = append.call_args.args[1]
+    assert persisted["event"] == "stream_end"
+    assert persisted["text"] == "one two three"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_transcript_persists_one_canonical_record(monkeypatch) -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    append = MagicMock()
+    monkeypatch.setattr("nanobot.webui.transcript.append_transcript_object", append)
+
+    await channel.send_reasoning_delta("chat-reasoning-write-rate", "plan ", stream_id="r1")
+    await channel.send_reasoning_delta("chat-reasoning-write-rate", "then act", stream_id="r1")
+
+    append.assert_not_called()
+
+    await channel.send_reasoning_end("chat-reasoning-write-rate", stream_id="r1")
+
+    append.assert_called_once()
+    persisted = append.call_args.args[1]
+    assert persisted["event"] == "reasoning_end"
+    assert persisted["text"] == "plan then act"
+
+
+@pytest.mark.asyncio
+async def test_turn_end_discards_unclosed_stream_buffers() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "streaming": True},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+
+    await channel.send_delta("chat-unclosed", "partial", stream_id="s1")
+    await channel.send_reasoning_delta("chat-unclosed", "thinking", stream_id="r1")
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-unclosed",
+        content="",
+        event=TurnEndEvent(),
+    ))
+
+    assert channel._stream_text_buffers == {}
+    assert channel._reasoning_text_buffers == {}
 
 
 @pytest.mark.asyncio
@@ -4945,6 +5078,14 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
         },
     ]
     monkeypatch.setattr(ws_http_module, "list_webui_sessions", lambda _session_manager: sessions)
+    handle = session_handle_for_name("websocket:chat-1", "luma")
+    monkeypatch.setattr(
+        ws_http_module,
+        "SessionHandleResolver",
+        lambda _session_manager: SimpleNamespace(
+            list_all_by_key=lambda: {handle.session_key: handle}
+        ),
+    )
     channel = WebSocketChannel(
         {"enabled": True, "allowFrom": ["*"]},
         bus,
@@ -4974,6 +5115,7 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
             "preview": "work",
             "model_preset": "fast",
             "run_started_at": 1_700_000_000.0,
+            "handle": handle.public_payload(),
         }
     ]
 

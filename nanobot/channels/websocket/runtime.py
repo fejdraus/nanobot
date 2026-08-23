@@ -36,6 +36,7 @@ from nanobot.bus.outbound_events import (
     SessionUpdatedEvent,
     TurnEndEvent,
     TurnModelUpdatedEvent,
+    UserInputEvent,
     outbound_event_from_message,
 )
 from nanobot.bus.queue import MessageBus
@@ -425,6 +426,7 @@ class WebSocketChannel(BaseChannel):
         )
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
+        self._reasoning_text_buffers: dict[tuple[str, str], list[str]] = {}
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -481,6 +483,9 @@ class WebSocketChannel(BaseChannel):
         for key in tuple(self._stream_text_buffers):
             if key[0] == chat_id:
                 self._stream_text_buffers.pop(key, None)
+        for key in tuple(self._reasoning_text_buffers):
+            if key[0] == chat_id:
+                self._reasoning_text_buffers.pop(key, None)
 
     async def _discard_connection_owned_chat(
         self,
@@ -1640,17 +1645,56 @@ class WebSocketChannel(BaseChannel):
             include_source=include_source,
             transcript_overrides=transcript_overrides,
         )
-        if (
-            not persisted
-            and phase in {"answer", "complete"}
-            and (metadata or {}).get("webui") is True
-        ):
+        return self._retain_turn_on_transcript_failure(
+            chat_id,
+            persisted=persisted,
+            metadata=metadata,
+            phase=phase,
+        )
+
+    @staticmethod
+    def _retain_turn_on_transcript_failure(
+        chat_id: str,
+        *,
+        persisted: bool,
+        metadata: dict[str, Any] | None,
+        phase: str,
+    ) -> bool:
+        if not persisted and phase in {"answer", "complete"} and (metadata or {}).get("webui") is True:
             owner = (metadata or {}).get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
             mark_websocket_turn_transcript_persistence_failed(
                 chat_id,
                 owner if isinstance(owner, str) else None,
             )
         return persisted
+
+    def _persist_turn_stream_event(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        completed_text: str | None,
+        metadata: dict[str, Any] | None,
+        phase: str,
+        include_source: bool = False,
+    ) -> bool:
+        """Persist the canonical end of a live stream, never its wire chunks."""
+        if not self._temporary_chats.should_persist_transcript(chat_id):
+            return True
+        persisted = self._transcripts.prepare_and_append_stream_event(
+            chat_id,
+            event,
+            completed_text=completed_text,
+            metadata=metadata,
+            phase=phase,
+            include_source=include_source,
+        )
+        return self._retain_turn_on_transcript_failure(
+            chat_id,
+            persisted=persisted,
+            metadata=metadata,
+            phase=phase,
+        )
 
     async def send(self, msg: OutboundMessage) -> None:
         event = outbound_event_from_message(msg)
@@ -1668,6 +1712,7 @@ class WebSocketChannel(BaseChannel):
             if isinstance(
                 event,
                 ProgressEvent
+                | UserInputEvent
                 | TurnEndEvent
                 | SessionUpdatedEvent
                 | GoalStatusEvent
@@ -1683,6 +1728,16 @@ class WebSocketChannel(BaseChannel):
                     model_name=event.model,
                     model_preset=event.model_preset,
                     context_window_tokens=event.context_window_tokens,
+                    fallback=event.fallback,
+                )
+            return
+        if isinstance(event, UserInputEvent):
+            if conns:
+                await self.send_user_input(
+                    msg.chat_id,
+                    content=event.content,
+                    created_at_ms=event.created_at_ms,
+                    provenance=event.provenance,
                 )
             return
         if isinstance(event, GoalStateSyncEvent):
@@ -1823,9 +1878,12 @@ class WebSocketChannel(BaseChannel):
         }
         if stream_id is not None:
             body["stream_id"] = stream_id
-        self._persist_turn_transcript_event(
+        stream_key = (chat_id, str(stream_id or ""))
+        self._reasoning_text_buffers.setdefault(stream_key, []).append(delta)
+        self._persist_turn_stream_event(
             chat_id,
             body,
+            completed_text=None,
             metadata=meta,
             phase="reasoning",
         )
@@ -1851,9 +1909,12 @@ class WebSocketChannel(BaseChannel):
         }
         if stream_id is not None:
             body["stream_id"] = stream_id
-        self._persist_turn_transcript_event(
+        stream_key = (chat_id, str(stream_id or ""))
+        reasoning_text = "".join(self._reasoning_text_buffers.pop(stream_key, []))
+        self._persist_turn_stream_event(
             chat_id,
             body,
+            completed_text=reasoning_text or None,
             metadata=meta,
             phase="reasoning",
         )
@@ -1901,6 +1962,7 @@ class WebSocketChannel(BaseChannel):
         conns = list(self._subs.get(chat_id, ()))
         meta = metadata or {}
         stream_key = (chat_id, str(stream_id or ""))
+        completed_text: str | None = None
         if stream_end:
             body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
             buffered = (
@@ -1912,6 +1974,7 @@ class WebSocketChannel(BaseChannel):
                 buffered.append(delta)
             full_text = "".join(buffered)
             rewritten = self._media.rewrite_local_markdown_images(full_text)
+            completed_text = rewritten
             if delta or rewritten != full_text:
                 body["text"] = rewritten
         else:
@@ -1927,9 +1990,10 @@ class WebSocketChannel(BaseChannel):
             body["resuming"] = True
         if stream_end and merge_next:
             body["merge_next"] = True
-        self._persist_turn_transcript_event(
+        self._persist_turn_stream_event(
             chat_id,
             body,
+            completed_text=completed_text,
             metadata=meta,
             phase="answer",
             include_source=True,
@@ -1986,6 +2050,7 @@ class WebSocketChannel(BaseChannel):
             # carries a durable incomplete marker. The HTTP replay path can
             # recover the latter from session history after a gateway restart.
             clear_websocket_turn_if_current(chat_id, turn_owner)
+        self._clear_stream_buffers(chat_id)
         raw = json.dumps(body, ensure_ascii=False)
         if not conns:
             return
@@ -2039,6 +2104,31 @@ class WebSocketChannel(BaseChannel):
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" session_updated ")
 
+    async def send_user_input(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        created_at_ms: int,
+        provenance: dict[str, Any],
+    ) -> None:
+        """Project user input produced outside a WebSocket connection."""
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            return
+        body: dict[str, Any] = {
+            "event": "user_message",
+            "chat_id": chat_id,
+            "text": content,
+            "created_at_ms": created_at_ms,
+            "starts_turn": False,
+        }
+        if provenance:
+            body["provenance"] = provenance
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" user_message ")
+
     async def send_runtime_model_updated(
         self,
         *,
@@ -2066,6 +2156,7 @@ class WebSocketChannel(BaseChannel):
         model_name: Any,
         model_preset: Any = None,
         context_window_tokens: Any = None,
+        fallback: bool = False,
     ) -> None:
         """Notify one chat's subscribers which model is handling its current request."""
         conns = list(self._subs.get(chat_id, ()))
@@ -2084,6 +2175,8 @@ class WebSocketChannel(BaseChannel):
             body["model_preset"] = model_preset.strip()
         if isinstance(context_window_tokens, int) and context_window_tokens > 0:
             body["context_window_tokens"] = context_window_tokens
+        if fallback:
+            body["fallback"] = True
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" turn_model_updated ")

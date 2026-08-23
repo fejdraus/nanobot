@@ -79,6 +79,15 @@ class SessionUpdatedEvent(OutboundEvent):
 
 
 @dataclass(frozen=True)
+class UserInputEvent(OutboundEvent):
+    """A user-input row projected by an edge adapter."""
+
+    content: str
+    created_at_ms: int
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class RuntimeModelUpdatedEvent(OutboundEvent):
     model: str | None
     model_preset: str | None = None
@@ -91,6 +100,7 @@ class TurnModelUpdatedEvent(OutboundEvent):
     model: str
     model_preset: str | None = None
     context_window_tokens: int | None = None
+    fallback: bool = False
 
 
 def outbound_message_for_event(
@@ -136,7 +146,10 @@ def replace_outbound_event(
 
 
 def _event_content(event: OutboundEvent) -> str:
-    if isinstance(event, ProgressEvent | RetryWaitEvent | StreamDeltaEvent | StreamEndEvent):
+    if isinstance(
+        event,
+        ProgressEvent | RetryWaitEvent | StreamDeltaEvent | StreamEndEvent | UserInputEvent,
+    ):
         return event.content
     return ""
 

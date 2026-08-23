@@ -39,6 +39,16 @@ export interface UIMediaAttachment {
 
 export interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
 
+export interface TurnUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  context_tokens?: number;
+  request_count?: number;
+  estimated_tokens?: number;
+  [key: string]: number | undefined;
+}
+
 export interface UIMessage {
   id: string;
   role: Role;
@@ -56,6 +66,9 @@ export interface UIMessage {
   fileEdits?: UIFileEdit[];
   /** Activity rows created during the same agent phase share one collapsible block. */
   activitySegmentId?: string;
+  /** Internal projection marker for assistant text emitted before a later tool.
+   * It is not a wire message and is rendered as a compact activity row. */
+  activityKind?: "model";
   /** User turn: optimistic blob URLs for preview. Replay: placeholder chips. */
   images?: UIImage[];
   /** Signed or local UI-renderable media attachments. */
@@ -77,8 +90,14 @@ export interface UIMessage {
   latencyMs?: number;
   /** Client epoch milliseconds when the definitive ``turn_end`` was received. */
   completedAt?: number;
+  /** Additive model usage for this turn; context_tokens is the final request only. */
+  usage?: TurnUsage;
+  /** Configured context-window capacity for the model used by this turn. */
+  contextWindowTokens?: number;
   /** Lightweight provenance for proactive assistant messages. */
   source?: UIMessageSource;
+  /** Structured provenance for a message delivered by another session. */
+  sessionMessage?: UISessionMessage;
   /** Stable protocol metadata for grouping all activity emitted by one user turn. */
   turnId?: string;
   turnPhase?: UITurnPhase;
@@ -110,11 +129,24 @@ export interface UIMcpPresetAttachment {
 }
 
 export interface SessionMention {
+  /** Stable public identity. Older transcript rows may not include it. */
+  id?: string;
   /** Text token inserted in the composer, without the leading @. */
   name: string;
   /** Stable persisted-session identifier used by read_session. */
   session_key: string;
   title: string;
+}
+
+/** Stable public handle returned by the session-list endpoint. */
+export interface SessionHandle {
+  id: string;
+  name: string;
+}
+
+export interface UISessionMessage {
+  message_id: string;
+  session: SessionHandle;
 }
 
 export interface SessionAutomationJob {
@@ -337,6 +369,8 @@ export interface ChatSummary {
   /** Unix epoch seconds when this session currently has a turn in flight. */
   runStartedAt?: number | null;
   workspaceScope?: WorkspaceScopePayload | null;
+  /** Stable, server-owned @handle for this session. */
+  handle?: SessionHandle | null;
 }
 
 export type WorkspaceAccessMode = "restricted" | "full";
@@ -1208,7 +1242,12 @@ export interface InboundTurnMetadata {
 
 export type InboundEvent =
   | { event: "ready"; chat_id: string; client_id: string }
-  | { event: "attached"; chat_id: string; temporary?: boolean }
+  | {
+      event: "attached";
+      chat_id: string;
+      temporary?: boolean;
+      usage?: TurnUsage;
+    }
   | {
       event: "message_accepted";
       chat_id: string;
@@ -1225,10 +1264,12 @@ export type InboundEvent =
       active_turn_id?: string;
       starts_turn: boolean;
       started_at?: number;
+      created_at_ms?: number;
       media_urls?: UIMediaAttachment[];
       cli_apps?: UICliAppAttachment[];
       mcp_presets?: UIMcpPresetAttachment[];
       session_mentions?: SessionMention[];
+      provenance?: { session_message?: UISessionMessage };
     }
   | ({
       event: "message";
@@ -1294,11 +1335,14 @@ export type InboundEvent =
       chat_id: string;
       model_name: string;
       model_preset?: string | null;
+      fallback?: boolean;
     }
   | ({
       event: "turn_end";
       chat_id: string;
       latency_ms?: number;
+      usage?: TurnUsage;
+      context_window_tokens?: number;
       /** Authoritative sustained-goal snapshot for this chat (same shape as ``goal_state`` events). */
       goal_state?: GoalStateWsPayload;
     } & InboundTurnMetadata)
