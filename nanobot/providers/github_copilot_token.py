@@ -9,7 +9,6 @@ from datetime import datetime
 
 from litellm.llms.github_copilot.authenticator import Authenticator  # type: ignore
 
-# Refresh token 5 minutes before expiry (like OpenClaw)
 REFRESH_THRESHOLD_SECONDS = 300
 
 
@@ -34,7 +33,6 @@ class CopilotTokenManager:
                 data = json.load(f)
             expires_at = data.get("expires_at", 0)
             now = datetime.now().timestamp()
-            # Token is usable if expires in more than 5 minutes
             return (expires_at - now) > REFRESH_THRESHOLD_SECONDS
         except Exception:
             return False
@@ -58,7 +56,6 @@ class CopilotTokenManager:
             if info:
                 return info.get("token", "")
 
-        # Token expired or expiring soon — refresh
         return self._auth.get_api_key()
 
     def needs_refresh(self) -> tuple[bool, int]:
@@ -84,7 +81,6 @@ class CopilotTokenManager:
         return self._auth.get_api_key()
 
 
-# Singleton instance
 _manager: CopilotTokenManager | None = None
 
 

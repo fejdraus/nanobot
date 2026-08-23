@@ -11,13 +11,10 @@ export async function rememberChat(path: string | undefined, chatId: string): Pr
     try {
       await rename(temporary, path)
     } catch {
-      // Windows cannot always atomically replace an existing destination.
       await Bun.write(path, content)
       await rm(temporary, { force: true })
     }
   } catch {
-    // Session navigation must keep working when this optional convenience file
-    // is read-only, on a network volume, or removed during shutdown.
     await rm(temporary, { force: true }).catch(() => {})
   }
 }

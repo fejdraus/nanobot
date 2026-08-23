@@ -10,7 +10,6 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-# SearXNG endpoint
 SEARXNG_URL = "http://192.168.1.60:8888/search"
 
 server = Server("searxng")
@@ -45,7 +44,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     query = arguments.get("query", "")
 
-    # Handle count as string or integer
     count_raw = arguments.get("count", 5)
     try:
         count = min(max(int(count_raw), 1), 10)

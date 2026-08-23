@@ -44,7 +44,6 @@ def test_build_user_content_emits_video_url_block(tmp_path):
     assert block["type"] == "video_url"
     assert block["video_url"]["url"].startswith("data:video/mp4;base64,")
     assert block["video_url"]["fps"] == 2.0
-    # the base64 payload must be the file we passed, not a truncated read
     payload = block["video_url"]["url"].split(",", 1)[1]
     assert base64.b64decode(payload) == b"\x00" * 64
     assert content[-1] == {"type": "text", "text": "what happens here"}
@@ -74,7 +73,7 @@ def test_oversized_video_is_skipped_rather_than_sent(tmp_path, monkeypatch):
 def test_images_still_work_alongside_video(tmp_path):
     png = tmp_path / "shot.png"
     png.write_bytes(
-        b"\x89PNG\r\n\x1a\n" + b"\x00" * 24  # magic bytes are what detection reads
+        b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
     )
     video = _write_video(tmp_path)
     builder = ContextBuilder(workspace=tmp_path)

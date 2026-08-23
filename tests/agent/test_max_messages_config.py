@@ -112,24 +112,24 @@ class TestGetHistoryWithMaxMessages:
         assert len(history) <= FILE_MAX_MESSAGES
 
     def test_explicit_max_messages_limits_output(self) -> None:
-        session = _populated_session(40)  # 80 messages total
+        session = _populated_session(40)
         history = session.get_history(max_messages=20)
         assert len(history) <= 20
 
     def test_max_messages_starts_at_user_turn(self) -> None:
         """Sliced history should start with a user message, not mid-turn."""
-        session = _populated_session(30)  # 60 messages
+        session = _populated_session(30)
         history = session.get_history(max_messages=25)
         assert history[0]["role"] == "user"
 
     def test_max_messages_zero_uses_builtin_limit(self) -> None:
-        session = _populated_session(80)  # 160 messages total
+        session = _populated_session(80)
         history = session.get_history(max_messages=0)
         assert len(history) <= FILE_MAX_MESSAGES
 
     def test_small_session_unaffected(self) -> None:
         """When session has fewer messages than max_messages, all are returned."""
-        session = _populated_session(5)  # 10 messages
+        session = _populated_session(5)
         history = session.get_history(max_messages=25)
         assert len(history) == 10
 
