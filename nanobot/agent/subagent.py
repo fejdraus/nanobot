@@ -105,7 +105,6 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
-        fail_on_tool_error: bool | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         if workspace is None:
@@ -148,11 +147,6 @@ class SubagentManager:
             max_concurrent_subagents
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
-        )
-        self.fail_on_tool_error = (
-            fail_on_tool_error
-            if fail_on_tool_error is not None
-            else defaults.fail_on_tool_error
         )
         self._run_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner()
@@ -447,7 +441,6 @@ class SubagentManager:
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
                     error_message=None,
-                    fail_on_tool_error=self.fail_on_tool_error,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,

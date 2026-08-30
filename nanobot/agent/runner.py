@@ -103,7 +103,6 @@ class AgentRunSpec:
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
     max_iterations_message: str | None = None
     concurrent_tools: bool = False
-    fail_on_tool_error: bool = False
     workspace: Path | None = None
     session_key: str | None = None
     context_block_limit: int | None = None
@@ -585,7 +584,7 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await execute_tool_calls(
+                results, new_events = await execute_tool_calls(
                     spec.tools,
                     response.tool_calls,
                     concurrent=spec.concurrent_tools,
@@ -593,7 +592,6 @@ class AgentRunner:
                     workspace_violation_counts=workspace_violation_counts,
                     hook=hook,
                     context=context,
-                    fail_on_tool_error=spec.fail_on_tool_error,
                 )
                 tool_events.extend(new_events)
                 tools_used.extend(
@@ -618,24 +616,6 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
-                if fatal_error is not None:
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    final_content = error
-                    stop_reason = "tool_error"
-                    self._append_final_message(messages, final_content)
-                    context.final_content = final_content
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    await hook.after_iteration(context)
-                    should_continue, injection_cycles = await self._try_drain_injections(
-                        spec, messages, None, injection_cycles,
-                        phase="after tool error",
-                    )
-                    if should_continue:
-                        had_injections = True
-                        length_recovery_parts.clear()
-                        continue
-                    break
                 checkpoint_model_messages = (
                     self.context_governor.prepare_for_model(
                         governance_config,

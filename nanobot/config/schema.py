@@ -129,7 +129,6 @@ class AgentDefaults(Base):
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
     max_concurrent_subagents: int = Field(default=4, ge=1)
-    fail_on_tool_error: bool = True
     max_tool_result_chars: int = 16_000
     # Attach video files to the model request instead of only naming their path.
     # Off by default: the ``video_url`` content block is not part of the common

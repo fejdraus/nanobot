@@ -266,7 +266,6 @@ class AgentLoop:
         max_tool_result_chars: int | None = None,
         video_input: bool | None = None,
         video_fps: float | None = None,
-        fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
         tool_hint_max_length: int | None = None,
         cron_service: CronService | None = None,
@@ -402,7 +401,6 @@ class AgentLoop:
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
-            fail_on_tool_error=fail_on_tool_error,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
@@ -516,7 +514,6 @@ class AgentLoop:
             max_tool_result_chars=defaults.max_tool_result_chars,
             video_input=defaults.video_input,
             video_fps=defaults.video_fps,
-            fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
             restrict_to_workspace=config.tools.restrict_to_workspace,

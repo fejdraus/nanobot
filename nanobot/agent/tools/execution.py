@@ -59,16 +59,9 @@ async def execute_tool_calls(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
-    fail_on_tool_error: bool = False,
-) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
-    """Execute one model response's tool calls in stable result order.
-
-    With ``fail_on_tool_error`` a failing tool also yields the exception, so the
-    caller can end the turn instead of letting the model narrate its way past a
-    step that never ran — what a subagent's caller needs, since nobody reads its
-    transcript to notice.
-    """
-    tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+) -> tuple[list[Any], list[dict[str, str]]]:
+    """Execute one model response's tool calls in stable result order."""
+    tool_results: list[tuple[Any, dict[str, str]]] = []
     for batch in _partition_tool_batches(tools, tool_calls, concurrent=concurrent):
         if concurrent and len(batch) > 1:
             batch_results = await asyncio.gather(*(
@@ -79,7 +72,6 @@ async def execute_tool_calls(
                     workspace_violation_counts,
                     hook,
                     context,
-                    fail_on_tool_error,
                 )
                 for tool_call in batch
             ))
@@ -93,14 +85,12 @@ async def execute_tool_calls(
                     workspace_violation_counts,
                     hook,
                     context,
-                    fail_on_tool_error,
                 )
                 tool_results.append(result)
 
-    results = [result for result, _event, _err in tool_results]
-    events = [event for _result, event, _err in tool_results]
-    fatal = next((err for *_rest, err in tool_results if err is not None), None)
-    return results, events, fatal
+    results = [result for result, _event in tool_results]
+    events = [event for _result, event in tool_results]
+    return results, events
 
 
 async def _execute_tool_call(
@@ -110,8 +100,7 @@ async def _execute_tool_call(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
-    fail_on_tool_error: bool = False,
-) -> tuple[Any, dict[str, str], BaseException | None]:
+) -> tuple[Any, dict[str, str]]:
     lookup_error = repeated_external_lookup_error(
         tool_call.name,
         tool_call.arguments,
@@ -123,8 +112,7 @@ async def _execute_tool_call(
             "status": "error",
             "detail": "repeated external lookup blocked",
         }
-        return (_with_retry_hint(lookup_error), event,
-                RuntimeError(lookup_error) if fail_on_tool_error else None)
+        return _with_retry_hint(lookup_error), event
 
     prepare_call = cast(
         Callable[[str, Any], object] | None,
@@ -152,8 +140,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return (*handled, None)
-        return payload, event, RuntimeError(prep_error) if fail_on_tool_error else None
+            return handled
+        return payload, event
 
     await hook.before_execute_tool(context, tool_call, tool, params)
     try:
@@ -179,8 +167,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return (*handled, None)
-        return payload, event, exc if fail_on_tool_error else None
+            return handled
+        return payload, event
 
     if is_tool_error_result(result):
         await hook.on_execute_tool_error(context, tool_call, tool, params, result)
@@ -198,8 +186,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return (*handled, None)
-        return payload, event, RuntimeError(result) if fail_on_tool_error else None
+            return handled
+        return payload, event
 
     await hook.after_execute_tool(context, tool_call, tool, params, result)
 
@@ -209,7 +197,7 @@ async def _execute_tool_call(
         detail = "(empty)"
     elif len(detail) > 120:
         detail = detail[:120] + "..."
-    return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+    return result, {"name": tool_call.name, "status": "ok", "detail": detail}
 
 
 def is_ssrf_violation(text: str) -> bool:
