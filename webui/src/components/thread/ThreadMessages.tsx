@@ -26,12 +26,8 @@ interface ThreadMessagesProps {
 
 export type DisplayUnit = TurnUnit;
 
-export function buildDisplayUnits(
-  messages: UIMessage[],
-  isStreaming = false,
-  activeTurnId: string | null = null,
-): DisplayUnit[] {
-  return projectActivityTimeline(messages, isStreaming ? activeTurnId : undefined);
+export function buildDisplayUnits(messages: UIMessage[]): DisplayUnit[] {
+  return projectActivityTimeline(messages);
 }
 
 export function assistantForkFlags(units: DisplayUnit[]): boolean[] {
@@ -69,8 +65,8 @@ export function ThreadMessages({
   const { t } = useTranslation();
   const messageListRef = useRef<HTMLDivElement>(null);
   const units = useMemo(
-    () => buildDisplayUnits(messages, isStreaming, activeTurnId),
-    [activeTurnId, isStreaming, messages],
+    () => buildDisplayUnits(messages),
+    [messages],
   );
   const forkBoundaryAfterUnitIndex = useMemo(
     () => unitIndexAfterMessageCount(units, forkBoundaryMessageCount),
@@ -140,6 +136,7 @@ export function ThreadMessages({
         return (
           <ThreadDisplayUnit
             key={unitKeys[index]}
+            unitKey={unitKeys[index]}
             unit={unit}
             marginTop={marginTop}
             userPromptId={userPromptId}
@@ -229,6 +226,7 @@ function pendingTurnProjection(
 }
 
 interface ThreadDisplayUnitProps {
+  unitKey: string;
   unit: DisplayUnit;
   marginTop: string;
   userPromptId?: string;
@@ -247,6 +245,7 @@ interface ThreadDisplayUnitProps {
 }
 
 const ThreadDisplayUnit = memo(function ThreadDisplayUnit({
+  unitKey,
   unit,
   marginTop,
   userPromptId,
@@ -277,6 +276,7 @@ const ThreadDisplayUnit = memo(function ThreadDisplayUnit({
     <>
       <div
         className={`${marginTop}${stableDeferOffscreenRender ? " thread-render-unit" : ""}`}
+        data-thread-display-unit={unitKey}
         data-user-prompt-id={userPromptId}
       >
         {unit.type === "activity" ? (
@@ -355,11 +355,15 @@ function activeTurnStartIndex(units: DisplayUnit[], activeTurnId: string | null)
 function displayUnitsEqual(previous: DisplayUnit, next: DisplayUnit): boolean {
   if (previous.type !== next.type) return false;
   if (previous.type === "message" && next.type === "message") {
-    return shallowMessageEqual(previous.message, next.message);
+    return (
+      previous.sourceMessageCount === next.sourceMessageCount
+      && shallowMessageEqual(previous.message, next.message)
+    );
   }
   if (previous.type !== "activity" || next.type !== "activity") return false;
   return (
-    previous.turnLatencyMs === next.turnLatencyMs
+    previous.sourceMessageCount === next.sourceMessageCount
+    && previous.turnLatencyMs === next.turnLatencyMs
     && previous.startedAtMs === next.startedAtMs
     && previous.messages.length === next.messages.length
     && previous.messages.every((message, index) =>
@@ -383,7 +387,7 @@ function unitIndexAfterMessageCount(
   let seen = 0;
   for (let i = 0; i < units.length; i += 1) {
     const unit = units[i];
-    seen += unit.type === "activity" ? unit.messages.length : 1;
+    seen += unit.sourceMessageCount;
     if (seen >= messageCount) return i;
   }
   return null;

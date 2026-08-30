@@ -1,20 +1,31 @@
 import type { UIMessage } from "@/lib/types";
 
-/** A completed turn has two surfaces: one activity container and one final
- * answer. An active turn temporarily preserves arrival order so visible
- * Markdown never moves when a later tool starts. */
+/** A turn is projected into ordered answer messages and collapsible activity
+ * runs. Folding changes presentation only; it never changes semantic order. */
 export type TurnUnit =
   | {
       type: "activity";
       messages: UIMessage[];
+      /** Number of raw UI messages represented by this display unit. */
+      sourceMessageCount: number;
       turnLatencyMs?: number;
       startedAtMs?: number;
     }
-  | { type: "message"; message: UIMessage };
+  | {
+      type: "message";
+      message: UIMessage;
+      /** Number of raw UI messages represented by this display unit. */
+      sourceMessageCount: number;
+    };
 
 export function isReasoningOnlyAssistant(message: UIMessage): boolean {
   if (message.role !== "assistant" || message.kind === "trace") return false;
-  if (message.activityKind === "model" || message.content.trim().length > 0) return false;
+  if (
+    message.activityKind === "model"
+    || message.content.trim().length > 0
+    || !!message.media?.length
+    || !!message.images?.length
+  ) return false;
   return !!(message.reasoning?.length || message.reasoningStreaming || message.isStreaming);
 }
 
@@ -37,15 +48,14 @@ export function hasPendingAgentActivity(messages: UIMessage[]): boolean {
     || previous.turnId !== lastTurnId;
 }
 
-/**
- * Project completed or replayed gateway rows into the stable shape:
+/** Project gateway rows without changing their causal order.
  *
- *   user → [one live/completed activity surface] → [one final answer]
- *
- * Assistant text that is followed by another activity is an intermediate model
- * segment. It remains in the activity timeline, where the renderer keeps its
- * normal Markdown surface, but it never creates a second answer bubble. This
- * is the same causal model used by Codex-style transcripts.
+ * Messages use ``turnSeq`` when every row in the turn provides it and fall
+ * back to stable arrival order otherwise. Only contiguous rows of the same
+ * display class are combined: activity rows share a collapsible surface, and
+ * adjacent answer slices share an answer bubble. A visible answer is always a
+ * hard boundary between activity surfaces; completed empty transport frames
+ * have no display semantics and therefore create no boundary.
  */
 export function normalizeActivityTimeline(
   messages: UIMessage[],
@@ -62,51 +72,22 @@ export function normalizeActivityTimeline(
       return;
     }
 
-    const ordered = orderMessagesByTurnSeq(turnMessages);
-    const lastActivityIndex = ordered.reduce(
-      (index, message, current) => isRawActivity(message) ? current : index,
-      -1,
+    const projected = projectOrderedTurn(
+      orderMessagesByTurnSeq(turnMessages),
+      activeTurnStartedAtMs,
     );
-    const answerIndices = ordered
-      .map((message, index) => ({ message, index }))
-      .filter(({ message }) => isAssistantAnswer(message));
-    const finalAnswerIndex = answerIndices.at(-1)?.index;
-    // A replay can deliver a completed answer before a late trace row. Keep
-    // that answer visible, but place the late activity in the single activity
-    // surface before it. An answer followed by more activity is an
-    // intermediate model segment and stays in that surface in turn order.
-    const hasFinalAnswer = finalAnswerIndex !== undefined
-      && (finalAnswerIndex > lastActivityIndex || ordered[finalAnswerIndex].isStreaming !== true);
-
-    const activity: UIMessage[] = [];
-    const answers: UIMessage[] = [];
-    ordered.forEach((message, index) => {
-      if (isRawActivity(message)) {
-        activity.push(message);
-      } else if (isAssistantAnswer(message)) {
-        if (message.reasoning?.trim() || message.reasoningStreaming) {
-          activity.push(reasoningOnlyMessageFromAnswer(message));
-        }
-        if (hasFinalAnswer && index === finalAnswerIndex) {
-          answers.push(stripInlineReasoning(message));
-        } else {
-          activity.push(modelActivitySnippet(message));
-        }
-      } else {
-        activity.push(message);
-      }
-    });
-
-    if (activity.length) {
-      units.push({
-        type: "activity",
-        messages: activity,
-        turnLatencyMs: activityTurnLatencyMs(activity, ordered),
-        startedAtMs: activeTurnStartedAtMs,
-      });
-    }
-    if (answers.length) {
-      units.push({ type: "message", message: mergeAssistantAnswers(answers) });
+    if (projected.length) {
+      units.push(...projected);
+    } else if (units.length) {
+      // A turn containing only completed transport placeholders has no
+      // display surface. Keep its source count on the preceding prompt so
+      // persisted fork-boundary offsets still map to a visible unit.
+      const lastIndex = units.length - 1;
+      const last = units[lastIndex];
+      units[lastIndex] = {
+        ...last,
+        sourceMessageCount: last.sourceMessageCount + turnMessages.length,
+      };
     }
 
     turnMessages = [];
@@ -117,7 +98,7 @@ export function normalizeActivityTimeline(
   for (const message of messages) {
     if (message.role === "user") {
       flushTurn();
-      units.push({ type: "message", message });
+      units.push({ type: "message", message, sourceMessageCount: 1 });
       activeTurnId = message.turnId;
       activeTurnStartedAtMs = validCreatedAtMs(message.createdAt);
       continue;
@@ -131,82 +112,110 @@ export function normalizeActivityTimeline(
   return units;
 }
 
-/**
- * Keep an in-flight turn in arrival order. Until ``turn_end`` there is no
- * reliable way to know whether an assistant text segment is the final answer
- * or commentary before another tool call. Reclassifying it when that tool
- * arrives makes an already-visible Markdown tree jump between containers.
- *
- * Completed turns still use ``normalizeActivityTimeline`` and collapse into
- * one audit surface plus the final answer. While the turn is active, text and
- * contiguous activity phases stay in arrival order. A later tool therefore
- * appends a Working surface after existing Markdown instead of reparenting it.
- */
 export function projectActivityTimeline(
   messages: UIMessage[],
-  liveTurnId?: string | null,
 ): TurnUnit[] {
-  if (liveTurnId === undefined) return normalizeActivityTimeline(messages);
-
-  const liveStart = findLiveTurnStart(messages, liveTurnId);
-  if (liveStart < 0) return normalizeActivityTimeline(messages);
-  const nextPrompt = messages.findIndex(
-    (message, index) => index > liveStart && message.role === "user",
-  );
-  const liveEnd = nextPrompt < 0 ? messages.length : nextPrompt;
-
-  return [
-    ...normalizeActivityTimeline(messages.slice(0, liveStart)),
-    ...projectLiveTurn(messages.slice(liveStart, liveEnd)),
-    ...normalizeActivityTimeline(messages.slice(liveEnd)),
-  ];
+  return normalizeActivityTimeline(messages);
 }
 
-function findLiveTurnStart(messages: UIMessage[], liveTurnId: string | null): number {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role !== "user") continue;
-    if (liveTurnId === null || message.turnId === liveTurnId) return index;
-  }
-  return -1;
-}
-
-function projectLiveTurn(messages: UIMessage[]): TurnUnit[] {
+function projectOrderedTurn(
+  messages: UIMessage[],
+  startedAtMs?: number,
+): TurnUnit[] {
   const units: TurnUnit[] = [];
-  const prompt = messages[0];
-  const startedAtMs = prompt?.role === "user" ? validCreatedAtMs(prompt.createdAt) : undefined;
   let activity: UIMessage[] = [];
-
-  if (prompt?.role === "user") units.push({ type: "message", message: prompt });
+  let activitySourceMessageCount = 0;
+  let answers: UIMessage[] = [];
+  let answerSourceMessageCount = 0;
+  let leadingNoopSourceMessageCount = 0;
 
   const flushActivity = () => {
     if (!activity.length) return;
     units.push({
       type: "activity",
       messages: activity,
-      turnLatencyMs: activityTurnLatencyMs(activity, activity),
+      sourceMessageCount: activitySourceMessageCount,
       startedAtMs,
     });
     activity = [];
+    activitySourceMessageCount = 0;
   };
 
-  for (const message of messages.slice(prompt?.role === "user" ? 1 : 0)) {
+  const flushAnswers = () => {
+    if (!answers.length) return;
+    units.push({
+      type: "message",
+      message: mergeAssistantAnswers(answers),
+      sourceMessageCount: answerSourceMessageCount,
+    });
+    answers = [];
+    answerSourceMessageCount = 0;
+  };
+
+  const claimLeadingNoops = () => {
+    const count = leadingNoopSourceMessageCount;
+    leadingNoopSourceMessageCount = 0;
+    return count;
+  };
+
+  const appendActivity = (message: UIMessage, sourceMessageCount: number) => {
+    flushAnswers();
+    activity.push(message);
+    activitySourceMessageCount += sourceMessageCount + claimLeadingNoops();
+  };
+
+  const absorbDisplayNoop = () => {
+    if (activity.length) {
+      activitySourceMessageCount += 1;
+    } else if (answers.length) {
+      answerSourceMessageCount += 1;
+    } else {
+      leadingNoopSourceMessageCount += 1;
+    }
+  };
+
+  for (const message of messages) {
+    if (isCompletedDisplayNoop(message)) {
+      absorbDisplayNoop();
+      continue;
+    }
     if (isRawActivity(message)) {
-      activity.push(message);
+      appendActivity(message, 1);
       continue;
     }
     if (isAssistantAnswer(message)) {
       if (message.reasoning?.trim() || message.reasoningStreaming) {
-        activity.push(reasoningOnlyMessageFromAnswer(message));
+        // This raw message contributes one answer source plus a synthetic
+        // reasoning row, so count it only on the answer unit.
+        appendActivity(reasoningOnlyMessageFromAnswer(message), 0);
       }
       flushActivity();
-      units.push({ type: "message", message: stripInlineReasoning(message) });
+      answerSourceMessageCount += claimLeadingNoops();
+      answers.push(stripInlineReasoning(message));
+      answerSourceMessageCount += 1;
       continue;
     }
-    activity.push(message);
+    appendActivity(message, 1);
   }
 
   flushActivity();
+  flushAnswers();
+
+  let lastActivityIndex = -1;
+  for (let index = units.length - 1; index >= 0; index -= 1) {
+    if (units[index].type !== "activity") continue;
+    lastActivityIndex = index;
+    break;
+  }
+  if (lastActivityIndex >= 0) {
+    const lastActivity = units[lastActivityIndex];
+    if (lastActivity.type === "activity") {
+      const turnLatencyMs = activityTurnLatencyMs(lastActivity.messages, messages);
+      if (turnLatencyMs !== undefined) {
+        units[lastActivityIndex] = { ...lastActivity, turnLatencyMs };
+      }
+    }
+  }
   return units;
 }
 
@@ -214,8 +223,37 @@ function isRawActivity(message: UIMessage): boolean {
   return isAgentActivityMember(message);
 }
 
+/** A completed transport placeholder carries ordering/accounting metadata but
+ * no user-visible semantics, so it cannot define a display boundary. */
+function isCompletedDisplayNoop(message: UIMessage): boolean {
+  return (
+    message.role === "assistant"
+    && message.kind !== "trace"
+    && message.activityKind !== "model"
+    && !message.isStreaming
+    && !message.reasoningStreaming
+    && message.content.trim().length === 0
+    && !message.reasoning?.trim()
+    && !message.media?.length
+    && !message.images?.length
+    && !message.traces?.some((line) => line.trim().length > 0)
+    && !message.toolEvents?.length
+    && !message.fileEdits?.length
+    && !message.sessionMessage
+  );
+}
+
 function isAssistantAnswer(message: UIMessage): boolean {
-  return message.role === "assistant" && message.kind !== "trace" && message.content.trim().length > 0;
+  if (message.role !== "assistant" || message.kind === "trace" || message.activityKind === "model") {
+    return false;
+  }
+  if (message.turnPhase === "reasoning" || message.turnPhase === "activity") return false;
+  return (
+    message.turnPhase === "answer"
+    || message.content.trim().length > 0
+    || !!message.media?.length
+    || !!message.images?.length
+  );
 }
 
 function orderMessagesByTurnSeq(messages: UIMessage[]): UIMessage[] {
@@ -246,18 +284,6 @@ function mergeAssistantAnswers(answers: UIMessage[]): UIMessage {
   if (images.length) merged.images = images;
   else delete merged.images;
   return merged;
-}
-
-function modelActivitySnippet(message: UIMessage): UIMessage {
-  return {
-    ...stripInlineReasoning(message),
-    id: `${message.id}-activity`,
-    activityKind: "model",
-    turnPhase: "activity",
-    // Keep the source stream state so the activity surface can render this
-    // segment with the same Markdown streaming semantics as a normal answer.
-    isStreaming: message.isStreaming,
-  };
 }
 
 function reasoningOnlyMessageFromAnswer(message: UIMessage): UIMessage {

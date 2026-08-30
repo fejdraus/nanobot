@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { useClient } from "@/providers/ClientProvider";
 import { toMediaAttachment } from "@/lib/media";
@@ -20,7 +21,6 @@ import {
   isReasoningOnlyPlaceholder,
   matchesTurn,
   mergeFileEdits,
-  pruneReasoningOnlyPlaceholders,
   replaceMessageAt,
   stampLastAssistantCompletion,
   stripCoveredFileEditToolHintsFromMessages,
@@ -28,6 +28,7 @@ import {
 } from "@/lib/thread-event-projection";
 import type { UIMessageTurnFields } from "@/lib/thread-event-projection";
 import { formatQuotedUserMessage } from "@/lib/user-message-quote";
+import { readLocalPreferences } from "@/lib/local-preferences";
 import type {
   InboundEvent,
   OutboundCliAppMention,
@@ -36,6 +37,7 @@ import type {
   SessionMention,
   GoalStateWsPayload,
   MessageDeliveryStatus,
+  RecoveryState,
   UIMediaAttachment,
   UIMessage,
   WorkspaceScopePayload,
@@ -87,10 +89,12 @@ function attachReasoningChunk(
     const activitySegmentId = candidate.activitySegmentId ?? segments?.ensure();
     const hasAnswer = candidate.content.length > 0;
     if (hasAnswer) break;
+    // ``reasoning_end`` closes this row even though the assistant placeholder
+    // stays streaming for the rest of the turn. The next reasoning stream must
+    // get its own row when an intervening tool trace is delayed or unavailable.
     if (
       candidate.reasoningStreaming
-      || candidate.reasoning !== undefined
-      || candidate.isStreaming
+      || (candidate.isStreaming && candidate.reasoning === undefined)
     ) {
       const merged: UIMessage = {
         ...candidate,
@@ -244,6 +248,9 @@ export function useNanobotStream(
   runStartedAt: number | null;
   /** Latest sustained goal for this ``chatId`` (``goal_state`` WS events). */
   goalState: GoalStateWsPayload | undefined;
+  recoveryState: RecoveryState | null;
+  continueRecovery: () => Promise<void>;
+  dismissRecovery: () => Promise<void>;
   send: (
     content: string,
     images?: SendAttachment[],
@@ -262,6 +269,7 @@ export function useNanobotStream(
   dismissStreamError: () => void;
 } {
   const { client } = useClient();
+  const { t } = useTranslation();
   const initialRunStartedAt = chatId ? client.getRunStartedAt(chatId) : null;
   const [messages, setMessages] = useState<UIMessage[]>(initialMessages);
   const [messageOwnerChatId, setMessageOwnerChatId] = useState(chatId);
@@ -273,6 +281,7 @@ export function useNanobotStream(
   /** Unix epoch seconds when the current user turn started; cleared on ``idle``. */
   const [runStartedAt, setRunStartedAt] = useState<number | null>(initialRunStartedAt);
   const [goalState, setGoalState] = useState<GoalStateWsPayload | undefined>(undefined);
+  const [recoveryState, setRecoveryState] = useState<RecoveryState | null>(null);
   const [streamError, setStreamError] = useState<StreamError | null>(null);
   const buffer = useRef<StreamBuffer | null>(null);
   const activeAssistantRef = useRef<ActiveAssistantCursor | null>(null);
@@ -287,6 +296,16 @@ export function useNanobotStream(
   const sideChannelTurnIdsRef = useRef<Set<string>>(new Set());
 
   const dismissStreamError = useCallback(() => setStreamError(null), []);
+
+  const notifyInBackground = useCallback((body: string) => {
+    if (
+      typeof Notification === "undefined"
+      || Notification.permission !== "granted"
+      || document.visibilityState === "visible"
+      || !readLocalPreferences().browserNotifications
+    ) return;
+    new Notification("nanobot", { body });
+  }, []);
 
   const clearPendingStreamWork = useCallback(() => {
     if (streamFrameRef.current !== null) {
@@ -639,6 +658,7 @@ export function useNanobotStream(
     setStreamError(null);
     setRunStartedAt(restoredRunStartedAt);
     setGoalState(chatId ? client.getGoalState(chatId) : undefined);
+    setRecoveryState(null);
     buffer.current = null;
     activeAssistantRef.current = null;
     closedAssistantStreamIdsRef.current.clear();
@@ -822,7 +842,6 @@ export function useNanobotStream(
         const completedAt = Date.now();
         setMessages((prev) => {
           let finalized = prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m));
-          finalized = pruneReasoningOnlyPlaceholders(finalized);
           const latencyMs =
             typeof ev.latency_ms === "number" && ev.latency_ms >= 0
               ? Math.round(ev.latency_ms)
@@ -846,7 +865,68 @@ export function useNanobotStream(
           return finalized;
         });
         suppressStreamUntilTurnEndRef.current = false;
+        notifyInBackground(t("recovery.completed", { defaultValue: "Task completed" }));
         onTurnEnd?.();
+        return;
+      }
+
+      if (ev.event === "recovery_state") {
+        const next: RecoveryState = {
+          status: ev.status,
+          recovery_id: ev.recovery_id,
+          ...(ev.reason ? { reason: ev.reason } : {}),
+          ...(typeof ev.attempts === "number" ? { attempts: ev.attempts } : {}),
+          ...(typeof ev.can_continue === "boolean"
+            ? { can_continue: ev.can_continue }
+            : {}),
+        };
+        setRecoveryState(next);
+        if (ev.status === "resuming") {
+          setRunStartedAt((current) => current ?? Date.now() / 1000);
+          setIsStreaming(true);
+        }
+        if (
+          ev.status === "awaiting_user"
+          || ev.status === "recovered"
+          || ev.status === "failed"
+        ) {
+          // Recovery is an explicit boundary. The interrupted turn is no
+          // longer running, so do not let the stale start time keep the
+          // activity clock (or composer stop state) alive underneath the
+          // recovery notice.
+          setRunStartedAt(null);
+          setIsStreaming(false);
+          client.finishRunLocally(chatId);
+          clearPendingStreamWork();
+          closeActiveAssistantStream();
+          clearActivitySegment();
+          if (ev.status !== "recovered") {
+            notifyInBackground(
+              ev.status === "failed"
+                ? t("recovery.failed", { defaultValue: "Task recovery failed" })
+                : t("recovery.interrupted", { defaultValue: "Task interrupted" }),
+            );
+          }
+        }
+        return;
+      }
+
+      if (ev.event === "attached") {
+        setRecoveryState(ev.recovery_state ?? null);
+        if (ev.recovery_state?.status === "resuming") {
+          setRunStartedAt((current) => current ?? Date.now() / 1000);
+          setIsStreaming(true);
+        } else if (
+          ev.recovery_state?.status === "awaiting_user"
+          || ev.recovery_state?.status === "failed"
+        ) {
+          setRunStartedAt(null);
+          setIsStreaming(false);
+          client.finishRunLocally(chatId);
+          clearPendingStreamWork();
+          closeActiveAssistantStream();
+          clearActivitySegment();
+        }
         return;
       }
 
@@ -1062,8 +1142,10 @@ export function useNanobotStream(
     ensureActivitySegmentId,
     flushPendingStreamEvents,
     isSideChannelEvent,
+    notifyInBackground,
     onTurnEnd,
     schedulePendingStreamFlush,
+    t,
   ]);
 
   const send = useCallback(
@@ -1103,7 +1185,7 @@ export function useNanobotStream(
         }
         const base = finalizeActiveTurn ? finalizeStreamedTurn(prev) : prev;
         return [
-          ...(sideChannel || continueActiveTurn ? base : pruneReasoningOnlyPlaceholders(base)),
+          ...base,
           {
             id: userMessageId,
             role: "user",
@@ -1173,12 +1255,32 @@ export function useNanobotStream(
     [client],
   );
 
+  const recoveryAction = useCallback(async (action: "continue" | "dismiss") => {
+    if (!chatId || !recoveryState) return;
+    await client.requestMutation(`recovery.${action}`, {
+      chat_id: chatId,
+      recovery_id: recoveryState.recovery_id,
+    });
+  }, [chatId, client, recoveryState]);
+
+  const continueRecovery = useCallback(
+    () => recoveryAction("continue"),
+    [recoveryAction],
+  );
+  const dismissRecovery = useCallback(
+    () => recoveryAction("dismiss"),
+    [recoveryAction],
+  );
+
   return {
     messages,
     messagesReady: messageOwnerChatId === chatId,
     isStreaming,
     runStartedAt,
     goalState,
+    recoveryState,
+    continueRecovery,
+    dismissRecovery,
     send,
     transcribeAudio,
     stop,

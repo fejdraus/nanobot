@@ -1,8 +1,8 @@
-export type Role = "user" | "assistant" | "tool" | "system";
+type Role = "user" | "assistant" | "tool" | "system";
 
 /** "trace" rows are intermediate agent breadcrumbs (tool-call hints,
  * progress pings) that should not be rendered as conversational replies. */
-export type MessageKind = "message" | "trace";
+type MessageKind = "message" | "trace";
 
 export type UITurnPhase = "user" | "reasoning" | "activity" | "answer" | "complete";
 export type MessageDeliveryStatus = "sending" | "accepted" | "failed";
@@ -37,7 +37,7 @@ export interface UIMediaAttachment {
   name?: string;
 }
 
-export interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
+interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
 
 export interface TurnUsage {
   prompt_tokens?: number;
@@ -47,6 +47,16 @@ export interface TurnUsage {
   request_count?: number;
   estimated_tokens?: number;
   [key: string]: number | undefined;
+}
+
+export type RecoveryStatus = "resuming" | "awaiting_user" | "recovered" | "failed";
+
+export interface RecoveryState {
+  status: RecoveryStatus;
+  recovery_id: string;
+  reason?: string;
+  attempts?: number;
+  can_continue?: boolean;
 }
 
 export interface UIMessage {
@@ -144,7 +154,7 @@ export interface SessionHandle {
   name: string;
 }
 
-export interface UISessionMessage {
+interface UISessionMessage {
   message_id: string;
   session: SessionHandle;
 }
@@ -226,14 +236,14 @@ export interface SkillSummary {
   unavailable_reason?: string;
 }
 
-export interface SkillRequirements {
+interface SkillRequirements {
   bins: string[];
   env: string[];
   missing_bins: string[];
   missing_env: string[];
 }
 
-export interface SkillInstallOption {
+interface SkillInstallOption {
   id: string;
   kind: string;
   label: string;
@@ -303,7 +313,7 @@ export interface SkillInstallPayload extends SkillsPayload {
 }
 
 /** Structured UI blob on ``progress`` WS frames; channels may add more ``kind`` values later. */
-export interface AgentUIBlob {
+interface AgentUIBlob {
   kind: string;
   data?: unknown;
 }
@@ -368,6 +378,8 @@ export interface ChatSummary {
   modelPreset?: string | null;
   /** Unix epoch seconds when this session currently has a turn in flight. */
   runStartedAt?: number | null;
+  /** Durable recovery state that needs attention after an interrupted turn. */
+  recoveryState?: RecoveryState | null;
   workspaceScope?: WorkspaceScopePayload | null;
   /** Stable, server-owned @handle for this session. */
   handle?: SessionHandle | null;
@@ -455,16 +467,16 @@ export interface BootstrapResponse {
   runtime_capabilities?: RuntimeCapabilities;
 }
 
-export interface WebUITransportLimits {
+interface WebUITransportLimits {
   max_frame_bytes: number;
   envelope_reserve_bytes: number;
 }
 
-export interface WebUIMessageLimits {
+interface WebUIMessageLimits {
   max_text_bytes: number;
 }
 
-export interface WebUIAttachmentLimits {
+interface WebUIAttachmentLimits {
   max_count: number;
   max_file_bytes: number;
   max_total_bytes: number;
@@ -477,8 +489,8 @@ export interface WebUIIngressLimits {
 }
 
 export type RuntimeSurface = "browser" | "native";
-export type RestartBehavior = "none" | "nextTurn" | "engineRestart" | "appRestart";
-export type SettingsApplyStatus =
+type RestartBehavior = "none" | "nextTurn" | "engineRestart" | "appRestart";
+type SettingsApplyStatus =
   | "idle"
   | "pending"
   | "applying"
@@ -492,12 +504,14 @@ export interface RuntimeCapabilities {
   can_export_diagnostics: boolean;
 }
 
-export interface ProviderModelInfo {
+interface ProviderModelInfo {
   id: string;
   label?: string | null;
   description?: string | null;
   owned_by?: string | null;
   context_window?: number | null;
+  reasoning_efforts?: string[];
+  supports_backend_search?: boolean;
 }
 
 export interface ProviderModelsPayload {
@@ -509,7 +523,15 @@ export interface ProviderModelsPayload {
     | "not_configured"
     | "missing_api_base"
     | "error";
-  catalog_kind: "builtin" | "official" | "catalog" | "local" | "custom" | "unsupported";
+  catalog_kind:
+    | "builtin"
+    | "hybrid"
+    | "official"
+    | "catalog"
+    | "local"
+    | "custom"
+    | "unsupported";
+  source?: "remote" | "cache" | "stale" | "fallback";
   models: ProviderModelInfo[];
   model_count: number;
   message?: string | null;
@@ -700,27 +722,47 @@ export interface SettingsPayload {
   usage?: {
     days: Array<{
       date: string;
-      prompt_tokens: number;
-      completion_tokens: number;
-      cached_tokens: number;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      cache_read_observed_input_tokens: number;
+      cache_write_observed_input_tokens: number;
       total_tokens: number;
-      provider_tokens?: number;
+      reported_tokens?: number;
       estimated_tokens?: number;
       requests: number;
-      provider_requests?: number;
+      reported_requests?: number;
       estimated_requests?: number;
+      successful_requests?: number;
+      failed_requests?: number;
+      generation_ms?: number;
+      measured_output_tokens?: number;
+      ttft_ms?: number;
+      timed_requests?: number;
+      duration_ms?: number;
       sources?: Record<
         "user" | "api" | "cron" | "dream" | "system" | string,
         {
-          prompt_tokens: number;
-          completion_tokens: number;
-          cached_tokens: number;
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          cache_read_observed_input_tokens: number;
+          cache_write_observed_input_tokens: number;
           total_tokens: number;
-          provider_tokens?: number;
+          reported_tokens?: number;
           estimated_tokens?: number;
           requests: number;
-          provider_requests?: number;
+          reported_requests?: number;
           estimated_requests?: number;
+          successful_requests?: number;
+          failed_requests?: number;
+          generation_ms?: number;
+          measured_output_tokens?: number;
+          ttft_ms?: number;
+          timed_requests?: number;
+          duration_ms?: number;
         }
       >;
     }>;
@@ -732,6 +774,35 @@ export interface SettingsPayload {
     longest_streak_days: number;
     active_days_30d: number;
     requests_30d: number;
+    failed_requests_30d?: number;
+    reported_tokens_30d?: number;
+    estimated_tokens_30d?: number;
+    cache_read_tokens_30d?: number;
+    cache_read_observed_input_tokens_30d?: number;
+    cache_read_rate_30d?: number | null;
+    providers_30d?: Array<{
+      provider: string;
+      model: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      cache_read_observed_input_tokens: number;
+      cache_write_observed_input_tokens: number;
+      total_tokens: number;
+      reported_tokens: number;
+      estimated_tokens: number;
+      requests: number;
+      successful_requests: number;
+      failed_requests: number;
+      reported_requests: number;
+      estimated_requests: number;
+      generation_ms: number;
+      measured_output_tokens: number;
+      ttft_ms: number;
+      timed_requests: number;
+      duration_ms: number;
+    }>;
     updated_at?: string | null;
   };
   advanced: {
@@ -783,12 +854,12 @@ export interface ApiServicePayload {
   last_action?: "started" | "stopped" | string;
 }
 
-export interface AppPackageRef {
+interface AppPackageRef {
   manager: string;
   name?: string;
 }
 
-export interface AppCapability {
+interface AppCapability {
   type: "cli" | "mcp" | "skill" | string;
   entry_point?: string;
   package?: AppPackageRef;
@@ -806,20 +877,20 @@ export interface AppCapability {
   }>;
 }
 
-export interface AppPlan {
+interface AppPlan {
   supported: boolean;
   strategy?: string;
   managed_paths?: string[];
   verification?: string[];
 }
 
-export interface AppTrust {
+interface AppTrust {
   registry: string;
   level: string;
   review_status: string;
 }
 
-export interface AppManifest {
+interface AppManifest {
   schema: "agent-app.v1" | string;
   id: string;
   display_name: string;
@@ -935,7 +1006,7 @@ export interface NanobotFeaturesPayload {
   };
 }
 
-export type ChannelSetupStatus =
+type ChannelSetupStatus =
   | "connected"
   | "configured"
   | "needs_setup"
@@ -943,9 +1014,9 @@ export type ChannelSetupStatus =
   | "unsupported"
   | string;
 
-export type ChannelValidationCheckStatus = "pass" | "warn" | "fail" | "skipped" | string;
+type ChannelValidationCheckStatus = "pass" | "warn" | "fail" | "skipped" | string;
 
-export interface ChannelValidationCheck {
+interface ChannelValidationCheck {
   id: string;
   label: string;
   status: ChannelValidationCheckStatus;
@@ -953,7 +1024,7 @@ export interface ChannelValidationCheck {
   action_url?: string;
 }
 
-export interface ChannelIdentity {
+interface ChannelIdentity {
   name?: string;
   workspace?: string;
   account?: string;
@@ -993,7 +1064,7 @@ export interface PairingPayload {
   };
 }
 
-export interface McpPresetField {
+interface McpPresetField {
   name: string;
   label: string;
   secret: boolean;
@@ -1033,7 +1104,7 @@ export interface McpPresetInfo {
   manifest?: AppManifest;
 }
 
-export type McpOAuthFlowStatus =
+type McpOAuthFlowStatus =
   | "starting"
   | "authorization_required"
   | "connecting"
@@ -1089,7 +1160,7 @@ export interface McpPresetsPayload {
   };
 }
 
-export type ChannelConnectStatus = "pending" | "succeeded" | "expired" | "cancelled" | "failed";
+type ChannelConnectStatus = "pending" | "succeeded" | "expired" | "cancelled" | "failed";
 
 export interface ChannelConnectPayload {
   session_id: string;
@@ -1234,7 +1305,7 @@ export type ConnectionStatus =
   | "closed"
   | "error";
 
-export interface InboundTurnMetadata {
+interface InboundTurnMetadata {
   turn_id?: string;
   turn_phase?: UITurnPhase;
   turn_seq?: number;
@@ -1246,6 +1317,7 @@ export type InboundEvent =
       event: "attached";
       chat_id: string;
       temporary?: boolean;
+      recovery_state?: RecoveryState;
       usage?: TurnUsage;
     }
   | {
@@ -1289,6 +1361,10 @@ export type InboundEvent =
       /** Optional structured payload on progress frames (channel-specific). */
       agent_ui?: AgentUIBlob;
     } & InboundTurnMetadata)
+  | ({
+      event: "recovery_state";
+      chat_id: string;
+    } & RecoveryState)
   | ({
       event: "file_edit";
       chat_id: string;
@@ -1430,7 +1506,7 @@ export interface OutboundMcpPresetMention {
 }
 
 /** Response shape for ``GET .../webui-thread`` (server-built transcript replay). */
-export interface WebuiThreadPagePayload {
+interface WebuiThreadPagePayload {
   before_cursor?: string | null;
   has_more_before?: boolean;
   loaded_message_count?: number;

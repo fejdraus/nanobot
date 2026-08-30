@@ -119,21 +119,6 @@ export function isReasoningOnlyPlaceholder(message: UIMessage): boolean {
   );
 }
 
-function isToolTrace(message: UIMessage | undefined): boolean {
-  return message?.kind === "trace";
-}
-
-export function pruneReasoningOnlyPlaceholders(prev: UIMessage[]): UIMessage[] {
-  return prev.filter((message, index) => {
-    if (!isReasoningOnlyPlaceholder(message)) return true;
-    // A reasoning-only assistant row immediately followed by tool traces is
-    // the live equivalent of a persisted assistant tool-call message with
-    // empty content, reasoning_content, and tool_calls. Keep it so live render
-    // and history replay stay isomorphic.
-    return isToolTrace(prev[index + 1]);
-  });
-}
-
 export function stampLastAssistantCompletion(
   prev: UIMessage[],
   completion: Pick<UIMessage, "latencyMs" | "completedAt" | "usage" | "contextWindowTokens">,
