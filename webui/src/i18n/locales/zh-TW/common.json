@@ -423,7 +423,7 @@
       "presetName": "預設名稱",
       "presetNameHelp": "用於介面和 /model 命令；名稱不得重複。",
       "presetNameDuplicate": "已有同名預設。",
-      "presetNamePlaceholder": "快速寫作",
+      "presetNamePlaceholder": "例如：快速寫作",
       "advancedOptions": "進階選項",
       "advancedSummary": "上下文 {{context}} · 最大輸出 {{max}} tokens",
       "maxTokens": "最大輸出 tokens",
@@ -1069,6 +1069,13 @@
     "error": "連線錯誤"
   },
   "thread": {
+    "compaction": {
+      "cancelled": "上下文壓縮已取消",
+      "empty": "無需壓縮上下文",
+      "started": "正在壓縮上下文…",
+      "failed": "上下文壓縮失敗",
+      "succeeded": "上下文已壓縮"
+    },
     "loadingConversation": "正在載入話題…",
     "empty": {
       "greetings": {
@@ -1181,11 +1188,20 @@
       "removeQuotedContext": "移除引用內容",
       "modelNotConfigured": "尚未設定模型",
       "configureModel": "設定模型",
+      "chooseAI": "選擇你的 AI",
       "switchModel": "切換此對話使用的模型",
       "manageModels": "管理模型預設",
       "context": {
-        "tooltip": "上下文 · {{tokens}}{{capacity}}",
-        "meterDescription": "{{context}}。已使用 {{percent}}%。"
+        "tooltip": "上下文 {{percent}}%",
+        "detailsLabel": "開啟上下文用量",
+        "panelTitle": "上下文用量",
+        "contextTitle": "上下文",
+        "recentRounds": "最近輪次",
+        "inputTrend": "輸入 Token",
+        "input": "輸入 Token",
+        "cacheHitRate": "KV Cache 命中率",
+        "output": "輸出 Token",
+        "duration": "生成耗時"
       },
       "queued": {
         "label": "佇列中的引導訊息",
@@ -1243,6 +1259,10 @@
           "new": {
             "title": "新增話題",
             "description": "重置目前話題，並開始新的話題。"
+          },
+          "compact": {
+            "title": "壓縮上下文",
+            "description": "壓縮目前對話的上下文並繼續對話。"
           },
           "stop": {
             "title": "停止目前任務",

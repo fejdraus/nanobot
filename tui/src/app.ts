@@ -442,7 +442,6 @@ export class NanobotTui {
   private readonly client: ChatClient
   private readonly shell: BoxRenderable
   private readonly title: BoxRenderable
-  private readonly titleText: TextRenderable
   private readonly composerFrame: BoxRenderable
   private readonly composer: TextareaRenderable
   private composerSyntax: SyntaxStyle
@@ -649,28 +648,6 @@ export class NanobotTui {
       alignItems: "center",
       backgroundColor: RGBA.defaultBackground(),
     })
-    this.titleText = new TextRenderable(renderer, {
-      id: "nanobot-tui-title-text",
-      content: "nanobot",
-      height: 1,
-      flexShrink: 0,
-      truncate: true,
-      fg: this.palette.muted,
-      selectable: false,
-      onMouseOver: () => { this.titleText.fg = this.palette.accent },
-      onMouseOut: () => this.renderTitleColor(),
-      onMouseDown: (event) => {
-        if (event.button !== 0) return
-        event.preventDefault()
-        event.stopPropagation()
-        this.renderer.clearSelection()
-        if (this.sessionLoading || this.sessionMenu.visible) {
-          this.closeSessions()
-          return
-        }
-        void this.openSessions()
-      },
-    })
     this.runtimeControls = new RuntimeControls(
       renderer,
       runtimeControlsTheme(this.palette),
@@ -703,7 +680,6 @@ export class NanobotTui {
         },
       },
     )
-    this.title.add(this.titleText)
     this.title.add(this.runtimeControls.modelText)
     this.title.add(this.runtimeControls.accessText)
     this.title.add(this.runtimeControls.contextText)
@@ -757,7 +733,10 @@ export class NanobotTui {
       // IMEs may commit their final composed glyph after Enter. Matching the
       // OpenCode/OpenTUI integration, defer twice before reading plainText.
       onSubmit: () => this.deferSubmit(),
-      onPaste: (event) => this.handlePaste(event),
+      onPaste: (event) => {
+        this.flushSubmit()
+        if (!this.composer.isDestroyed) this.handlePaste(event)
+      },
     })
     this.status = new TextRenderable(renderer, {
       id: "nanobot-tui-status",
@@ -879,12 +858,15 @@ export class NanobotTui {
     if (this.submitPending) return
     this.submitPending = true
     const generation = ++this.submitGeneration
-    setTimeout(() => setTimeout(() => {
-      if (generation !== this.submitGeneration) return
-      this.submitPending = false
-      if (this.composer.isDestroyed) return
-      this.submit()
-    }, 0), 0)
+    setTimeout(() => setTimeout(() => this.flushSubmit(generation), 0), 0)
+  }
+
+  private flushSubmit(generation = this.submitGeneration): void {
+    if (!this.submitPending || generation !== this.submitGeneration) return
+    this.submitPending = false
+    this.submitGeneration += 1
+    if (this.composer.isDestroyed) return
+    this.submit()
   }
 
   private submit(): void {
@@ -1081,6 +1063,9 @@ export class NanobotTui {
     }
 
     switch (event.event) {
+      case "context_compaction":
+        this.transcript.compaction({ id: event.compaction_id, phase: event.phase })
+        return
       case "message_accepted":
         this.reconcileTurnOwnership(event)
         return
@@ -1599,6 +1584,15 @@ export class NanobotTui {
   }
 
   private handleKey = (key: KeyEvent): void => {
+    // The app receives keypresses before the focused Textarea. Seal the pending
+    // submission first so this key is inserted into the next draft.
+    if (this.submitPending) {
+      this.flushSubmit()
+      if (this.quitting || this.composer.isDestroyed) {
+        key.preventDefault()
+        return
+      }
+    }
     if (this.diffViewer.visible) {
       if (key.ctrl && key.name === "c") {
         const selected = this.renderer.getSelection()?.getSelectedText()
@@ -1747,16 +1741,30 @@ export class NanobotTui {
       key.preventDefault()
       return
     }
-    if (!key.ctrl && !key.meta && !key.shift && (key.name === "left" || key.name === "right")) {
+    if (!key.ctrl && !key.meta && (key.name === "left" || key.name === "right")) {
       const direction = key.name === "left" ? -1 : 1
+      const cursor = this.composerStringCursor()
       const target = this.draft.moveImageCursor(
         this.composer.plainText,
-        this.composerStringCursor(),
+        cursor,
         direction,
       )
       if (target !== null) {
         this.composerCursor = target
-        this.setComposerStringCursor(this.composer.plainText, target)
+        if (key.shift) {
+          const cursorOffset = this.composerOffsetForStringIndex(this.composer.plainText, cursor)
+          const targetOffset = this.composerOffsetForStringIndex(this.composer.plainText, target)
+          this.composer.setSelection(
+            Math.min(cursorOffset, targetOffset),
+            Math.max(cursorOffset, targetOffset),
+          )
+          // OpenTUI 0.5.10 clears the selection through the public cursor
+          // setter. Move the native edit cursor directly so the placeholder
+          // remains one selected, replaceable unit.
+          this.composer.editBuffer.setCursorByOffset(targetOffset)
+        } else {
+          this.setComposerStringCursor(this.composer.plainText, target)
+        }
         key.preventDefault()
         return
       }
@@ -1877,7 +1885,6 @@ export class NanobotTui {
     this.composer.syntaxStyle = this.composerSyntax
     this.syncComposerImageHighlights(this.composer.plainText)
     void this.renderer.idle().catch(() => {}).finally(() => previousComposerSyntax.destroy())
-    this.renderTitleColor()
     this.status.fg = this.palette.muted
     this.meta.fg = this.palette.faint
     this.updateMeta()
@@ -1957,22 +1964,13 @@ export class NanobotTui {
   }
 
   private updateTitle(): void {
-    const identity = this.sessionTitle.trim() || "nanobot"
-    this.titleText.maxWidth = Math.max(8, Math.floor(this.renderer.width * 0.38))
-    this.titleText.content = identity
     const context = this.contextTokens === null
       ? ""
-      : `  ·  ~${formatTokenCount(this.contextTokens)}${this.contextWindowTokens
+      : `     ~${formatTokenCount(this.contextTokens)}${this.contextWindowTokens
         ? `/${formatTokenCount(this.contextWindowTokens)}`
         : ""} ctx`
     this.runtimeControls.updateModel(this.modelName, this.modelPreset)
     this.runtimeControls.updateContext(context)
-  }
-
-  private renderTitleColor(): void {
-    this.titleText.fg = this.sessionLoading || this.sessionMenu.visible
-      ? this.palette.accent
-      : this.palette.muted
   }
 
   private resizeComposer(): void {
@@ -2385,7 +2383,6 @@ export class NanobotTui {
     this.contextPanel.hide()
     this.clearComposer()
     this.sessionLoading = true
-    this.renderTitleColor()
     const loadId = ++this.sessionLoadId
     this.status.content = "Loading sessions…"
     try {
@@ -2412,7 +2409,6 @@ export class NanobotTui {
         this.defaultModelPreset,
       )
       this.startSessionRefresh()
-      this.renderTitleColor()
       this.sessionMenu.update(this.composer.plainText, limit)
       this.syncComposerPlaceholder()
       this.updateMeta()
@@ -2420,7 +2416,6 @@ export class NanobotTui {
     } catch (error) {
       if (loadId !== this.sessionLoadId) return
       this.sessionLoading = false
-      this.renderTitleColor()
       this.status.content = error instanceof Error ? error.message : String(error)
     }
   }
@@ -2579,7 +2574,6 @@ export class NanobotTui {
     this.sessionLoadId += 1
     this.sessionLoading = false
     this.hideSessionMenu()
-    this.renderTitleColor()
     this.clearComposer()
     this.syncComposerPlaceholder()
     this.composer.focus()

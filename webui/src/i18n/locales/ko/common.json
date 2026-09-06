@@ -423,7 +423,7 @@
       "presetName": "프리셋 이름",
       "presetNameHelp": "화면과 /model 명령에서 사용됩니다. 이름은 고유해야 합니다.",
       "presetNameDuplicate": "같은 이름의 프리셋이 이미 있습니다.",
-      "presetNamePlaceholder": "빠른 작성",
+      "presetNamePlaceholder": "예: 빠른 작성",
       "advancedOptions": "고급 옵션",
       "advancedSummary": "컨텍스트 {{context}} · 최대 {{max}} 토큰",
       "maxTokens": "최대 출력 토큰",
@@ -1069,6 +1069,13 @@
     "error": "연결 오류"
   },
   "thread": {
+    "compaction": {
+      "cancelled": "컨텍스트 압축이 취소되었습니다",
+      "empty": "압축할 컨텍스트가 없습니다.",
+      "started": "컨텍스트 압축 중…",
+      "failed": "컨텍스트 압축 실패",
+      "succeeded": "컨텍스트를 압축했습니다"
+    },
     "loadingConversation": "대화 불러오는 중…",
     "empty": {
       "greetings": {
@@ -1181,11 +1188,20 @@
       "removeQuotedContext": "인용한 문맥 제거",
       "modelNotConfigured": "모델이 설정되지 않음",
       "configureModel": "모델 설정",
+      "chooseAI": "AI 선택",
       "switchModel": "이 대화에서 사용할 모델 전환",
       "manageModels": "모델 관리",
       "context": {
-        "tooltip": "컨텍스트 · {{tokens}}{{capacity}}",
-        "meterDescription": "{{context}}. {{percent}}% 사용 중."
+        "tooltip": "컨텍스트 {{percent}}%",
+        "detailsLabel": "컨텍스트 사용량 열기",
+        "panelTitle": "컨텍스트 사용량",
+        "contextTitle": "컨텍스트",
+        "recentRounds": "최근 라운드",
+        "inputTrend": "입력 토큰",
+        "input": "입력 토큰",
+        "cacheHitRate": "KV 캐시 적중률",
+        "output": "출력 토큰",
+        "duration": "생성 시간"
       },
       "queued": {
         "label": "대기 중인 안내",
@@ -1243,6 +1259,10 @@
           "new": {
             "title": "새 채팅",
             "description": "이 채팅을 초기화하고 새 대화를 시작합니다."
+          },
+          "compact": {
+            "title": "컨텍스트 압축",
+            "description": "이 채팅의 컨텍스트를 압축하고 대화를 계속합니다."
           },
           "stop": {
             "title": "현재 작업 중지",

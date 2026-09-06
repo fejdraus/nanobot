@@ -1,3 +1,4 @@
+import { acceptsCompactionPhase } from "../../../packages/client-events/notifications";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -643,6 +644,28 @@ export function useNanobotStream(
     return () => document.removeEventListener("visibilitychange", flushOnReturn);
   }, [flushPendingStreamEvents]);
 
+  useEffect(() => {
+    if (!chatId) return;
+    return client.onRunStatus((runChatId, startedAt) => {
+      if (runChatId !== chatId) return;
+      if (startedAt !== null) {
+        setRunStartedAt(startedAt);
+        setIsStreaming(true);
+        return;
+      }
+      flushPendingStreamEvents();
+      buffer.current = null;
+      activeAssistantRef.current = null;
+      closedAssistantStreamIdsRef.current.clear();
+      clearActivitySegment();
+      setMessages((prev) => prev.map((message) => (
+        message.isStreaming ? { ...message, isStreaming: false } : message
+      )));
+      setRunStartedAt(null);
+      setIsStreaming(false);
+    });
+  }, [chatId, client, clearActivitySegment, flushPendingStreamEvents]);
+
   // Reset local state when switching chats. Do not reset on every
   // ``initialMessages`` update: a brand-new chat can receive an empty/404
   // history response after the optimistic first message has already rendered.
@@ -749,6 +772,36 @@ export function useNanobotStream(
         return;
       }
       const sideChannelEvent = isSideChannelEvent(ev);
+      if (ev.event === "context_compaction") {
+        flushPendingStreamEvents({ closeAnswerSegment: true });
+        clearActivitySegment();
+        const compaction = {
+          id: ev.compaction_id,
+          phase: ev.phase,
+          announce: true,
+        };
+        setMessages((prev) => {
+          const id = `compaction-${ev.compaction_id}`;
+          const existing = prev.findIndex((message) => message.id === id);
+          if (!acceptsCompactionPhase(prev[existing]?.compaction?.phase, ev.phase)) return prev;
+          const next = {
+            id,
+            role: "assistant" as const,
+            content: "",
+            kind: "compaction" as const,
+            createdAt: Date.now(),
+            compaction,
+            ...turnFieldsFromEvent(ev, "activity"),
+          };
+          if (existing < 0) return [...prev, next];
+          return prev.map((message, index) => (
+            index === existing
+              ? { ...next, createdAt: message.createdAt }
+              : message
+          ));
+        });
+        return;
+      }
       if (ev.event === "delta") {
         if (suppressStreamUntilTurnEndRef.current) return;
         const chunk = typeof ev.text === "string" ? ev.text : "";
@@ -832,6 +885,7 @@ export function useNanobotStream(
       }
 
       if (ev.event === "turn_end") {
+        if (typeof ev.turn_id === "string") sideChannelTurnIdsRef.current.delete(ev.turn_id);
         if ("goal_state" in ev && ev.goal_state != null && typeof ev.goal_state === "object") {
           setGoalState(ev.goal_state);
         }
@@ -851,6 +905,7 @@ export function useNanobotStream(
             {
               ...(latencyMs !== undefined ? { latencyMs } : {}),
               ...(ev.usage ? { usage: ev.usage } : {}),
+              ...(ev.round_usages?.length ? { roundUsages: ev.round_usages } : {}),
               ...(typeof ev.context_window_tokens === "number"
                 ? { contextWindowTokens: ev.context_window_tokens }
                 : {}),

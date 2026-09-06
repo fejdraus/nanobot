@@ -21,6 +21,7 @@ function makeClient() {
     (modelName: string | null, modelPreset?: string | null) => void
   >();
   const sessionUpdateHandlers = new Set<(chatId: string, scope?: string) => void>();
+  const runStatusHandlers = new Set<(chatId: string, startedAt: number | null) => void>();
   const runStartedAtByChatId = new Map<string, number>();
   const runGenerationByChatId = new Map<string, number>();
   const latestRunTurnIdByChatId = new Map<string, string>();
@@ -98,6 +99,13 @@ function makeClient() {
         statusHandlers.delete(handler);
       };
     },
+    onRunStatus: (handler: (chatId: string, startedAt: number | null) => void) => {
+      runStatusHandlers.add(handler);
+      for (const [chatId, startedAt] of runStartedAtByChatId) handler(chatId, startedAt);
+      return () => {
+        runStatusHandlers.delete(handler);
+      };
+    },
     onRuntimeModelUpdate: (
       handler: (modelName: string | null, modelPreset?: string | null) => void,
     ) => {
@@ -157,11 +165,13 @@ function makeClient() {
       ) {
         advanceRunGeneration(chatId, ev.turn_id);
         runStartedAtByChatId.set(chatId, ev.started_at);
+        for (const h of runStatusHandlers) h(chatId, ev.started_at);
       } else if (
         (ev.event === "goal_status" && ev.status === "idle")
         || ev.event === "turn_end"
       ) {
         runStartedAtByChatId.delete(chatId);
+        for (const h of runStatusHandlers) h(chatId, null);
       }
       if (ev.event === "goal_state") {
         goalStateByChatId.set(chatId, ev.goal_state);
@@ -368,7 +378,6 @@ function modelSettings(model: string, provider: string): SettingsPayload {
       heartbeat: {
         enabled: true,
         interval_s: 1800,
-        keep_recent_messages: 8,
       },
       dream: {
         schedule: "every 2h",
@@ -415,6 +424,78 @@ describe("ThreadShell", () => {
         json: async () => ({}),
       }),
     );
+  });
+
+  it("renders each logical round in a completed turn as its own usage bar", async () => {
+    const client = makeClient();
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("websocket%3Ausage-chart/webui-thread")) {
+        return Promise.resolve(httpJson({
+          schemaVersion: 3,
+          messages: [
+            {
+              id: "assistant-1",
+              role: "assistant",
+              content: "First response",
+              turnId: "turn-1",
+              createdAt: 1_000,
+              usage: {
+                prompt_tokens: 18_000,
+                completion_tokens: 280,
+                cached_tokens: 12_000,
+                request_count: 2,
+              },
+              roundUsages: [
+                { prompt_tokens: 8_000, completion_tokens: 120, cached_tokens: 2_000 },
+                { prompt_tokens: 10_000, completion_tokens: 160, cached_tokens: 10_000 },
+              ],
+            },
+            {
+              id: "assistant-2",
+              role: "assistant",
+              content: "Second response",
+              turnId: "turn-2",
+              createdAt: 2_000,
+              contextWindowTokens: 65_536,
+              usage: {
+                prompt_tokens: 29_400,
+                completion_tokens: 416,
+                cached_tokens: 26_180,
+                context_tokens: 14_700,
+                request_count: 2,
+              },
+              roundUsages: [
+                { prompt_tokens: 13_000, completion_tokens: 180, cached_tokens: 10_000 },
+                { prompt_tokens: 16_400, completion_tokens: 236, cached_tokens: 16_180 },
+              ],
+            },
+          ] satisfies UIMessage[],
+        }));
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      });
+    }));
+
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("usage-chart")}
+        title="Usage chart"
+        onToggleSidebar={() => {}}
+        settingsSnapshot={modelSettings("openai-codex/gpt-5.5", "openai_codex")}
+      />,
+      "openai-codex/gpt-5.5",
+    ));
+
+    const trigger = await screen.findByTestId("composer-context-usage");
+    fireEvent.click(trigger);
+    expect(await screen.findAllByTestId("round-usage-bar")).toHaveLength(4);
+    expect(screen.getByRole("img", {
+      name: /input tokens 16,400.*KV cache hit rate 99%.*output tokens 236/i,
+    })).toBeInTheDocument();
   });
 
   it("moves the session handle into the pane only when the workbench is split", () => {
@@ -681,7 +762,7 @@ describe("ThreadShell", () => {
     );
 
     expect(await screen.findByTitle("fast · gpt-5.5 · OpenAI Codex")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Model not configured" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Choose your AI" })).not.toBeInTheDocument();
   });
 
   it("switches through every named preset while preserving call-order priority", async () => {
@@ -763,7 +844,7 @@ describe("ThreadShell", () => {
     );
 
     expect(await screen.findByTitle("fast · gpt-4 · Company Proxy")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Model not configured" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Choose your AI" })).not.toBeInTheDocument();
   });
 
   it("shows the effective fallback model in the composer badge", async () => {
@@ -835,7 +916,7 @@ describe("ThreadShell", () => {
     expect(screen.getByText("Default")).toBeInTheDocument();
   });
 
-  it("opens model settings from the unconfigured model badge", async () => {
+  it("opens model settings directly without clearing the draft", async () => {
     const client = makeClient();
     const settings = modelSettings("openai-codex/gpt-5.1-codex", "openai_codex");
     settings.agent.has_api_key = false;
@@ -843,6 +924,20 @@ describe("ThreadShell", () => {
       provider.name === "openai_codex"
         ? { ...provider, auth_type: "oauth", configured: false }
         : provider,
+    );
+    settings.providers.push(
+      {
+        name: "xai_grok",
+        label: "xAI Grok",
+        auth_type: "oauth",
+        configured: true,
+      },
+      {
+        name: "ollama",
+        label: "Ollama",
+        configured: true,
+        api_base: "http://127.0.0.1:11434",
+      },
     );
     const onOpenModelSettings = vi.fn();
 
@@ -860,18 +955,39 @@ describe("ThreadShell", () => {
       ),
     );
 
-    const badge = await screen.findByRole("button", { name: "Model not configured" });
-    expect(screen.getByTestId("composer-model-setup-icon")).toBeInTheDocument();
+    const badge = await screen.findByRole("button", { name: "Choose your AI" });
+    expect(screen.queryByTestId("composer-model-setup-icon")).not.toBeInTheDocument();
+    expect(badge.querySelector('[data-needs-setup="true"]')).toHaveClass(
+      "composer-model-pill-setup",
+    );
+    expect(screen.getByTestId("composer-model-setup-label")).toHaveTextContent("Choose your AI");
+    expect(badge).not.toHaveClass("border-amber-500/35");
     expect(screen.queryByTestId("composer-model-logo-openai_codex")).not.toBeInTheDocument();
-    fireEvent.click(badge);
-    expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Message input" }), {
+    const input = screen.getByRole("textbox", { name: "Message input" });
+    fireEvent.change(input, {
       target: { value: "hello" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Configure model" }));
-    expect(onOpenModelSettings).toHaveBeenCalledTimes(2);
+    fireEvent.click(badge);
+
+    expect(screen.queryByRole("dialog", { name: "Choose your AI" })).not.toBeInTheDocument();
+    expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
+    expect(input).toHaveValue("hello");
     expect(client.sendMessage).not.toHaveBeenCalled();
+
+    onOpenModelSettings.mockClear();
+    const firstSetupPill = badge.querySelector('[data-needs-setup="true"]');
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    const secondSetupPill = badge.querySelector('[data-needs-setup="true"]');
+    expect(onOpenModelSettings).not.toHaveBeenCalled();
+    expect(secondSetupPill).not.toBe(firstSetupPill);
+    expect(secondSetupPill).toHaveClass("composer-model-pill-setup-attention");
+    expect(input).toHaveValue("hello");
+    expect(client.sendMessage).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    expect(badge.querySelector('[data-needs-setup="true"]')).not.toBe(secondSetupPill);
   });
 
   it("keeps image generation controls out of the composer", async () => {
@@ -1118,7 +1234,7 @@ describe("ThreadShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
-    expect(onCreateChat).toHaveBeenCalledWith(null, "start for real");
+    expect(onCreateChat).toHaveBeenCalledWith(null, "start for real", null);
     expect(onNewChat).not.toHaveBeenCalled();
   });
 
@@ -1159,8 +1275,13 @@ describe("ThreadShell", () => {
       "chat-new",
       "/model fast",
     ));
+    expect(onCreateChat).toHaveBeenCalledWith(null, "use the selected model", "fast");
 
-    rerender(view(session("chat-new")));
+    await act(async () => {
+      rerender(view(session("chat-new", "fast")));
+    });
+    expect(screen.getByTitle("fast · gpt-5.5 · OpenAI Codex")).toBeInTheDocument();
+    expect(screen.queryByText("Default")).not.toBeInTheDocument();
     expect(client.sendMessage).not.toHaveBeenCalled();
 
     await act(async () => {

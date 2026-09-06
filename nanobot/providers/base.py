@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import json_repair
 from loguru import logger
 
+from nanobot.events import NO_EVENTS, EventSink, RetryWaitEvent
 from nanobot.utils.helpers import sanitize_surrogates_deep
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ RETRY_AFTER_BUFFER = 1
 
 RetryEventCallback = Callable[[str], Awaitable[None]]
 LLMCallObserver = Callable[["LLMCallRecord"], None]
+ProviderCompactionScope = Literal["prior_context", "current_request"]
 
 
 def resolve_stream_idle_timeout_s(
@@ -259,6 +261,7 @@ class ProviderCallContext:
     conversation_state: ProviderConversationState | None = field(default=None, repr=False)
     context_window_tokens: int | None = None
     session_id: str | None = field(default=None, repr=False)
+    events: EventSink = field(default=NO_EVENTS, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +566,22 @@ class LLMResponse:
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
     thinking_blocks: list[dict[str, Any]] | None = None  # Anthropic extended thinking
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
+    # True only when this response installed a new provider-native compaction
+    # boundary. Replaying an older compaction item does not set this flag.
+    provider_compaction_applied: bool = field(default=False, repr=False)
+    # State immediately after native compaction, before the normal response
+    # continues. An archive prompt can resume this state without replaying H.
+    provider_compaction_state: ProviderConversationState | None = field(
+        default=None,
+        repr=False,
+    )
+    # Which model input the native compaction state replaces. Providers that
+    # compact before attaching the current request delta report
+    # ``prior_context``; in-request compaction reports ``current_request``.
+    provider_compaction_scope: ProviderCompactionScope | None = field(
+        default=None,
+        repr=False,
+    )
     # Routing wrappers may preserve or discard an incoming provider-owned
     # continuation independently of the final fallback error's retry policy.
     preserve_provider_state_on_error: bool | None = field(default=None, repr=False)
@@ -926,6 +945,63 @@ class LLMProvider(ABC):
         """
         pass
 
+    @staticmethod
+    def _error_response_from_exception(exc: Exception) -> LLMResponse:
+        """Convert an unexpected exception while retaining retry metadata."""
+        error_names = tuple(cls.__name__.lower() for cls in type(exc).__mro__)
+        error_kind: str | None = None
+        error_should_retry: bool | None = None
+        if any("timeout" in name for name in error_names):
+            error_kind = "timeout"
+            error_should_retry = True
+        elif any(
+            token in name
+            for name in error_names
+            for token in ("connect", "connection", "network", "protocol", "transport")
+        ):
+            error_kind = "connection"
+            error_should_retry = True
+        elif any(
+            "ratelimit" in name or "throttl" in name
+            for name in error_names
+        ):
+            error_kind = "rate_limit"
+            error_should_retry = True
+        elif any(
+            "server" in name or "internal" in name
+            for name in error_names
+        ):
+            error_kind = "server_error"
+            error_should_retry = True
+        elif any(
+            token in name
+            for name in error_names
+            for token in ("auth", "credential", "permissiondenied", "unauthor")
+        ):
+            error_kind = "authentication"
+
+        response = getattr(exc, "response", None)
+        raw_status = getattr(exc, "status_code", None)
+        if raw_status is None and response is not None:
+            raw_status = getattr(response, "status_code", None)
+        try:
+            error_status_code = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError):
+            error_status_code = None
+
+        raw_error_type = getattr(exc, "error_type", None)
+        raw_error_code = getattr(exc, "error_code", None)
+        detail = str(exc).strip() or type(exc).__name__
+        return LLMResponse(
+            content=f"Error calling LLM: {detail}",
+            finish_reason="error",
+            error_status_code=error_status_code,
+            error_kind=error_kind,
+            error_type=str(raw_error_type) if raw_error_type is not None else None,
+            error_code=str(raw_error_code) if raw_error_code is not None else None,
+            error_should_retry=error_should_retry,
+        )
+
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
@@ -1030,6 +1106,20 @@ class LLMProvider(ABC):
         return True
 
     @staticmethod
+    def _content_as_blocks(content: Any) -> list[dict[str, Any]]:
+        """Convert message content to blocks so mixed user content can be merged."""
+        if isinstance(content, list):
+            return [
+                dict(cast(dict[str, Any], item))
+                if isinstance(item, dict)
+                else {"type": "text", "text": str(item)}
+                for item in cast(list[object], content)
+            ]
+        if content is None:
+            return []
+        return [{"type": "text", "text": str(content)}]
+
+    @staticmethod
     def _enforce_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Merge consecutive same-role messages and drop trailing assistant messages.
 
@@ -1063,6 +1153,13 @@ class LLMProvider(ABC):
                 curr_content = msg.get("content") or ""
                 if isinstance(prev_content, str) and isinstance(curr_content, str):
                     prev["content"] = (prev_content + "\n\n" + curr_content).strip()
+                elif role == "user":
+                    combined = dict(msg)
+                    combined["content"] = [
+                        *LLMProvider._content_as_blocks(prev_content),
+                        *LLMProvider._content_as_blocks(curr_content),
+                    ]
+                    merged[-1] = combined
                 else:
                     merged[-1] = dict(msg)
             else:
@@ -1188,7 +1285,7 @@ class LLMProvider(ABC):
             )
             raise
         except Exception as exc:
-            response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            response = self._error_response_from_exception(exc)
         return self._observe_llm_call(
             response,
             kwargs,
@@ -1330,7 +1427,7 @@ class LLMProvider(ABC):
             )
             raise
         except Exception as exc:
-            response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            response = self._error_response_from_exception(exc)
         return self._observe_llm_call(
             _attach_stream_timing(response),
             kwargs,
@@ -1392,13 +1489,16 @@ class LLMProvider(ABC):
             kw["provider_context"] = provider_context
         if on_stream_recover and getattr(self, "supports_stream_recover_callback", False):
             kw["on_stream_recover"] = _recover_stream
+        on_retry_wait, on_retry_exhausted = self._retry_notifications(
+            provider_context, on_retry_wait, on_retry_exhausted,
+        )
         return await self._run_chat_with_retry(
             kw,
             messages,
             stream=True,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
-            on_retry_exhausted=on_retry_exhausted or on_retry_wait,
+            on_retry_exhausted=on_retry_exhausted,
             should_retry_guard=lambda: not has_streamed_content,
             on_stream_recover=_recover_stream if on_stream_recover else None,
         )
@@ -1440,14 +1540,35 @@ class LLMProvider(ABC):
         )
         if provider_context is not None:
             kw["provider_context"] = provider_context
+        on_retry_wait, on_retry_exhausted = self._retry_notifications(
+            provider_context, on_retry_wait, on_retry_exhausted,
+        )
         return await self._run_chat_with_retry(
             kw,
             messages,
             stream=False,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
-            on_retry_exhausted=on_retry_exhausted or on_retry_wait,
+            on_retry_exhausted=on_retry_exhausted,
         )
+
+    @staticmethod
+    def _retry_notifications(
+        context: ProviderCallContext | None,
+        on_wait: RetryEventCallback | None,
+        on_exhausted: RetryEventCallback | None,
+    ) -> tuple[RetryEventCallback | None, RetryEventCallback | None]:
+        """Adapt once at the retry-chain boundary, before candidate callbacks.
+
+        Explicit callbacks retain precedence. In particular a fallback candidate
+        exhaustion callback captures its result; it must not also notify the UI.
+        """
+        if on_wait is None and context is not None and context.events.publish is not None:
+            async def publish(content: str) -> None:
+                await context.events.emit(RetryWaitEvent(content))
+
+            on_wait = publish
+        return on_wait, on_exhausted or on_wait
 
     async def _run_chat_with_retry(
         self,
@@ -1642,6 +1763,7 @@ class LLMProvider(ABC):
                                 provider_context.context_window_tokens
                             ),
                             session_id=provider_context.session_id,
+                            events=provider_context.events,
                         )
                 if stripped is not None or stripped_context is not None:
                     logger.warning(

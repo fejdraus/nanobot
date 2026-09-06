@@ -423,7 +423,7 @@
       "presetName": "Tên cấu hình đặt trước",
       "presetNameHelp": "Dùng trong giao diện và lệnh /model. Tên phải là duy nhất.",
       "presetNameDuplicate": "Đã có một cấu hình sẵn với tên này.",
-      "presetNamePlaceholder": "Viết nhanh",
+      "presetNamePlaceholder": "ví dụ: Viết nhanh",
       "advancedOptions": "Tùy chọn nâng cao",
       "advancedSummary": "Ngữ cảnh {{context}} · Tối đa {{max}} token",
       "maxTokens": "Token đầu ra tối đa",
@@ -1069,6 +1069,13 @@
     "error": "Lỗi kết nối"
   },
   "thread": {
+    "compaction": {
+      "cancelled": "Đã hủy nén ngữ cảnh",
+      "empty": "Không có ngữ cảnh cần nén.",
+      "started": "Đang nén ngữ cảnh…",
+      "failed": "Nén ngữ cảnh không thành công",
+      "succeeded": "Đã nén ngữ cảnh"
+    },
     "loadingConversation": "Đang tải cuộc trò chuyện…",
     "empty": {
       "greetings": {
@@ -1181,11 +1188,20 @@
       "removeQuotedContext": "Xóa ngữ cảnh được trích dẫn",
       "modelNotConfigured": "Chưa cấu hình mô hình",
       "configureModel": "Cấu hình mô hình",
+      "chooseAI": "Chọn AI của bạn",
       "switchModel": "Chuyển mô hình cho cuộc trò chuyện này",
       "manageModels": "Quản lý mô hình",
       "context": {
-        "tooltip": "Ngữ cảnh · {{tokens}}{{capacity}}",
-        "meterDescription": "{{context}}. Đã dùng {{percent}}%."
+        "tooltip": "Ngữ cảnh {{percent}}%",
+        "detailsLabel": "Mở mức sử dụng ngữ cảnh",
+        "panelTitle": "Mức sử dụng ngữ cảnh",
+        "contextTitle": "Ngữ cảnh",
+        "recentRounds": "Các lượt gần đây",
+        "inputTrend": "Token đầu vào",
+        "input": "Token đầu vào",
+        "cacheHitRate": "Tỷ lệ hit KV cache",
+        "output": "Token đầu ra",
+        "duration": "Thời gian tạo"
       },
       "queued": {
         "label": "Hướng dẫn đang chờ",
@@ -1243,6 +1259,10 @@
           "new": {
             "title": "Cuộc trò chuyện mới",
             "description": "Đặt lại cuộc trò chuyện này và bắt đầu một cuộc trò chuyện mới."
+          },
+          "compact": {
+            "title": "Nén ngữ cảnh",
+            "description": "Nén ngữ cảnh của cuộc trò chuyện này và tiếp tục hội thoại."
           },
           "stop": {
             "title": "Dừng tác vụ hiện tại",

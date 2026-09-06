@@ -6,11 +6,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.context import TranscriptInput
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.utils.progress_events import output_events
 
 
 def _make_loop(tmp_path: Path) -> AgentLoop:
@@ -178,7 +180,9 @@ class TestMessageToolSuppressLogic:
             progress.append((content, tool_hint))
 
         result = await loop._run_agent_loop(
-            [], runtime=loop.llm_runtime(), on_progress=on_progress
+            TranscriptInput(history=[], current_message=None),
+            runtime=loop.llm_runtime(),
+            events=output_events(on_progress=on_progress),
         )
 
         assert result.final_content == "Done"

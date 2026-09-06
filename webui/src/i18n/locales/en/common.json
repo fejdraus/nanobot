@@ -145,7 +145,7 @@
       "presetName": "Preset name",
       "presetNameHelp": "Used in the interface and /model commands. Names must be unique.",
       "presetNameDuplicate": "A preset with this name already exists.",
-      "presetNamePlaceholder": "Fast writing",
+      "presetNamePlaceholder": "e.g. Fast writing",
       "advancedOptions": "Advanced options",
       "advancedSummary": "Context {{context}} · Max {{max}} tokens",
       "maxTokens": "Max output tokens",
@@ -1083,6 +1083,13 @@
     "error": "Connection error"
   },
   "thread": {
+    "compaction": {
+      "cancelled": "Context compaction cancelled",
+      "empty": "Nothing to compact.",
+      "started": "Compressing context…",
+      "failed": "Context compaction failed",
+      "succeeded": "Context compacted"
+    },
     "loadingConversation": "Loading conversation…",
     "empty": {
       "greetings": {
@@ -1195,11 +1202,20 @@
       "removeQuotedContext": "Remove quoted context",
       "modelNotConfigured": "Model not configured",
       "configureModel": "Configure model",
+      "chooseAI": "Choose your AI",
       "switchModel": "Switch model for this chat",
       "manageModels": "Manage models",
       "context": {
-        "tooltip": "Context · {{tokens}}{{capacity}}",
-        "meterDescription": "{{context}}. {{percent}}% used."
+        "tooltip": "Context {{percent}}%",
+        "detailsLabel": "Open context usage",
+        "panelTitle": "Context usage",
+        "contextTitle": "Context",
+        "recentRounds": "Recent rounds",
+        "inputTrend": "Input tokens",
+        "input": "Input tokens",
+        "cacheHitRate": "KV cache hit rate",
+        "output": "Output tokens",
+        "duration": "Generation time"
       },
       "queued": {
         "label": "Queued guidance",
@@ -1267,6 +1283,10 @@
           "new": {
             "title": "New chat",
             "description": "Reset this chat and start a fresh conversation."
+          },
+          "compact": {
+            "title": "Compact context",
+            "description": "Compact this chat's context and continue the conversation."
           },
           "stop": {
             "title": "Stop current task",
