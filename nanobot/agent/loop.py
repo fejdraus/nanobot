@@ -103,7 +103,6 @@ from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text, video_placeholder_text
-from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
@@ -2132,16 +2131,6 @@ class AgentLoop:
                 filtered.append(
                     {"type": "text", "text": video_placeholder_text(path)}
                 )
-                continue
-
-            if block_data.get("type") == "text" and isinstance(
-                block_data.get("text"),
-                str,
-            ):
-                text = cast(str, block_data["text"])
-                if should_truncate_text and len(text) > self.max_tool_result_chars:
-                    text = truncate_text_fn(text, self.max_tool_result_chars)
-                filtered.append({**block_data, "text": text})
                 continue
 
             filtered.append(block_data)
