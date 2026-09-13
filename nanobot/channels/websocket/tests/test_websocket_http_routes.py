@@ -18,7 +18,7 @@ from nanobot.channels.base import BaseChannel
 from nanobot.channels.websocket.runtime import WebSocketChannel, WebSocketConfig
 from nanobot.config.loader import load_config, save_config
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronRunResult, CronSchedule
 from nanobot.optional_features import InstallResult
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.session.keys import UNIFIED_SESSION_KEY
@@ -1345,6 +1345,67 @@ async def test_nanobot_feature_channel_action_can_apply_without_restart(
 
 
 @pytest.mark.asyncio
+async def test_nanobot_feature_install_only_does_not_start_channel(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_calls: list[tuple[str, str, str | None]] = []
+
+    def feature_action(
+        action: str,
+        query: dict[str, list[str]],
+        *,
+        allow_install: bool,
+        config_path: Path,
+    ) -> dict[str, Any]:
+        assert action == "enable"
+        assert query == {"name": ["whatsapp"], "install_only": ["true"]}
+        assert allow_install is True
+        return {
+            "features": [{
+                "name": "whatsapp",
+                "type": "channel",
+                "enabled": False,
+                "installed": True,
+                "ready": False,
+                "status": "not_enabled",
+            }],
+            "enabled_count": 0,
+            "requires_restart": False,
+        }
+
+    async def channel_feature_action(
+        action: str,
+        name: str,
+        instance_id: str | None,
+    ) -> dict[str, Any]:
+        runtime_calls.append((action, name, instance_id))
+        return {"handled": True, "ok": True, "requires_restart": False}
+
+    monkeypatch.setattr(
+        "nanobot.webui.settings_routes.nanobot_features_action",
+        feature_action,
+    )
+    channel = _ch(
+        bus,
+        session_manager=_seed_session(tmp_path),
+        port=_free_port(),
+        channel_feature_action=channel_feature_action,
+    )
+
+    response = await _webui_mutate(
+        channel,
+        "settings.feature.enable",
+        {"name": "whatsapp", "install_only": True},
+    )
+
+    assert response.status_code == 200
+    assert runtime_calls == []
+    assert response.json()["features"][0]["enabled"] is False
+
+
+@pytest.mark.asyncio
 async def test_channel_connect_runtime_import_error_is_not_reported_as_unsupported(
     bus: MagicMock,
     tmp_path: Path,
@@ -2356,6 +2417,57 @@ async def test_session_delete_removes_unpersisted_new_chat(
 
 
 @pytest.mark.asyncio
+async def test_webui_automation_result_is_authenticated_and_returns_only_selected_response(
+    bus: MagicMock, tmp_path: Path,
+) -> None:
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+
+    async def execute(job: CronJob) -> CronRunResult:
+        cron.write_run_record("selected-run", {
+            "job_id": job.id, "session_key": job.payload.session_key,
+            "status": "ok", "response": "Selected **reply**", "rendered_prompt": "private prompt",
+        })
+        return CronRunResult(run_id="selected-run", response="Selected **reply**")
+
+    cron = CronService(tmp_path / "cron" / "jobs.json", on_job=execute)
+    job = cron.add_job(name="Reminder", schedule=CronSchedule(kind="every", every_ms=86400000),
+                       message="hi", session_key="websocket:abc", origin_channel="websocket",
+                       origin_chat_id="abc")
+    assert await cron.run_job(job.id, force=True)
+    completed = cron.get_job(job.id)
+    assert completed is not None
+    run_at = completed.state.run_history[-1].run_at_ms
+    cron.register_system_job(CronJob(id="system", name="system",
+                                    schedule=CronSchedule(kind="every", every_ms=86400000),
+                                    payload=CronPayload(kind="system_event")))
+    channel = _ch(bus, session_manager=_seed_session(tmp_path, key="websocket:abc"),
+                  cron_service=cron, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        path = f"{base_url}/api/webui/automations/result?id={job.id}&run_at_ms={run_at}"
+        assert (await _http_get(path)).status_code == 401
+        token = channel.gateway.tokens.issue_api_token(300)
+        auth = {"Authorization": f"Bearer {token}"}
+        result = await _http_get(path, headers=auth)
+        assert result.status_code == 200, result.text
+        assert result.json() == {"response": "Selected **reply**"}
+        listed = await _http_get(f"{base_url}/api/webui/automations", headers=auth)
+        assert "Selected **reply**" not in listed.text
+        for query, status in [
+            (f"id={job.id}&run_at_ms=invalid", 400),
+            (f"id={job.id}&run_at_ms=0", 404),
+            (f"id=missing&run_at_ms={run_at}", 404),
+            (f"id=system&run_at_ms={run_at}", 403),
+            (f"id={job.id}&run_at_ms={run_at}&kind=invalid", 400),
+        ]:
+            response = await _http_get(f"{base_url}/api/webui/automations/result?{query}", headers=auth)
+            assert response.status_code == status
+    finally:
+        await channel.stop()
+        await server_task
+
+
 async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
     bus: MagicMock, tmp_path: Path
 ) -> None:
@@ -3070,6 +3182,116 @@ async def test_webui_thread_negotiates_gzip_for_large_payloads(
         unauthorized = await _http_get(url, headers={"Accept-Encoding": "gzip"})
         assert unauthorized.status_code == 401
         assert "Content-Encoding" not in unauthorized.headers
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_revalidates_and_loads_large_trace_details(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.webui.transcript import append_transcript_object
+
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:revalidated-thread"
+    sm = _seed_session(tmp_path, key=key)
+    trace = f'exec({json.dumps({"command": "x" * 40_000})})'
+    for event in (
+        {"event": "user", "chat_id": "revalidated-thread", "text": "run it"},
+        {
+            "event": "message",
+            "chat_id": "revalidated-thread",
+            "kind": "progress",
+            "text": trace,
+        },
+        {"event": "message", "chat_id": "revalidated-thread", "text": "done"},
+        {"event": "turn_end", "chat_id": "revalidated-thread"},
+    ):
+        append_transcript_object(key, event)
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, workspace_path=tmp_path, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        url = (
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Arevalidated-thread/webui-thread?limit=40&direction=latest"
+        )
+        auth = {"Authorization": f"Bearer {token}"}
+        first = await _http_get(url, headers=auth)
+
+        assert first.status_code == 200
+        assert first.headers["Cache-Control"] == "no-store"
+        assert first.headers["ETag"] == f'"{first.json()["revision"]}"'
+        trace_message = next(
+            message for message in first.json()["messages"] if message.get("kind") == "trace"
+        )
+        assert trace_message["content"] == "exec(…)"
+
+        unchanged = await _http_get(
+            url,
+            headers={**auth, "If-None-Match": first.headers["ETag"]},
+        )
+        assert unchanged.status_code == 304
+        assert unchanged.content == b""
+
+        detail = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Arevalidated-thread/webui-thread/trace-detail"
+            f"?ref={trace_message['traceDetail']['ref']}",
+            headers=auth,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["content"] == trace
+
+        append_transcript_object(
+            key,
+            {"event": "user", "chat_id": "revalidated-thread", "text": "again"},
+        )
+        changed = await _http_get(
+            url,
+            headers={**auth, "If-None-Match": first.headers["ETag"]},
+        )
+        assert changed.status_code == 200
+        assert changed.headers["ETag"] != first.headers["ETag"]
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_omits_validator_when_transcript_changes_during_replay(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.webui.transcript import append_transcript_object
+
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:changing-thread"
+    sm = _seed_session(tmp_path, key=key)
+    append_transcript_object(
+        key,
+        {"event": "user", "chat_id": "changing-thread", "text": "hello"},
+    )
+    revisions = iter(("before-replay", "after-replay"))
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.webui_transcript_revision",
+        lambda *_args, **_kwargs: next(revisions),
+    )
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, workspace_path=tmp_path, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Achanging-thread/webui-thread?limit=40&direction=latest",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        assert "ETag" not in response.headers
+        assert "revision" not in response.json()
     finally:
         await channel.stop()
         await server_task

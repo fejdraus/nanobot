@@ -110,3 +110,4 @@ exp/
 bridge/node_modules/
 webui/.verify-*
 .mcp.json
+.playwright-cli/

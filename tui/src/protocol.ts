@@ -1,6 +1,6 @@
 import { decodeNotification, isCompactionPhase, isRecoveryState } from "../../packages/client-events/notifications"
 import type { ContextCompaction, NotificationEvent, RecoveryState } from "../../packages/client-events/notifications"
-export type { ContextCompaction, RecoveryState, RecoveryStatus } from "../../packages/client-events/notifications"
+export type { ContextCompaction, RecoveryState, RecoveryStatus, RetryStatus } from "../../packages/client-events/notifications"
 
 export type ConnectionStatus =
   | "starting"
@@ -136,6 +136,11 @@ export type InboundEvent =
       usage?: TokenUsage
       context_window_tokens?: number
       goal_state?: Record<string, unknown>
+      outcome?: "completed" | "failed" | "cancelled" | "interrupted"
+      failure_kind?: string
+      failure_error_kind?: string
+      failure_attempts?: number
+      failure_message?: string
     }
   | {
       event: "goal_status"
@@ -187,6 +192,8 @@ type OutboundEvent =
     }
 
 export interface ClientOptions {
+  expectedGatewayId?: string
+  reconnect?: boolean
   url?: string
   resolveConnection?: () => Promise<GatewayConnection>
   checkHealth?: () => Promise<GatewayHealthStatus>
@@ -254,6 +261,11 @@ export interface TokenUsage {
   measured_completion_tokens?: number
   ttft_ms?: number
   timed_requests?: number
+}
+
+export interface SessionUsageSnapshot {
+  context: { tokens: number; windowTokens?: number } | null
+  rounds: TokenUsage[]
 }
 
 export interface SessionContextSnapshot {
@@ -347,6 +359,7 @@ const CHAT_EVENTS = new Set([
   "stream_end",
   "reasoning_delta",
   "reasoning_end",
+  "retry_status",
   "turn_end",
   "goal_status",
   "goal_state",
@@ -526,7 +539,16 @@ function decodeInboundEvent(value: unknown): InboundEvent | null | undefined {
     && (!optional(record.latency_ms, "number")
       || !optional(record.context_window_tokens, "number")
       || (record.usage !== undefined && !isTokenUsage(record.usage))
-      || (record.goal_state !== undefined && !isRecord(record.goal_state)))
+      || (record.goal_state !== undefined && !isRecord(record.goal_state))
+      || (record.outcome !== undefined
+        && !["completed", "failed", "cancelled", "interrupted"].includes(String(record.outcome)))
+      || !optional(record.failure_kind, "string")
+      || !optional(record.failure_error_kind, "string")
+      || (record.failure_attempts !== undefined
+        && (typeof record.failure_attempts !== "number"
+          || !Number.isInteger(record.failure_attempts)
+          || record.failure_attempts < 1))
+      || !optional(record.failure_message, "string"))
   ) return null
   if (name === "goal_status" && record.status !== "running" && record.status !== "idle") return null
   if (name === "goal_state" && !isRecord(record.goal_state)) return null
@@ -552,13 +574,92 @@ async function fetchApi(
   apiToken: string,
   path: string,
   reauthenticate?: ApiReauthenticator,
+  signal?: AbortSignal,
 ): Promise<Response> {
-  const request = (connection: GatewayApiConnection) => fetch(`${connection.apiUrl}${path}`, {
-    headers: { Authorization: `Bearer ${connection.apiToken}` },
-  })
+  const request = (connection: GatewayApiConnection) => {
+    signal?.throwIfAborted()
+    return fetch(`${connection.apiUrl}${path}`, {
+      headers: { Authorization: `Bearer ${connection.apiToken}` },
+      ...(signal ? { signal } : {}),
+    })
+  }
   const response = await request({ apiUrl, apiToken })
+  signal?.throwIfAborted()
   if (response.status !== 401 || !reauthenticate) return response
   return request(await reauthenticate(apiToken))
+}
+
+interface ThreadPage {
+  messages?: Array<Record<string, unknown>>
+  page?: { has_more_before?: boolean; before_cursor?: string; user_message_offset?: number }
+}
+
+async function fetchThreadPage(
+  apiUrl: string,
+  apiToken: string,
+  chatId: string,
+  beforeCursor?: string | null,
+  reauthenticate?: ApiReauthenticator,
+  signal?: AbortSignal,
+): Promise<ThreadPage> {
+  if (!apiUrl || !apiToken) return {}
+  const key = encodeURIComponent(`websocket:${chatId}`)
+  const params = new URLSearchParams({ limit: "120", direction: "latest" })
+  if (beforeCursor) params.set("before", beforeCursor)
+  const response = await fetchApi(
+    apiUrl,
+    apiToken,
+    `/api/sessions/${key}/webui-thread?${params}`,
+    reauthenticate,
+    signal,
+  )
+  if (response.status === 404) return {}
+  if (!response.ok) throw new Error(`history request failed: HTTP ${response.status}`)
+  return await response.json() as ThreadPage
+}
+
+/** Same recent model-call samples and context boundary as the WebUI usage popover. */
+export async function fetchSessionUsage(
+  apiUrl: string,
+  apiToken: string,
+  chatId: string,
+  reauthenticate?: ApiReauthenticator,
+  signal?: AbortSignal,
+): Promise<SessionUsageSnapshot> {
+  const payload = await fetchThreadPage(apiUrl, apiToken, chatId, undefined, reauthenticate, signal)
+  signal?.throwIfAborted()
+  const snapshot: SessionUsageSnapshot = { context: null, rounds: [] }
+  const seenTurns = new Set<unknown>()
+  let contextResolved = false
+  for (const message of [...(payload.messages ?? [])].reverse()) {
+    if (message.kind === "compaction" && isRecord(message.compaction)
+      && message.compaction.phase === "succeeded") contextResolved = true
+    if (message.role !== "assistant" || message.kind === "trace" || message.isStreaming) continue
+    const usage = isTokenUsage(message.usage) ? message.usage : null
+    if (!contextResolved && typeof usage?.context_tokens === "number"
+      && Number.isFinite(usage.context_tokens) && usage.context_tokens >= 0) {
+      const window = message.contextWindowTokens
+      snapshot.context = {
+        tokens: usage.context_tokens,
+        ...(typeof window === "number" && Number.isFinite(window) && window > 0
+          ? { windowTokens: window } : {}),
+      }
+      contextResolved = true
+    }
+    const turnKey = message.turnId || message.id || message
+    if (seenTurns.has(turnKey)) continue
+    seenTurns.add(turnKey)
+    const rounds = Array.isArray(message.roundUsages) ? message.roundUsages : []
+    for (const round of [...rounds].reverse()) {
+      if (snapshot.rounds.length >= 8) break
+      if (isTokenUsage(round) && typeof round.prompt_tokens === "number"
+        && Number.isFinite(round.prompt_tokens) && round.prompt_tokens > 0) {
+        snapshot.rounds.push(round)
+      }
+    }
+  }
+  snapshot.rounds.reverse()
+  return snapshot
 }
 
 export async function fetchHistory(
@@ -568,26 +669,7 @@ export async function fetchHistory(
   beforeCursor?: string | null,
   reauthenticate?: ApiReauthenticator,
 ): Promise<HistorySnapshot> {
-  if (!apiUrl || !apiToken) {
-    return { messages: [], hasMoreBefore: false, beforeCursor: null, userMessageOffset: 0 }
-  }
-  const key = encodeURIComponent(`websocket:${chatId}`)
-  const params = new URLSearchParams({ limit: "120", direction: "latest" })
-  if (beforeCursor) params.set("before", beforeCursor)
-  const response = await fetchApi(
-    apiUrl,
-    apiToken,
-    `/api/sessions/${key}/webui-thread?${params}`,
-    reauthenticate,
-  )
-  if (response.status === 404) {
-    return { messages: [], hasMoreBefore: false, beforeCursor: null, userMessageOffset: 0 }
-  }
-  if (!response.ok) throw new Error(`history request failed: HTTP ${response.status}`)
-  const payload = (await response.json()) as {
-    messages?: Array<Record<string, unknown>>
-    page?: { has_more_before?: boolean; before_cursor?: string; user_message_offset?: number }
-  }
+  const payload = await fetchThreadPage(apiUrl, apiToken, chatId, beforeCursor, reauthenticate)
   let userIndex = typeof payload.page?.user_message_offset === "number"
     ? Math.max(0, payload.page.user_message_offset)
     : 0
@@ -1057,6 +1139,8 @@ export function sanitizeConnectionFailure(error: unknown): string {
 }
 
 export class NanobotClient {
+  private identityVerified = false
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null
   private socket: WebSocket | null = null
   private chatId = ""
   private workspaceScope?: WorkspaceScopePayload
@@ -1100,6 +1184,7 @@ export class NanobotClient {
   private async open(): Promise<void> {
     if (this.socket || this.opening || this.closedByClient) return
     this.opening = true
+    this.identityVerified = !this.options.expectedGatewayId
     this.nextRetryAt = 0
     this.connectionAttempt += 1
     this.reportConnectionProgress()
@@ -1139,6 +1224,9 @@ export class NanobotClient {
     }
     let opened = false
     this.socket = socket
+    if (this.options.expectedGatewayId) {
+      this.handshakeTimer = setTimeout(() => this.desktopFailure(), 8_000)
+    }
     socket.addEventListener("open", () => {
       if (this.socket !== socket) return
       opened = true
@@ -1157,6 +1245,7 @@ export class NanobotClient {
     })
     socket.addEventListener("error", () => {
       if (this.socket !== socket) return
+      if (this.options.reconnect === false) { this.desktopFailure(); return }
       this.lastFailure = "connection failed"
       this.reportRetryState()
     })
@@ -1168,6 +1257,7 @@ export class NanobotClient {
         this.options.onStatus("closed")
         return
       }
+      if (this.options.reconnect === false) { this.desktopFailure(); return }
       if (opened) {
         this.connectionAttempt = 0
         this.reconnectAttempt = 0
@@ -1180,6 +1270,8 @@ export class NanobotClient {
   }
 
   close(): void {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
+    this.handshakeTimer = null
     this.closedByClient = true
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
@@ -1256,6 +1348,9 @@ export class NanobotClient {
     payload: Record<string, unknown> = {},
     timeoutMs = 20_000,
   ): Promise<T> {
+    if (this.options.expectedGatewayId && !this.identityVerified) {
+      return Promise.reject(new Error("Desktop identity not verified"))
+    }
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("gateway connection is not open"))
     }
@@ -1299,10 +1394,23 @@ export class NanobotClient {
     try {
       value = JSON.parse(raw) as unknown
     } catch {
+      if (!this.identityVerified && this.options.expectedGatewayId) { this.desktopFailure(); return }
       this.options.onStatus("error", "gateway sent invalid JSON")
       return
     }
     const response = decodeWebUIResponse(value)
+    if (!this.identityVerified) {
+      // Matching metadata is insufficient: an invalid ready frame must not
+      // unlock mutations or cancel the bounded compatibility handshake.
+      if (!isRecord(value) || decodeInboundEvent(value)?.event !== "ready" || !isRecord(value.terminal)
+        || value.terminal.protocolVersion !== 1 || value.terminal.gatewayId !== this.options.expectedGatewayId) {
+        this.desktopFailure()
+        return
+      }
+      this.identityVerified = true
+      if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
+    }
     if (response === null) {
       this.options.onStatus("error", "gateway sent an invalid event")
       return
@@ -1356,6 +1464,7 @@ export class NanobotClient {
   }
 
   private async checkHealthAndScheduleReconnect(): Promise<void> {
+    if (this.options.reconnect === false) { this.desktopFailure(); return }
     if (this.options.checkHealth) {
       try {
         this.healthStatus = await this.options.checkHealth()
@@ -1376,6 +1485,11 @@ export class NanobotClient {
         : {}),
       ...(this.healthStatus ? { health: this.healthStatus } : {}),
     }
+  }
+
+  private desktopFailure(): void {
+    this.close()
+    this.options.onStatus("error", "Desktop disconnected or is incompatible; reconnect from the terminal", this.connectionInfo())
   }
 
   private reportConnectionProgress(): void {
@@ -1414,6 +1528,7 @@ export class NanobotClient {
   }
 
   private write(event: OutboundEvent): void {
+    if (this.options.expectedGatewayId && !this.identityVerified) throw new Error("Desktop identity not verified")
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("gateway connection is not open")
     }

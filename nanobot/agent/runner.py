@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -109,7 +108,6 @@ class AgentRunSpec:
     consolidate_provider_compaction: ProviderCompactionConsolidator | None = None
     injection_callback: InjectionCallback | None = None
     terminal_injection_callback: InjectionCallback | None = None
-    llm_timeout_s: float | None = None
     continuation_callback: ContinuationCallback | None = None
     finalize_on_max_iterations: bool = True
     provider_state: ProviderConversationState | None = None
@@ -130,6 +128,7 @@ class AgentRunResult:
     round_usages: list[LLMUsage] = field(default_factory=list)
     stop_reason: str = "completed"
     error: str | None = None
+    failure_error_kind: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
     # Terminal tail to emit when the preceding final-content prefix was already streamed.
@@ -396,6 +395,7 @@ class AgentRunner:
         usage: LLMUsage | None = None
         round_usages: list[LLMUsage] = []
         error: str | None = None
+        failure_error_kind: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
@@ -730,6 +730,7 @@ class AgentRunner:
                     had_injections = True
                     length_recovery_parts.clear()
                     continue
+                failure_error_kind = LLMProvider.public_error_kind(response)
                 break
             if is_blank_text(clean):
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -827,6 +828,7 @@ class AgentRunner:
             round_usages=round_usages,
             stop_reason=stop_reason,
             error=error,
+            failure_error_kind=failure_error_kind,
             tool_events=tool_events,
             had_injections=had_injections,
             pending_stream_content=pending_stream_content,
@@ -869,7 +871,6 @@ class AgentRunner:
         malformed_retry: bool = False,
         transcript: list[dict[str, Any]] | None,
     ) -> tuple[LLMResponse, LLMUsage]:
-        timeout_s = self._resolve_llm_timeout_s(spec)
         tool_definitions = spec.tools.get_definitions()
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
@@ -987,44 +988,19 @@ class AgentRunner:
                 on_stream_recover=_stream_recover,
             )
         else:
-            coro = spec.runtime.provider.chat_with_retry(
+            coro = spec.runtime.provider.chat_stream_with_retry(
                 **kwargs,
                 provider_context=provider_context,
             )
 
-        # Streaming requests also have provider-level idle timeouts
-        # (NANOBOT_STREAM_IDLE_TIMEOUT_S), but a stream that keeps producing
-        # very slow deltas can still run forever. Use a more generous wall-clock
-        # timeout for streaming while preserving NANOBOT_LLM_TIMEOUT_S=0 as an
-        # opt-out for all LLM wall-clock timeouts.
-        outer_timeout_s = (
-            max(300.0, timeout_s * 2)
-            if wants_streaming and timeout_s is not None
-            else timeout_s
-        )
+        # Providers bound the wait for each stream event, including reasoning and tool deltas.
         request_started_at = time.perf_counter()
         try:
-            response = (
-                await coro if outer_timeout_s is None
-                else await asyncio.wait_for(coro, timeout=outer_timeout_s)
-            )
+            response = await coro
         except asyncio.CancelledError:
             _pause_generation()
             await _close_native_reasoning()
             raise
-        except asyncio.TimeoutError:
-            if outer_timeout_s is None:
-                response = LLMResponse(
-                    content="Error calling LLM: stream stalled",
-                    finish_reason="error",
-                    error_kind="timeout",
-                )
-            else:
-                response = LLMResponse(
-                    content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",
-                    finish_reason="error",
-                    error_kind="timeout",
-                )
         _pause_generation()
         await _close_native_reasoning()
         if first_output_at is not None:
@@ -1257,23 +1233,10 @@ class AgentRunner:
             messages,
             tools=None,
         )
-        coro = spec.runtime.provider.chat_with_retry(
+        response = await spec.runtime.provider.chat_stream_with_retry(
             **kwargs,
             provider_context=provider_context,
         )
-        timeout_s = self._resolve_llm_timeout_s(spec)
-        try:
-            response = (
-                await coro
-                if timeout_s is None
-                else await asyncio.wait_for(coro, timeout=timeout_s)
-            )
-        except asyncio.TimeoutError:
-            response = LLMResponse(
-                content=f"Error calling LLM: timed out after {timeout_s:g}s",
-                finish_reason="error",
-                error_kind="timeout",
-            )
         await self.context_governor.summarize_provider_compaction(
             request_state,
             response,
@@ -1281,21 +1244,6 @@ class AgentRunner:
         )
         request_state.provider_compaction_applied |= response.provider_compaction_applied
         return response
-
-    @staticmethod
-    def _resolve_llm_timeout_s(spec: AgentRunSpec) -> float | None:
-        """Resolve the wall-clock limit shared by every model request path."""
-        timeout_s = spec.llm_timeout_s
-        if timeout_s is None:
-            # Default to a finite timeout to avoid per-session lock starvation when an LLM
-            # request hangs indefinitely (e.g. gateway/network stall).
-            # Set NANOBOT_LLM_TIMEOUT_S=0 to disable.
-            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
-            try:
-                timeout_s = float(raw)
-            except (TypeError, ValueError):
-                timeout_s = 300.0
-        return timeout_s if timeout_s > 0 else None
 
     @staticmethod
     def _budget_exhausted_finalization_messages(
