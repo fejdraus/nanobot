@@ -1141,6 +1141,114 @@ describe("ThreadComposer", () => {
     expect(screen.getByDisplayValue("voice text")).toBeInTheDocument();
   });
 
+  it.each(["thread", "hero"] as const)("separates narrow %s actions from access and usage without losing the draft", async (variant) => {
+    let width = 390;
+    vi.spyOn(HTMLFormElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => rect({ width, height: 160 }),
+    );
+    const onSend = vi.fn();
+    const onWorkspaceScopeChange = vi.fn();
+    const { container } = render(
+      <ThreadComposer
+        variant={variant}
+        compactWhenIdle
+        onSend={onSend}
+        modelLabel="codex"
+        workspaceScope={{ project_path: "/tmp/project", project_name: "project", access_mode: "full", restrict_to_workspace: false }}
+        onWorkspaceScopeChange={onWorkspaceScopeChange}
+        contextUsage={{ contextTokens: 500, contextWindowTokens: 1000 }}
+      />,
+    );
+    const form = container.querySelector("form")!;
+    const input = screen.getByRole("textbox");
+    const access = screen.getByRole("button", { name: "Workspace access mode: Full Access" });
+    const meta = container.querySelector(".thread-composer-meta")!;
+    expect(form).toHaveAttribute("data-compact-controls", "true");
+    expect(container.querySelector(".thread-composer-surface")).not.toHaveAttribute("data-compact");
+    expect(meta).toContainElement(access);
+    expect(meta).toContainElement(screen.getByTestId("composer-context-usage"));
+    expect(within(meta as HTMLElement).getByText("Context 50%")).toBeVisible();
+    expect(container.querySelector(".thread-composer-footer-primary")).toContainElement(screen.getByLabelText("codex"));
+    fireEvent.change(input, { target: { value: "keep this draft" } });
+
+    // A narrow desktop panel uses the same layout; resizing must not replace the textarea.
+    width = 800;
+    fireEvent(window, new Event("resize"));
+    expect(form).not.toHaveAttribute("data-compact-controls");
+    expect(container.querySelector(".thread-composer-meta")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toBe(input);
+    expect(input).toHaveValue("keep this draft");
+    expect(container.querySelector(".thread-composer-footer-actions")).toContainElement(screen.getByLabelText("codex"));
+    expect(screen.getAllByRole("button", { name: "Workspace access mode: Full Access" })).toHaveLength(1);
+
+    width = 320;
+    fireEvent(window, new Event("resize"));
+    expect(form).toHaveAttribute("data-compact-controls", "true");
+    expect(input).toHaveValue("keep this draft");
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("keep this draft", undefined, undefined));
+    expect(onWorkspaceScopeChange).not.toHaveBeenCalled();
+  });
+
+  it.each(["handle tap", "Escape"])("opens narrow context usage as a bottom sheet and restores interaction after %s", async (dismissal) => {
+    vi.spyOn(HTMLFormElement.prototype, "getBoundingClientRect").mockReturnValue(
+      rect({ width: 390, height: 160 }),
+    );
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    render(
+      <ThreadComposer
+        onSend={onSend}
+        contextUsage={{ contextTokens: 10000, contextWindowTokens: 200000 }}
+        recentRoundUsage={[{
+          id: "turn-1",
+          timestamp: Date.UTC(2026, 8, 13, 7, 20),
+          inputTokens: 10000,
+          outputTokens: 280,
+          cachedTokens: 8000,
+        }]}
+      />,
+    );
+    const trigger = screen.getByTestId("composer-context-usage");
+    await user.click(trigger);
+    const sheet = screen.getByRole("dialog", { name: "Context usage" });
+    expect(sheet).toHaveClass("bottom-0", "max-h-[60dvh]");
+    expect(sheet).toHaveFocus();
+    expect(within(sheet).getByRole("heading", { name: "Context usage" })).toBeVisible();
+    expect(within(sheet).getByText("10K / 200K")).toBeVisible();
+    expect(within(sheet).getByTestId("round-usage-bar")).toBeVisible();
+    expect(sheet).toContainElement(within(sheet).getByRole("group", { name: "Input tokens" }));
+    expect(document.body).toHaveStyle({ pointerEvents: "none" });
+
+    if (dismissal === "Escape") await user.keyboard("{Escape}");
+    else await user.click(within(sheet).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(document.body).not.toHaveStyle({ pointerEvents: "none" });
+    expect(trigger).toHaveFocus();
+    await user.type(screen.getByRole("textbox"), "still works");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(onSend).toHaveBeenCalledWith("still works", undefined, undefined);
+  });
+
+  it("releases the mobile sheet when resizing to desktop and keeps the desktop popover", async () => {
+    let width = 390;
+    vi.spyOn(HTMLFormElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => rect({ width, height: 160 }),
+    );
+    const user = userEvent.setup();
+    render(<ThreadComposer onSend={vi.fn()} contextUsage={{ contextTokens: 500, contextWindowTokens: 1000 }} />);
+    await user.click(screen.getByTestId("composer-context-usage"));
+    expect(screen.getByRole("dialog")).toHaveClass("bottom-0");
+
+    width = 800;
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(document.body).not.toHaveStyle({ pointerEvents: "none" });
+    await user.click(screen.getByTestId("composer-context-usage"));
+    expect(screen.getByRole("dialog", { name: "Context usage" })).not.toHaveClass("bottom-0");
+    expect(screen.getByRole("progressbar", { name: "Context 50%" })).toBeVisible();
+  });
+
   it("renders and changes workspace access mode", async () => {
     const onWorkspaceScopeChange = vi.fn();
     render(
@@ -1369,7 +1477,11 @@ describe("ThreadComposer", () => {
         variant="hero"
         workspaceScope={defaultScope}
         workspaceDefaultScope={defaultScope}
-        workspaceControls={{ can_change_project: true, can_use_full_access: true }}
+        workspaceControls={{
+          can_change_project: true,
+          can_use_full_access: true,
+          can_pick_folder: true,
+        }}
         onWorkspaceScopeChange={onWorkspaceScopeChange}
       />,
     );
@@ -1383,6 +1495,57 @@ describe("ThreadComposer", () => {
       project_name: "native-project",
       access_mode: "full",
       restrict_to_workspace: false,
+    }));
+  });
+
+  it("does not use a native host picker when the gateway disallows folder picking", async () => {
+    const user = userEvent.setup();
+    const onWorkspaceScopeChange = vi.fn();
+    const pickFolder = vi.fn().mockResolvedValue("/Users/test/native-project");
+    const onPickWorkspaceFolder = vi.fn().mockResolvedValue("/srv/nas-project");
+    const defaultScope = {
+      project_path: "/srv/nanobot/workspace",
+      project_name: "workspace",
+      access_mode: "full" as const,
+      restrict_to_workspace: false,
+    };
+    Object.defineProperty(window, "nanobotHost", {
+      configurable: true,
+      value: { pickFolder },
+    });
+
+    render(
+      <ThreadComposer
+        onSend={vi.fn()}
+        placeholder="Ask anything..."
+        variant="hero"
+        workspaceScope={defaultScope}
+        workspaceDefaultScope={defaultScope}
+        workspaceControls={{
+          can_change_project: true,
+          can_use_full_access: false,
+          can_pick_folder: false,
+        }}
+        onPickWorkspaceFolder={onPickWorkspaceFolder}
+        onWorkspaceScopeChange={onWorkspaceScopeChange}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Choose project" }));
+
+    expect(await screen.findByLabelText("Paste path")).toBeInTheDocument();
+    expect(pickFolder).not.toHaveBeenCalled();
+    expect(onPickWorkspaceFolder).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Paste path"), {
+      target: { value: "/srv/nas-project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Use Path" }));
+
+    expect(onWorkspaceScopeChange).toHaveBeenCalledWith(expect.objectContaining({
+      project_path: "/srv/nas-project",
+      access_mode: "restricted",
+      restrict_to_workspace: true,
     }));
   });
 

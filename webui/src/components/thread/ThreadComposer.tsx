@@ -963,6 +963,32 @@ export function ThreadComposer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionOverlayRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const [compactControls, setCompactControls] = useState(false);
+
+  useLayoutEffect(() => {
+    const form = formRef.current;
+    if (!form) return;
+    let previousWidth = 0;
+    const update = () => {
+      const width = form.getBoundingClientRect().width;
+      if (width <= 0 || width === previousWidth) return;
+      previousWidth = width;
+      setCompactControls(width <= 512);
+      const input = textareaRef.current;
+      if (input) {
+        input.style.height = "auto";
+        input.style.height = `${Math.min(input.scrollHeight, 260)}px`;
+      }
+    };
+    update();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(form);
+    window.addEventListener("resize", update);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chipRefs = useRef(new Map<string, HTMLButtonElement>());
   const queuedPromptCounterRef = useRef(0);
@@ -1524,7 +1550,7 @@ export function ThreadComposer({
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
     if (mentionOverlayRef.current) mentionOverlayRef.current.scrollTop = el.scrollTop;
-  }, [mentionInput.isComposing, mentionInput.value]);
+  }, [compactControls, mentionInput.isComposing, mentionInput.value]);
 
   // Runs before paint so switching sessions never flashes stale draft text.
   useLayoutEffect(() => {
@@ -2201,12 +2227,12 @@ export function ThreadComposer({
         : t("thread.composer.voice.hint");
   const showStopButton = isStreaming && !!onStop;
   const relaxedHeroInput = isHero && images.length === 0 && !isStreaming;
-  const compactIdle = compactWhenIdle && !isHero && !composerFocused
+  const compactIdle = compactWhenIdle && !compactControls && !isHero && !composerFocused
     && value.length === 0 && images.length === 0 && !inlineError
     && !normalizedQuotedContext && !queuedPrompts.length && !goalState?.active
     && !isDragging && !sessionDragPreview && !voiceRecorder.isRecording && !showProjectPicker;
   useLayoutEffect(() => {
-    if (!compactWhenIdle) return;
+    if (!compactWhenIdle || compactControls) return;
     const form = formRef.current;
     const primary = form?.querySelector<HTMLElement>(".thread-composer-footer-primary");
     const actions = form?.querySelector<HTMLElement>(".thread-composer-footer-actions");
@@ -2225,20 +2251,53 @@ export function ThreadComposer({
     controls.forEach((control) => observer?.observe(control));
     observer?.observe(actions);
     return () => observer?.disconnect();
-  }, [compactWhenIdle, modelLabel, voiceRecorder.isRecording, workspaceScope]);
+  }, [compactControls, compactWhenIdle, modelLabel, voiceRecorder.isRecording, workspaceScope]);
+  const accessControl = workspaceScope && !workspaceControlsHidden ? (
+    <WorkspaceAccessMenu
+      scope={workspaceScope}
+      disabled={interactionDisabled || workspaceScopeDisabled}
+      canUseFullAccess={workspaceControls?.can_use_full_access !== false}
+      isHero={isHero}
+      onChange={onWorkspaceScopeChange}
+    />
+  ) : null;
+  const modelControl = modelLabel && !voiceRecorder.isRecording ? (
+    <ModelPresetBadge
+      label={modelLabel}
+      modelDetail={modelDetail}
+      modelPreset={modelPreset}
+      modelPresets={modelPresets}
+      onPresetChange={onModelPresetChange}
+      onManageModels={onManageModels}
+      onRequestComposerFocus={() => textareaRef.current?.focus()}
+      provider={modelProvider}
+      providerLabel={modelProviderLabel}
+      needsSetup={modelNeedsSetup}
+      attentionRequest={modelSetupAttentionRequest}
+      fallbackModelName={fallbackModelName}
+      isHero={isHero && !compactControls}
+      onClick={modelNeedsSetup ? onModelBadgeClick : undefined}
+    />
+  ) : null;
+  const usageControl = !voiceRecorder.isRecording ? (
+    <ComposerUsagePopover context={contextUsage} rounds={recentRoundUsage} showLabel={compactControls} bottomSheet={compactControls} />
+  ) : null;
   const inputTextClasses = cn(
     "w-full resize-none bg-transparent",
-    isHero
-      ? cn(
-          "min-h-[78px] px-4 text-[16px] leading-6 sm:px-5",
-          relaxedHeroInput ? "pb-2 pt-[27px]" : "pb-1.5 pt-4",
-        )
-      : "min-h-[50px] px-3.5 pb-1.5 pt-3 text-[16px] leading-5 sm:px-4",
+    compactControls
+      ? "min-h-[52px] px-4 pb-2 pt-3 text-[16px] leading-6"
+      : isHero
+        ? cn(
+            "min-h-[78px] px-4 text-[16px] leading-6 sm:px-5",
+            relaxedHeroInput ? "pb-2 pt-[27px]" : "pb-1.5 pt-4",
+          )
+        : "min-h-[50px] px-3.5 pb-1.5 pt-3 text-[16px] leading-5 sm:px-4",
   );
 
   return (
     <form
       ref={formRef}
+      data-compact-controls={compactControls ? "true" : undefined}
       onFocusCapture={() => {
         if (!compactWhenIdle) return;
         // Portaled model controls belong to this composer too: keep its layout
@@ -2488,7 +2547,7 @@ export function ThreadComposer({
               aria-label={t("thread.composer.attachImage")}
               onClick={() => fileInputRef.current?.click()}
               className={cn(
-                "thread-composer-action touch-target rounded-full text-muted-foreground hover:text-foreground",
+                "thread-composer-action thread-composer-round-action touch-target rounded-full text-muted-foreground hover:text-foreground",
                 isHero
                   ? "h-8 w-8 border border-border/55 bg-card shadow-[0_2px_8px_rgba(15,23,42,0.05)] hover:bg-card"
                   : "h-9 w-9 border border-border/55 bg-card shadow-[0_2px_8px_rgba(15,23,42,0.05)] hover:bg-card",
@@ -2504,15 +2563,7 @@ export function ThreadComposer({
                 isHero={isHero}
                 levels={voiceRecorder.levels}
               />
-            ) : workspaceScope && !workspaceControlsHidden ? (
-              <WorkspaceAccessMenu
-                scope={workspaceScope}
-                disabled={interactionDisabled || workspaceScopeDisabled}
-                canUseFullAccess={workspaceControls?.can_use_full_access !== false}
-                isHero={isHero}
-                onChange={onWorkspaceScopeChange}
-              />
-            ) : null}
+            ) : compactControls ? modelControl : accessControl}
           </div>
           <div
             className={cn(
@@ -2520,30 +2571,8 @@ export function ThreadComposer({
               isHero ? "gap-1.5" : "gap-2",
             )}
           >
-            {modelLabel && !voiceRecorder.isRecording ? (
-              <ModelPresetBadge
-                label={modelLabel}
-                modelDetail={modelDetail}
-                modelPreset={modelPreset}
-                modelPresets={modelPresets}
-                onPresetChange={onModelPresetChange}
-                onManageModels={onManageModels}
-                onRequestComposerFocus={() => textareaRef.current?.focus()}
-                provider={modelProvider}
-                providerLabel={modelProviderLabel}
-                needsSetup={modelNeedsSetup}
-                attentionRequest={modelSetupAttentionRequest}
-                fallbackModelName={fallbackModelName}
-                isHero={isHero}
-                onClick={modelNeedsSetup ? onModelBadgeClick : undefined}
-              />
-            ) : null}
-            {!voiceRecorder.isRecording ? (
-              <ComposerUsagePopover
-                context={contextUsage}
-                rounds={recentRoundUsage}
-              />
-            ) : null}
+            {!compactControls ? modelControl : null}
+            {!compactControls ? usageControl : null}
             {showVoiceButton ? (
               <TooltipProvider>
                 <Tooltip>
@@ -2604,7 +2633,7 @@ export function ThreadComposer({
               }
               onClick={showStopButton ? handleStop : modelNeedsSetup ? onModelBadgeClick : undefined}
               className={cn(
-                "thread-composer-action touch-target rounded-full transition-transform",
+                "thread-composer-action thread-composer-round-action touch-target rounded-full transition-transform",
                 showStopButton
                   ? "border border-border/70 bg-card text-foreground/85 shadow-[0_3px_10px_rgba(15,23,42,0.08)] hover:bg-muted/65 hover:text-foreground disabled:text-muted-foreground/50"
                   : isHero
@@ -2648,6 +2677,12 @@ export function ThreadComposer({
           </div>
         ) : null}
       </div>
+      {compactControls ? (
+        <div className="thread-composer-meta mx-auto flex w-full max-w-[58rem] items-center justify-between gap-2 px-2">
+          {accessControl}
+          <div className="ml-auto">{usageControl}</div>
+        </div>
+      ) : null}
     </form>
   );
 }
