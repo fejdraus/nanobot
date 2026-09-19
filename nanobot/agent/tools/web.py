@@ -62,11 +62,11 @@ SEARCH_PROVIDER_OPTIONS: tuple[dict[str, str], ...] = (
 
 class WebSearchConfig(Base):
     """Web search configuration."""
-    provider: str = "searxng"  # brave, tavily, duckduckgo, searxng, jina, kagi, olostep
+    provider: str = "duckduckgo"
     api_key: str = ""
-    base_url: str = "http://localhost:8888"  # SearXNG base URL
+    base_url: str = ""
     max_results: int = 5
-    timeout: int = 30  # Wall-clock timeout (seconds) for search operations
+    timeout: int = 30
 
 
 class WebFetchConfig(Base):
