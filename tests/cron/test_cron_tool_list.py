@@ -353,7 +353,7 @@ def test_add_at_job_rejects_past_datetime(tmp_path) -> None:
     with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     ):
-        result = tool._add_job(None, "Old reminder", None, None, None, "2020-01-01T09:00:00")
+        result = tool._add_job(None, "Old reminder", None, None, None, None, "2020-01-01T09:00:00")
 
     assert "not in the future" in result
     assert "2020-01-01T09:00:00" in result
@@ -367,7 +367,7 @@ def test_add_at_job_rejects_datetime_equal_to_now(tmp_path, monkeypatch) -> None
     with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     ):
-        result = tool._add_job(None, "Deadline reminder", None, None, None, at)
+        result = tool._add_job(None, "Deadline reminder", None, None, None, None, at)
 
     assert "not in the future" in result
     assert tool._cron.list_jobs() == []
@@ -378,7 +378,7 @@ def test_add_at_job_accepts_future_datetime(tmp_path) -> None:
     with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     ):
-        result = tool._add_job(None, "Future reminder", None, None, None, future)
+        result = tool._add_job(None, "Future reminder", None, None, None, None, future)
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
@@ -391,9 +391,9 @@ def test_add_job_rejects_multiple_schedule_fields(tmp_path) -> None:
     with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     ):
-        result = tool._add_job(None, "Morning standup", 60, "0 8 * * *", None, None)
+        result = tool._add_job(None, "Morning standup", None, 60, "0 8 * * *", None, None)
 
-    assert result == "Error: exactly one of every_seconds, cron_expr, or at is required"
+    assert result == "Error: exactly one of delay_seconds, every_seconds, cron_expr, or at is required"
     assert tool._cron.list_jobs() == []
 
 
@@ -536,16 +536,17 @@ def test_relative_timer_tolerates_unusable_tz(tmp_path) -> None:
 def test_explicit_tz_still_applies_to_at_schedules(tmp_path) -> None:
     """The fix must not loosen tz handling for wall-clock schedules."""
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    naive = (datetime.now(timezone.utc) + timedelta(days=1)).replace(tzinfo=None, microsecond=0)
     with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     ):
         result = tool._add_job(
-            None, "Alarm", None, None, None, "Europe/Kyiv", "2026-07-26T22:00:00"
+            None, "Alarm", None, None, None, "Europe/Kyiv", naive.isoformat()
         )
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
-    expected = int(datetime(2026, 7, 26, 19, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    expected = int(naive.replace(tzinfo=ZoneInfo("Europe/Kyiv")).timestamp() * 1000)
     assert job.schedule.at_ms == expected
 
 

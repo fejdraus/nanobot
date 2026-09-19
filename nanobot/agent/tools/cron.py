@@ -189,17 +189,16 @@ class CronTool(Tool):
                 return err
 
         schedule_count = sum(
-            value is not None for value in (every_seconds, cron_expr, at)
+            value is not None for value in (delay_seconds, every_seconds, cron_expr, at)
         )
         if schedule_count != 1:
             return ToolResult.error(
-                "Error: exactly one of every_seconds, cron_expr, or at is required"
+                "Error: exactly one of delay_seconds, every_seconds, cron_expr, or at is required"
             )
 
         # Build schedule
         delete_after = False
         if delay_seconds:
-            import time
             at_ms = int((time.time() + delay_seconds) * 1000)
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
