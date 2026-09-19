@@ -35,6 +35,7 @@ EXPECTED_CHANNELS = {
 }
 
 INTERNAL_CHANNEL_FIELDS = {
+    "telegram": {"admins", "allowedChats"},
     "feishu": {"instanceId", "identityKey"},
     "signal": {"allowFrom"},
     "weixin": {"token"},

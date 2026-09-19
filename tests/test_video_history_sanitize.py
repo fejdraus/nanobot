@@ -11,16 +11,14 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.utils.helpers import image_placeholder_text, video_placeholder_text
 
 
-def _sanitize(content, *, truncate=False):
+def _sanitize(content):
     """Call the sanitizer without building a whole AgentLoop.
 
     It only touches ``self.max_tool_result_chars``, so a stand-in carrying
     that one attribute exercises the real code path.
     """
     stub = SimpleNamespace(max_tool_result_chars=16_000)
-    return AgentLoop._sanitize_persisted_blocks(
-        stub, content, should_truncate_text=truncate
-    )
+    return AgentLoop._sanitize_persisted_blocks(stub, content)
 
 
 def test_video_placeholder_carries_the_path():
