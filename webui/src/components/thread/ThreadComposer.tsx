@@ -121,6 +121,8 @@ import {
 } from "@/lib/session-drag";
 import { formatQuotedUserMessage } from "@/lib/user-message-quote";
 import { cn } from "@/lib/utils";
+import { composerMentionText } from "@/lib/composer-mention-text";
+import type { ComposerDraftStore } from "@/lib/composer-draft";
 
 const VOICE_SHORTCUT_CODE = "KeyD";
 const VOICE_SHORTCUT_ARIA = "Control+Shift+D";
@@ -205,13 +207,13 @@ interface ThreadComposerProps {
   modelProvider?: string | null;
   modelProviderLabel?: string | null;
   modelNeedsSetup?: boolean;
-  fallbackModelName?: string | null;
   onModelBadgeClick?: () => void;
   onManageModels?: () => void;
   contextUsage?: ComposerContextUsage | null;
   recentRoundUsage?: readonly ComposerRoundUsage[];
   variant?: "thread" | "hero";
   slashCommands?: SlashCommand[];
+  onMentionSearch?: () => void;
   cliApps?: CliAppInfo[];
   mcpPresets?: McpPresetInfo[];
   sessions?: ChatSummary[];
@@ -230,6 +232,9 @@ interface ThreadComposerProps {
   onPickWorkspaceFolder?: () => Promise<string | null>;
   onWorkspaceScopeChange?: (scope: WorkspaceScopePayload) => void;
   pendingQueueKey?: string | null;
+  draftKey?: string;
+  draftStore?: ComposerDraftStore;
+  persistDraft?: boolean;
   transcriptionProvider?: string | null;
   ingressLimits?: WebUIIngressLimits | null;
   quotedContext?: string | null;
@@ -907,13 +912,13 @@ export function ThreadComposer({
   modelProvider = null,
   modelProviderLabel = null,
   modelNeedsSetup = false,
-  fallbackModelName = null,
   onModelBadgeClick,
   onManageModels,
   contextUsage = null,
   recentRoundUsage = [],
   variant = "thread",
   slashCommands = [],
+  onMentionSearch,
   cliApps = [],
   mcpPresets = [],
   sessions = [],
@@ -931,6 +936,9 @@ export function ThreadComposer({
   onPickWorkspaceFolder,
   onWorkspaceScopeChange,
   pendingQueueKey = null,
+  draftKey,
+  draftStore,
+  persistDraft = false,
   transcriptionProvider = null,
   ingressLimits = null,
   quotedContext = null,
@@ -938,10 +946,13 @@ export function ThreadComposer({
   onQuotedContextChange,
 }: ThreadComposerProps) {
   const { t } = useTranslation();
-  const [value, setValue] = useState("");
+  const [initialDraft] = useState(() => draftKey ? draftStore?.get(draftKey, persistDraft) : undefined);
+  const [value, setValue] = useState(initialDraft?.text ?? "");
   const [composerFocused, setComposerFocused] = useState(false);
   const blurFrame = useRef<number | null>(null);
-  const [selectedSessionMentions, setSelectedSessionMentions] = useState<SessionMention[]>([]);
+  const [selectedSessionMentions, setSelectedSessionMentions] = useState<SessionMention[]>(
+    initialDraft?.sessionMentions ?? [],
+  );
   const [sessionDragPreview, setSessionDragPreview] = useState<{
     mention: SessionMention;
     start: number;
@@ -1038,6 +1049,14 @@ export function ThreadComposer({
   const maxTextBytes = ingressLimits?.message.max_text_bytes ?? 64 * 1024;
   const { images, enqueue, remove, clear, restoreReadyImages, encoding, full } =
     useAttachedImages({ ingressLimits });
+  const restoredDraftAttachments = useRef(false);
+  const [draftAttachmentsReady, setDraftAttachmentsReady] = useState(!initialDraft?.files.length);
+  useLayoutEffect(() => {
+    if (restoredDraftAttachments.current) return;
+    restoredDraftAttachments.current = true;
+    if (initialDraft?.files.length) enqueue(initialDraft.files);
+    setDraftAttachmentsReady(true);
+  }, [enqueue, initialDraft]);
 
   const formatRejection = useCallback(
     (reason: AttachmentError): string => {
@@ -1303,6 +1322,11 @@ export function ThreadComposer({
     };
   }, [cliAppMenuDismissed, cursorPosition, interactionDisabled, value]);
 
+  const mentionSearchActive = cliAppMention !== null;
+  useEffect(() => {
+    if (mentionSearchActive) onMentionSearch?.();
+  }, [mentionSearchActive, onMentionSearch]);
+
   const availableSessionMentions = useMemo(
     () => sessionMentionOptions(sessions),
     [sessions],
@@ -1325,6 +1349,20 @@ export function ThreadComposer({
     resetKey: pendingQueueKey,
   });
   const { rawSelection, replace: replaceMentionInput } = mentionInput;
+  const draftText = composerMentionText(mentionInput.segments).raw;
+  useLayoutEffect(() => {
+    if (!draftKey || !draftStore || !draftAttachmentsReady) return;
+    if (!draftText && images.length === 0 && !quotedContext) {
+      draftStore.delete(draftKey);
+      return;
+    }
+    draftStore.set(draftKey, {
+      text: draftText,
+      files: images.map((image) => image.file),
+      sessionMentions: selectedSessionMentions,
+      quotedContext,
+    }, persistDraft);
+  }, [draftAttachmentsReady, draftKey, draftStore, images, persistDraft, quotedContext, selectedSessionMentions, draftText]);
   const sessionDragInsertion = sessionDragPreview
     ? mentionInsertion(
         value,
@@ -2030,7 +2068,11 @@ export function ThreadComposer({
     const isSlashSideChannel = isSideChannelLifecycle(slashLifecycle);
     const finalizeActiveTurn =
       slashLifecycle === "finalize_active_turn";
+    const submittedDraft = draftKey ? draftStore?.get(draftKey) : undefined;
     const finishSend = () => {
+      // A pending send can finish after this composer unmounts and a newer draft is started.
+      if (draftKey && draftStore && draftStore.get(draftKey) !== submittedDraft) return;
+      if (draftKey) draftStore?.delete(draftKey);
       if (hasTouchPrimaryPointer) textareaRef.current?.blur();
       setQueuedPrompts([]);
       // Bubble owns the data URL copy; safe to revoke every staged blob
@@ -2068,6 +2110,8 @@ export function ThreadComposer({
     activeMcpPresetMentions,
     activeSessionMentions,
     canSend,
+    draftKey,
+    draftStore,
     clear,
     clearComposerText,
     hasTouchPrimaryPointer,
@@ -2274,7 +2318,6 @@ export function ThreadComposer({
       providerLabel={modelProviderLabel}
       needsSetup={modelNeedsSetup}
       attentionRequest={modelSetupAttentionRequest}
-      fallbackModelName={fallbackModelName}
       isHero={isHero && !compactControls}
       onClick={modelNeedsSetup ? onModelBadgeClick : undefined}
     />
@@ -2716,7 +2759,10 @@ function QueuedPromptStack({
   onDragEnd: () => void;
   onDrop: (targetId: string) => void;
 }) {
-  const stripMaxHeight = Math.min(240, 14 + prompts.length * 34 + Math.max(0, prompts.length - 1) * 4);
+  const stripMaxHeight = Math.min(
+    320,
+    96 + prompts.length * 34 + Math.max(0, prompts.length - 1) * 4,
+  );
 
   return (
     <div
@@ -2732,6 +2778,9 @@ function QueuedPromptStack({
       style={{ "--composer-strip-max-height": `${stripMaxHeight}px` } as CSSProperties}
       aria-label={label}
     >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 px-2 pb-1">
+        <span className="text-[11.5px] font-semibold text-foreground/75">{label}</span>
+      </div>
       <div className="flex max-h-[216px] flex-col gap-1 overflow-y-auto">
         {prompts.map((prompt) => (
           <QueuedPromptRow
