@@ -581,6 +581,8 @@ def _run_gateway(
                 key = dream_session_key()
                 dream_runtime = agent.dream_runtime()
                 await mcp_provider.connect()
+                from nanobot.agent import dream_filter
+                memory_before = dream_filter.snapshot(store)
                 resp = await agent.process_direct(
                     prompt,
                     session_key=key,
@@ -589,6 +591,7 @@ def _run_gateway(
                     on_progress=_silent,
                     runtime=dream_runtime,
                 )
+                await asyncio.to_thread(dream_filter.apply, store, memory_before)
                 # The real file delta grounds the audit record; normal completion
                 # decides whether this history batch has finished processing.
                 diff_body = store.dream_content_diff()
