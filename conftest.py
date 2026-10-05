@@ -7,10 +7,18 @@ import ssl
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from threading import Thread
 
 import certifi
 import pytest
 from loguru import logger
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tokenizer_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests deterministic and out of the user's tokenizer cache and network."""
+    monkeypatch.setattr("nanobot.utils.token_encoding._encoding", None)
+    monkeypatch.setattr("nanobot.utils.token_encoding._warmup_thread", Thread())
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +55,15 @@ def _isolate_sessions_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> I
         lambda: legacy_root,
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_star_prompt_store(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep WebUI completion events out of the user's invitation state and lock."""
+    webui_dir = tmp_path_factory.mktemp("star-prompt-webui")
+    monkeypatch.setattr("nanobot.webui.star_prompt.get_webui_dir", lambda: webui_dir)
 
 
 @pytest.fixture(autouse=True)

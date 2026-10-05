@@ -872,7 +872,9 @@ async def test_openrouter_gpt5_stays_on_chat_completions() -> None:
 @pytest.mark.asyncio
 async def test_direct_openai_streaming_gpt5_uses_responses_api() -> None:
     mock_chat = AsyncMock(return_value=_StalledStream())
-    mock_responses = AsyncMock(return_value=_fake_responses_stream("hi"))
+    stream = MagicMock()
+    stream.__aiter__.side_effect = lambda: _fake_responses_stream("hi")
+    mock_responses = AsyncMock(return_value=stream)
     spec = find_by_name("openai")
 
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_class:
@@ -892,6 +894,7 @@ async def test_direct_openai_streaming_gpt5_uses_responses_api() -> None:
 
     assert result.content == "hi"
     assert result.finish_reason == "stop"
+    stream.__aexit__.assert_awaited_once()
     mock_responses.assert_awaited_once()
     mock_chat.assert_not_awaited()
 
@@ -1009,7 +1012,88 @@ def test_openai_compat_supports_temperature_matches_reasoning_model_rules() -> N
     assert OpenAICompatProvider._supports_temperature("gpt-4o") is True
     assert OpenAICompatProvider._supports_temperature("gpt-5-chat") is False
     assert OpenAICompatProvider._supports_temperature("o3-mini") is False
-    assert OpenAICompatProvider._supports_temperature("gpt-4o", reasoning_effort="medium") is False
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "model", "responses"),
+    [
+        ("deepseek", "deepseek-v4-flash", False),
+        ("deepseek", "deepseek-v4-flash", True),
+        ("mistral", "mistral-medium-3-5", False),
+    ],
+)
+def test_compatible_provider_keeps_temperature_when_reasoning_effort_is_set(
+    provider_name: str, model: str, responses: bool,
+) -> None:
+    spec = find_by_name(provider_name)
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model=model,
+            spec=spec,
+        )
+
+    build_request = provider._build_responses_body if responses else provider._build_kwargs
+    request = build_request(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model=model,
+        max_tokens=4096,
+        temperature=0.2,
+        reasoning_effort="high",
+        tool_choice=None,
+    )
+
+    assert request["temperature"] == 0.2
+    if responses:
+        assert request["reasoning"] == {"effort": "high"}
+    else:
+        assert request["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("api_type", ["chat_completions", "responses"])
+@pytest.mark.parametrize(
+    ("model", "effort", "supports_temperature"),
+    [
+        ("gpt-6.1-sol", "high", False),
+        ("gpt-6-sol", "high", False),
+        ("gpt-6-sol", None, False),
+        ("gpt-6-sol", "none", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gpt6_temperature_requires_explicit_none_effort(
+    api_type: str, model: str, effort: str | None, supports_temperature: bool,
+) -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(return_value=_fake_responses_response())
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client:
+        mock_client.return_value.chat.completions.create = mock_chat
+        mock_client.return_value.responses.create = mock_responses
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model=model,
+            spec=find_by_name("openai"),
+            api_type=api_type,
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.2,
+            reasoning_effort=effort,
+        )
+
+    assert result.content == "ok"
+    request_mock = mock_responses if api_type == "responses" else mock_chat
+    other_mock = mock_chat if api_type == "responses" else mock_responses
+    request_mock.assert_awaited_once()
+    other_mock.assert_not_awaited()
+    request = request_mock.call_args.kwargs
+    if supports_temperature:
+        assert request["temperature"] == 0.2
+    else:
+        assert "temperature" not in request
+        if api_type == "responses":
+            assert request["include"] == ["reasoning.encrypted_content"]
 
 
 def test_openai_compat_build_kwargs_uses_gpt5_safe_parameters() -> None:
@@ -1948,3 +2032,30 @@ def test_deepseek_no_backfill_when_reasoning_effort_none_string() -> None:
     )
     assistant = kw["messages"][1]
     assert "reasoning_content" not in assistant
+
+
+@pytest.mark.asyncio
+async def test_responses_request_preserves_optional_tool_fields() -> None:
+    mock_responses = AsyncMock(return_value=_fake_responses_response())
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": [],
+    }
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client:
+        mock_client.return_value.responses.create = mock_responses
+        provider = OpenAICompatProvider(
+            api_key="sk-test", default_model="gpt-5", spec=find_by_name("openai"),
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "Search issues"}],
+            tools=[{"type": "function", "function": {
+                "name": "list_issues", "parameters": parameters,
+            }}],
+        )
+
+    assert result.content == "ok"
+    mock_responses.assert_awaited_once()
+    tool = mock_responses.call_args.kwargs["tools"][0]
+    assert tool["strict"] is False
+    assert tool["parameters"] == parameters

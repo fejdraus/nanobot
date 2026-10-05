@@ -31,6 +31,7 @@ from nanobot.bus.runtime_events import (
     RuntimeEventContext,
     RuntimeModelChanged,
     SessionTurnStarted,
+    SubagentTaskChanged,
     TurnCompleted,
     TurnRunStatusChanged,
     TurnRuntimeAdmitted,
@@ -55,7 +56,7 @@ from nanobot.webui.metadata import (
     WEBSOCKET_TURN_OWNER_METADATA_KEY,
     WEBUI_TURN_METADATA_KEY,
 )
-from nanobot.webui.session_identity import is_webui_session_key
+from nanobot.webui.session_identity import is_webui_session_key, webui_session_key
 from nanobot.webui.star_prompt import update_star_prompt
 from nanobot.webui.transcript import append_session_message_input
 
@@ -64,7 +65,6 @@ WEBUI_TITLE_METADATA_KEY = "title"
 WEBUI_TITLE_USER_EDITED_METADATA_KEY = "title_user_edited"
 TITLE_MAX_CHARS = 60
 TITLE_GENERATION_MAX_TOKENS = 96
-TITLE_GENERATION_REASONING_EFFORT = "none"
 
 # Latest active turn projection per ``chat_id`` (websocket only). It survives browser refresh
 # while the gateway process stays up and is implicitly dropped on restart.
@@ -256,7 +256,10 @@ async def maybe_generate_webui_title(
         prompt += f"\nAssistant: {truncate_text(assistant_text, 1_000)}"
 
     try:
-        with llm_usage_source("system"):
+        with (
+            llm_usage_source("system"),
+            logger.contextualize(purpose="webui_title", session_key=target_session.key),
+        ):
             response = await provider.chat_stream_with_retry(
                 [
                     {
@@ -272,7 +275,7 @@ async def maybe_generate_webui_title(
                 model=model,
                 max_tokens=TITLE_GENERATION_MAX_TOKENS,
                 temperature=0.2,
-                reasoning_effort=TITLE_GENERATION_REASONING_EFFORT,
+                reasoning_effort=None,
                 retry_mode="standard",
             )
     except Exception:
@@ -500,7 +503,7 @@ class WebuiTurnRoutePolicy:
                 else uuid4().hex
             )
             metadata[WEBSOCKET_TURN_OWNER_METADATA_KEY] = owner
-            routed = replace(routed, metadata=metadata)
+            routed = replace(routed, metadata=metadata, turn_id=current_turn_id)
             # Direct websocket turns publish their final idle transition from
             # the original input message. Carry the same server-owned identity
             # there, overwriting any untrusted client-supplied value.
@@ -576,6 +579,7 @@ class WebuiTurnCoordinator:
                 self._handle_goal_state_changed,
                 GoalStateChanged,
             ),
+            self.bus.subscribe(self._handle_subagent_task_changed, SubagentTaskChanged),
             self.bus.subscribe(
                 self._handle_runtime_model_changed,
                 RuntimeModelChanged,
@@ -731,6 +735,12 @@ class WebuiTurnCoordinator:
                 metadata=event.context.metadata,
             ),
         )
+
+    async def _handle_subagent_task_changed(self, event: SubagentTaskChanged) -> None:
+        ctx = event.context
+        if not self._is_websocket_event(ctx) or ctx.session_key != webui_session_key(ctx.chat_id):
+            return
+        await self.bus.publish_event(event, channel=ctx.channel, chat_id=ctx.chat_id)
 
     async def _handle_runtime_model_changed(self, event: RuntimeModelChanged) -> None:
         await self.bus.publish_outbound(

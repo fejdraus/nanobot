@@ -33,9 +33,11 @@ _CRON_PARAMETERS = tool_parameters_schema(
     ),
     delay_seconds=IntegerSchema(
         description="One-time timer: fire once after N seconds (e.g. 300 for 5 min). Use for 'remind me in X minutes'",
+        minimum=1,
     ),
     every_seconds=IntegerSchema(
         description="Recurring: repeat every N seconds. Use ONLY for 'remind me every X hours'",
+        minimum=1,
     ),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
     tz=StringSchema(
@@ -198,11 +200,15 @@ class CronTool(Tool):
 
         # Build schedule
         delete_after = False
-        if delay_seconds:
+        if delay_seconds is not None:
+            if delay_seconds <= 0:
+                return ToolResult.error("Error: delay_seconds must be a positive integer")
             at_ms = int((time.time() + delay_seconds) * 1000)
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
-        elif every_seconds:
+        elif every_seconds is not None:
+            if every_seconds <= 0:
+                return ToolResult.error("Error: every_seconds must be a positive integer")
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
             effective_tz = tz or self._default_timezone
