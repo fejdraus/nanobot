@@ -200,6 +200,7 @@ nanobot onboard --config ~/.nanobot-reviewer/config.json --workspace ~/.nanobot-
       "gitlabUrl": "https://gitlab.banzait.com",
       "gitlabToken": "${GITLAB_REVIEW_TOKEN}",
       "reviewerUsernames": ["a.tyra"],
+      "reviewOwnMergeRequests": true,
       "telegramBotToken": "${REVIEW_TELEGRAM_BOT_TOKEN}",
       "telegramChatId": "49816954",
       "telegramUserIds": ["49816954"],
@@ -302,7 +303,8 @@ journalctl --user -u nanobot-reviewer -n 50
 
 1. Напишите своему новому боту в Telegram любое сообщение — бот ответит подсказкой с командами
    (сообщения из других чатов игнорируются молча).
-2. Дождитесь нового MR (или переоткройте свой тестовый, но не свой — свои бот не ревьюит).
+2. Дождитесь нового MR или переоткройте любой открытый. Свои MR бот тоже ревьюит
+   (`reviewOwnMergeRequests: true`), но аппрув для них не предлагает и не публикует.
 3. Через ~90 с после события начнётся ревью; черновик придёт в Telegram с нумерацией действий.
 4. Ответьте:
    - `публикуй !<iid>/<версия>` — всё (номер `iid/версия` есть в заголовке черновика);

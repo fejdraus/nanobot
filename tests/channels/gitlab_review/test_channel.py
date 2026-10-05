@@ -13,7 +13,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApiError
-from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE
+from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, ProposedAction
 from nanobot.channels.gitlab_review.runtime import GitLabReviewChannel, _PendingRun
 from nanobot.channels.gitlab_review.telegram_api import TelegramMessage
 
@@ -464,3 +464,27 @@ async def test_failed_command_does_not_stop_polling(tmp_path: Path) -> None:
     async with h:
         await _until(lambda: "черновик отменён" in h.telegram.text())
     assert "Команда не выполнена" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_own_mr_is_reviewed_when_enabled(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_own_merge_requests=True, review_timeout_s=0.05) as h:
+        h.gitlab.mr["author"] = {"username": "a.tyra"}
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    prompt = h.inbound[0].content
+    assert "review-gitlab-mrs" in prompt
+    assert "самого ревьюера" in prompt
+
+
+@pytest.mark.asyncio
+async def test_approval_of_own_mr_is_never_drafted_or_published(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_own_merge_requests=True) as h:
+        h.gitlab.mr["author"] = {"username": "a.tyra"}
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        h.channel._pending[42] = _PendingRun(future, SHA, "feat: thing", "", own=True)
+        await h.answer(42, [{"type": "note", "body": "general"}, {"type": "approve"}], waiting=False)
+        assert "аппрув своего MR снят" in h.telegram.text()
+        h.channel._state.save_draft(42, SHA, (ProposedAction("approve"),), 9)
+        await h.channel.handle_telegram(_tg(1, "публикуй !42/9"))
+    assert ("approve", SHA) not in h.gitlab.writes
+    assert "это ваш MR" in h.telegram.text()

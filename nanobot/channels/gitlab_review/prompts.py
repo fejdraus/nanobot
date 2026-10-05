@@ -33,10 +33,17 @@ _DRAFT_RULES = f"""\
 Если предлагать нечего, выведи блок с пустым списком actions. Текст до блока — краткая сводка для человека."""
 
 
-def review_prompt(iid: int) -> str:
+_OWN_MR = (
+    "Это merge request самого ревьюера. Он просит проверить свой код так же строго, как чужой: "
+    "правило скилла «не ревьюить свои MR» здесь не действует. Аппрув не предлагай."
+)
+
+
+def review_prompt(iid: int, *, own: bool = False) -> str:
+    own_note = f"{_OWN_MR}\n\n" if own else ""
     return (
         f"Выполни скилл review-gitlab-mrs для merge request !{iid}.\n\n"
-        f"Открыт merge request !{iid}. Проведи ревью.\n\n{_DRAFT_RULES}"
+        f"Открыт merge request !{iid}. Проведи ревью.\n\n{own_note}{_DRAFT_RULES}"
     )
 
 

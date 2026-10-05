@@ -18,6 +18,9 @@ class GitLabReviewConfig(Base):
     header, not a body signature, so that token is the whole trust boundary of
     the listener.
 
+    ``reviewOwnMergeRequests`` also reviews merge requests the reviewer
+    authored; approving them is never proposed or published.
+
     The reviewer never publishes on its own. Drafts go to one Telegram chat;
     only an approval sent from that chat makes the channel post to GitLab, with
     ``gitlabToken``. The comments appear under that token's account, a real
@@ -36,6 +39,7 @@ class GitLabReviewConfig(Base):
     gitlab_url: str = ""
     gitlab_token: str = ""
     reviewer_usernames: list[str] = Field(default_factory=list)
+    review_own_merge_requests: bool = False
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

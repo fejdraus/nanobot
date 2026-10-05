@@ -1763,6 +1763,7 @@ code, not in the prompt.
 | `webhookSecretToken` | — | **Required.** Must match the webhook's *Secret token* in GitLab. |
 | `gitlabUrl`, `gitlabToken` | — | **Required.** Used to read MRs and threads and to publish approved actions. |
 | `reviewerUsernames` | — | **Required.** The reviewer's GitLab usernames. Their notes never wake the bot, which prevents a reply loop. |
+| `reviewOwnMergeRequests` | `false` | Also review merge requests the reviewer authored. An approval of such an MR is never drafted nor published. |
 | `telegramBotToken`, `telegramChatId` | — | **Required.** Drafts go to this one chat; approvals are accepted only from it. In a private chat only its owner can approve. |
 | `telegramUserIds` | `[]` | Telegram user ids allowed to approve. **Required** when `telegramChatId` is a group (negative id): there the chat id says nothing about the sender. |
 | `host`, `port`, `webhookPath` | `127.0.0.1`, `3980`, `/gitlab/webhook` | Listener address. Expose it through a reverse proxy or Tailscale Funnel rather than binding to all interfaces. |
@@ -1774,7 +1775,8 @@ code, not in the prompt.
 
 What starts a run (checked against live GitLab state, after the debounce):
 
-- **MR opened or reopened** — skipped for drafts and for MRs authored by a reviewer.
+- **MR opened or reopened** — skipped for drafts, and for MRs authored by a reviewer unless
+  `reviewOwnMergeRequests` is on.
 - **Note on an open MR** — only in a thread the reviewer started, and only when
   the note answers the reviewer: it follows a reviewer note (a series of notes by
   the same person counts as one reply) or mentions the reviewer. A note that

@@ -7,8 +7,9 @@ Flow:
 2. Activity is debounced per thread (or per MR) and queued. A single worker
    runs one review at a time, so two reviews never share a repository clone.
 3. Before a run, live GitLab state is checked in code: the MR is open, not a
-   draft, not authored by the reviewer; a note passes :mod:`triage`; the MR is
-   within its hourly run budget.
+   draft, not authored by the reviewer unless ``reviewOwnMergeRequests`` is on;
+   a note passes :mod:`triage`; the MR is within its hourly run budget. An
+   approval of the reviewer's own MR is never drafted nor published.
 4. The agent reviews in draft mode and answers with proposed actions.
 5. The draft goes to one Telegram chat. Only «публикуй !N/V» from its approver
    makes the channel post to GitLab, and only if the branch has not moved since
@@ -39,6 +40,7 @@ from nanobot.channels.gitlab_review.prompts import reply_prompt, review_prompt
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
     ProposedAction,
+    ReviewDraft,
     parse_command,
     parse_draft,
     render_draft,
@@ -76,6 +78,7 @@ class _PendingRun:
     head_sha: str
     title: str
     web_url: str
+    own: bool = False
 
 
 @dataclass
@@ -209,6 +212,12 @@ class GitLabReviewChannel(BaseChannel):
 
     async def _deliver_draft(self, iid: int, answer: str, pending: _PendingRun) -> None:
         draft = parse_draft(answer)
+        if pending.own and any(action.type == "approve" for action in draft.actions):
+            draft = ReviewDraft(
+                summary=draft.summary,
+                actions=tuple(action for action in draft.actions if action.type != "approve"),
+                errors=(*draft.errors, "аппрув своего MR снят"),
+            )
         version = self._state.next_draft_version(iid)
         if draft.actions:
             self._state.save_draft(iid, pending.head_sha, draft.actions, version)
@@ -318,10 +327,11 @@ class GitLabReviewChannel(BaseChannel):
         if not info.open or info.draft:
             return
 
+        own = self.config.is_reviewer(info.author)
         if candidate.kind == "merge_request":
-            if self.config.is_reviewer(info.author):
+            if own and not self.config.review_own_merge_requests:
                 return
-            prompt = review_prompt(info.iid)
+            prompt = review_prompt(info.iid, own=own)
         else:
             assert self._gitlab is not None and candidate.discussion_id
             discussion = await self._gitlab.get_discussion(info.iid, candidate.discussion_id)
@@ -354,12 +364,14 @@ class GitLabReviewChannel(BaseChannel):
                 )
             )
             return
-        await self._run_agent(info, prompt)
+        await self._run_agent(info, prompt, own=own)
 
-    async def _run_agent(self, info: _MergeRequestInfo, prompt: str) -> None:
+    async def _run_agent(self, info: _MergeRequestInfo, prompt: str, *, own: bool = False) -> None:
         assert self._loop is not None
         future: asyncio.Future[None] = self._loop.create_future()
-        self._pending[info.iid] = _PendingRun(future, info.head_sha, info.title, info.web_url)
+        self._pending[info.iid] = _PendingRun(
+            future, info.head_sha, info.title, info.web_url, own=own
+        )
         try:
             await self.bus.publish_inbound(
                 InboundMessage(
@@ -471,6 +483,9 @@ class GitLabReviewChannel(BaseChannel):
 
         report: list[str] = []
         for number, action in selected:
+            if action.type == "approve" and self.config.is_reviewer(info.author):
+                report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
+                continue
             try:
                 await self._publish_action(info, action)
             except GitLabApiError as exc:
