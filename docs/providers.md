@@ -579,6 +579,57 @@ Bedrock can use the AWS credential chain, profile, region, or Bedrock bearer tok
 
 See [`configuration.md#providers`](./configuration.md#providers) for Bedrock-specific notes.
 
+### Claude Code CLI (Subscription)
+
+`claude_cli` runs the Claude Code CLI as a subprocess rather than calling the
+Messages API. Use it when your Claude access is a subscription: Anthropic
+requires subscription credentials to be used through Claude Code itself, so
+this provider reads and forwards no API key.
+
+```json
+{
+  "agents": { "defaults": { "model": "claude_cli/claude-opus-5-5" } },
+  "providers": {
+    "claude_cli": {
+      "cwd": "C:/src/my-project",
+      "permissionMode": "bypassPermissions",
+      "timeoutS": 3600
+    }
+  }
+}
+```
+
+Run `claude login` once so the CLI has its own credentials. Turn on
+`agents.defaults.showReasoning` or `agents.defaults.streaming` only if you want
+the CLI's own progress echoed — streaming collapses to a single delta,
+because the CLI decides its own output framing.
+
+Pick `cwd` as the repository the CLI should work on; it is not the nanobot
+workspace. The `claude_cli/` prefix is stripped before the model name reaches
+the CLI, and a non-Claude identifier (a Bedrock or Vertex model id) falls back
+to the configured default with a warning rather than failing opaquely.
+
+> [!NOTE]
+> **nanobot's own system prompt is not forwarded.** It describes nanobot's
+> tools, which a `claude -p` turn does not have; the CLI keeps its built-in
+> system prompt for the tools it actually runs. To give the CLI extra
+> instructions, set `appendSystemPrompt` (or replace its prompt with
+> `systemPrompt`).
+
+> [!IMPORTANT]
+> **The CLI owns its own tools.** `claude -p` accepts no caller-supplied tool
+> schema, so nanobot's tools are *not* reachable from an agent turn driven by
+> this provider. Such a turn can use only the CLI's own `Read`/`Bash`/`Grep`
+> and the MCP servers configured in Claude Code. Pick a normal API provider for
+> any agent that needs `message`, `cron`, or session tools.
+
+Every turn is a fresh CLI run that receives only the newest user message,
+through stdin. The CLI process gets a filtered environment (`PATH`, `HOME`,
+locale, proxy, `CLAUDE_*`, `ANTHROPIC_*`, `NODE_*` and the like), so other
+secrets the gateway holds never reach the tools the model runs. On a timeout
+or a cancelled turn the whole process group is killed, including tool
+processes and MCP servers the CLI started.
+
 ### OAuth Providers
 
 Some providers do not use API keys in `config.json`.

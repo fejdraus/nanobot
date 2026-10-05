@@ -18,6 +18,7 @@ EXPECTED_CHANNELS = {
     "discord",
     "email",
     "feishu",
+    "gitlab_review",
     "linear",
     "matrix",
     "mattermost",

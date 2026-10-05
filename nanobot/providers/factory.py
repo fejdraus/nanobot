@@ -198,6 +198,26 @@ def _make_provider_core(
         from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
 
         provider = GitHubCopilotProvider(default_model=model, provider_name=provider_name)
+    elif backend == "claude_cli":
+        from nanobot.config.schema import ClaudeCLIProviderConfig
+        from nanobot.providers.claude_cli_provider import ClaudeCLIProvider
+
+        cli = p if isinstance(p, ClaudeCLIProviderConfig) else ClaudeCLIProviderConfig()
+        provider = ClaudeCLIProvider(
+            default_model=model,
+            cli_path=cli.cli_path or "claude",
+            cwd=cli.cwd,
+            timeout_s=cli.timeout_s,
+            allowed_tools=cli.allowed_tools,
+            disallowed_tools=cli.disallowed_tools,
+            permission_mode=cli.permission_mode,
+            system_prompt=cli.system_prompt,
+            append_system_prompt=cli.append_system_prompt,
+            settings_file=cli.settings_file,
+            extra_args=list(cli.extra_args),
+            max_turns=cli.max_turns,
+            provider_name=provider_name,
+        )
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
 

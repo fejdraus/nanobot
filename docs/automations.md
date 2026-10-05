@@ -96,10 +96,69 @@ nanobot trigger --config ./bot-a/config.json trg_8K4P2Q9X "Nightly report"
 nanobot trigger --workspace ./bot-a/workspace trg_8K4P2Q9X "Nightly report"
 ```
 
-nanobot does not provide a built-in public webhook receiver for local triggers.
-If GitHub, CI, or another external system should wake nanobot, run your own
-small webhook service and have it call `nanobot trigger` after it builds the
-final message.
+nanobot ships one built-in webhook receiver: the [`gitlab_review`
+channel](./configuration.md#gitlab-review-channel), which turns merge-request
+activity into review turns. For other systems (GitHub, CI, any HTTP source),
+run your own small webhook service and have it call `nanobot trigger` after it
+builds the final message.
+
+### Claude Code Hooks
+
+A Claude Code hook is a shell command that Claude Code runs itself, so it needs
+no nanobot code at all — it is just another local script calling
+`nanobot trigger`.
+
+Create the trigger first with `/trigger <name>` in the target chat, then point a
+Claude Code hook at it. In `settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nanobot trigger trg_8K4P2Q9X \"Claude Code finished a task\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code passes the hook payload to the command as JSON on stdin, so a hook
+that should send real content reads it rather than hardcoding a message:
+
+```python
+#!/usr/bin/env python
+"""Claude Code hook: forward a session summary into a nanobot session."""
+
+import json
+import subprocess
+import sys
+
+payload = json.load(sys.stdin)
+summary = f"Claude Code ({payload.get('session_id', '?')}) stopped."
+
+subprocess.run(
+    ["nanobot", "trigger", "trg_8K4P2Q9X", summary],
+    check=False,
+)
+```
+
+Two properties of the local trigger queue make this reliable:
+
+- The gateway drains the queue every 0.5s, so the message arrives while the
+  session is running, without polling.
+- If the linked topic is already running a turn, the message waits until the
+  session is idle instead of being injected mid-turn.
+
+Delivery is at-least-once: a hook that may run twice should produce a message
+that is safe to see twice. If the gateway is not running, the message waits in
+the workspace until it starts.
+
 
 ## Heartbeat
 

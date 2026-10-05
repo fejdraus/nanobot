@@ -246,6 +246,27 @@ class BedrockProviderConfig(ProviderConfig):
     profile: str | None = None  # Optional AWS shared config profile
 
 
+class ClaudeCLIProviderConfig(ProviderConfig):
+    """Configuration for the Claude Code CLI backend.
+
+    Deliberately has no ``api_key``: Anthropic subscription credentials must be
+    used through Claude Code itself, so the CLI owns sign-in and nanobot never
+    reads or forwards a credential.
+    """
+
+    cli_path: str = "claude"
+    cwd: str | None = None
+    timeout_s: float = Field(default=3600.0, gt=0)
+    allowed_tools: list[str] | None = None
+    disallowed_tools: list[str] | None = None
+    permission_mode: str | None = None
+    system_prompt: str | None = None
+    append_system_prompt: str | None = None
+    settings_file: str | None = None
+    extra_args: list[str] = Field(default_factory=list)
+    max_turns: int | None = Field(default=None, ge=1)
+
+
 class ProvidersConfig(Base):
     """Configuration for LLM providers.
 
@@ -258,6 +279,7 @@ class ProvidersConfig(Base):
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     bedrock: BedrockProviderConfig = Field(default_factory=BedrockProviderConfig)  # AWS Bedrock Converse
+    claude_cli: ClaudeCLIProviderConfig = Field(default_factory=ClaudeCLIProviderConfig)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)

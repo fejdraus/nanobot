@@ -511,6 +511,28 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_oauth=True,
         supports_max_completion_tokens=True,
     ),
+    ProviderSpec(
+        name="claude_cli",
+        keywords=("claude-cli", "claude_cli"),
+        env_key="",
+        display_name="Claude Code CLI",
+        model_catalog="builtin",
+        builtin_models=(
+            ProviderModelSpec(
+                id="claude_cli/claude-opus-5-5",
+                label="Claude Opus 5.5",
+                description="Opus-class model served through the Claude Code CLI.",
+            ),
+            ProviderModelSpec(
+                id="claude_cli/claude-sonnet-5-5",
+                label="Claude Sonnet 5.5",
+                description="Sonnet-class model served through the Claude Code CLI.",
+            ),
+        ),
+        backend="claude_cli",
+        strip_model_prefix=True,
+        is_oauth=True,
+    ),
     # DeepSeek: OpenAI-compatible at api.deepseek.com
     ProviderSpec(
         name="deepseek",

@@ -45,6 +45,8 @@ the focused guides first and come back here for exact fields and defaults.
 | Configure web search and fetch | [Web Tools](#web-tools) |
 | Enable image generation | [Image Generation](#image-generation) |
 | Add MCP servers | [MCP](#mcp-model-context-protocol) |
+| Run reviews on GitLab MRs | [GitLab Review](#gitlab-review-channel) |
+| Use a Claude subscription as the model | [Claude Code CLI](#claude-cli-provider) |
 | Review shell, workspace, and SSRF controls | [Security](#security) |
 | Control access and pairing | [Pairing](#pairing) |
 | Tune gateway jobs, sessions, and tools | [Gateway Heartbeat](#gateway-heartbeat), [Auto Compact](#auto-compact), [Unified Session](#unified-session), [Tool Hint Max Length](#tool-hint-max-length) |
@@ -311,6 +313,67 @@ Tracing covers the providers that go through nanobot's OpenAI-compatible client 
 | `xai_grok` | LLM (Grok, OAuth) | `nanobot provider login xai-grok --set-main` |
 | `github_copilot` | LLM (GitHub Copilot, OAuth) | `nanobot provider login github-copilot` |
 | `qianfan` | LLM (Baidu Qianfan) | [cloud.baidu.com](https://cloud.baidu.com/doc/qianfan/s/Hmh4suq26) |
+| `claude_cli` | LLM (Claude Code CLI, uses your Claude subscription) | `claude login` |
+
+<a id="claude-cli-provider"></a>
+
+### Claude Code CLI (`claude_cli`)
+
+`claude_cli` runs the Claude Code CLI as a subprocess instead of calling the
+Messages API. Use it when your Claude access is a **subscription**: Anthropic
+requires subscription credentials to be used through Claude Code itself, so
+this provider deliberately reads and forwards no API key.
+
+```json
+{
+  "agents": { "defaults": { "model": "claude_cli/claude-opus-5-5" } },
+  "providers": {
+    "claude_cli": {
+      "cliPath": "claude",
+      "cwd": "C:/src/my-project",
+      "permissionMode": "bypassPermissions",
+      "timeoutS": 3600
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cliPath` | `claude` | CLI executable. A missing binary is reported by name. |
+| `cwd` | agent workspace | Directory the CLI runs in — the repository it works on. |
+| `timeoutS` | `3600` | Per-turn budget. A review turn legitimately runs for minutes. |
+| `allowedTools` | unset | Restricts the CLI's own tools, e.g. `["Read", "Grep", "Bash(git log:*)"]`. |
+| `disallowedTools` | unset | Tools the CLI may not use. |
+| `permissionMode` | unset | Passed to `--permission-mode`, e.g. `bypassPermissions`. |
+| `systemPrompt` | unset | Passed to `--system-prompt`, replacing the CLI's built-in prompt. |
+| `appendSystemPrompt` | unset | Passed to `--append-system-prompt`. |
+| `settingsFile` | unset | Path passed to `--settings`. |
+| `maxTurns` | unset | Caps the CLI's own tool loop with `--max-turns`. |
+| `extraArgs` | unset | Additional raw CLI arguments. |
+
+> [!NOTE]
+> **nanobot's own system prompt is not forwarded.** It describes nanobot's
+> tools, which a `claude -p` turn does not have; the CLI keeps its built-in
+> system prompt for the tools it actually runs. To give the CLI extra
+> instructions, set `appendSystemPrompt` (or replace its prompt with
+> `systemPrompt`).
+
+> [!IMPORTANT]
+> **The CLI owns its own tools.** `claude -p` accepts no caller-supplied tool
+> schema, so nanobot's tools are *not* reachable from an agent turn driven by
+> this provider — it can only use the CLI's own `Read`/`Bash`/`Grep` and any
+> MCP servers configured in Claude Code. An agent that needs `message`, `cron`,
+> or session tools must use a normal API provider instead.
+
+Every turn is a fresh CLI run that receives only the newest user message,
+through stdin. The CLI process gets a filtered environment (`PATH`, `HOME`,
+locale, proxy, `CLAUDE_*`, `ANTHROPIC_*`, `NODE_*` and the like), so other
+secrets the gateway holds never reach the tools the model runs. On a timeout
+or a cancelled turn the whole process group is killed, including tool
+processes and MCP servers the CLI started.
+
+
 
 <details>
 <summary><b>OpenAI</b></summary>
@@ -1668,6 +1731,86 @@ QQ `showCompactionNotices` defaults to `false`. It controls the context-compacti
 
 Telegram `richMessages` defaults to `false`. Enable it only to opt in to Bot API 10.1 `sendRichMessage` rendering; leave it disabled for Telegram Web clients that show unsupported-message errors for rich messages.
 
+<a id="gitlab-review-channel"></a>
+
+### GitLab Review (`gitlab_review`)
+
+Drafts merge-request reviews from GitLab webhooks and publishes them only after
+a human approves them in Telegram. Comments are posted with `gitlabToken`, so
+they appear under that account — a real person — and every guard below runs in
+code, not in the prompt.
+
+```json
+{
+  "channels": {
+    "gitlab_review": {
+      "enabled": true,
+      "webhookSecretToken": "${GITLAB_WEBHOOK_TOKEN}",
+      "port": 3980,
+      "projectPath": "astana-group/astana-motors",
+      "gitlabUrl": "https://gitlab.example.com",
+      "gitlabToken": "${GITLAB_TOKEN}",
+      "reviewerUsernames": ["a.tyra"],
+      "telegramBotToken": "${REVIEW_TELEGRAM_BOT_TOKEN}",
+      "telegramChatId": "49816954"
+    }
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `webhookSecretToken` | — | **Required.** Must match the webhook's *Secret token* in GitLab. |
+| `gitlabUrl`, `gitlabToken` | — | **Required.** Used to read MRs and threads and to publish approved actions. |
+| `reviewerUsernames` | — | **Required.** The reviewer's GitLab usernames. Their notes never wake the bot, which prevents a reply loop. |
+| `telegramBotToken`, `telegramChatId` | — | **Required.** Drafts go to this one chat; approvals are accepted only from it. In a private chat only its owner can approve. |
+| `telegramUserIds` | `[]` | Telegram user ids allowed to approve. **Required** when `telegramChatId` is a group (negative id): there the chat id says nothing about the sender. |
+| `host`, `port`, `webhookPath` | `127.0.0.1`, `3980`, `/gitlab/webhook` | Listener address. Expose it through a reverse proxy or Tailscale Funnel rather than binding to all interfaces. |
+| `projectPath` | `astana-group/astana-motors` | Webhooks from other projects are ignored. |
+| `chatId` | `gitlab-review` | Session prefix; each MR gets `gitlab-review:<iid>`. |
+| `debounceSeconds` | `90` | Quiet period per thread (or MR) before a run, so a reply posted as several notes yields one run. |
+| `maxRunsPerMrPerHour` | `6` | Hard cap on runs per MR; extra events are reported to Telegram and dropped. |
+| `reviewTimeoutS` | `3900` | How long one review may run. After that the agent turn is stopped (`/stop`), and an answer that still arrives is not turned into a draft. |
+
+What starts a run (checked against live GitLab state, after the debounce):
+
+- **MR opened or reopened** — skipped for drafts and for MRs authored by a reviewer.
+- **Note on an open MR** — only in a thread the reviewer started, and only when
+  the note answers the reviewer: it follows a reviewer note (a series of notes by
+  the same person counts as one reply) or mentions the reviewer. A note that
+  answers someone else, or mentions only other people, is ignored.
+- A reviewer mention in someone else's thread, or an MR author's reply right
+  after a third person, is only reported to Telegram — no run.
+
+Runs are processed one at a time, so two reviews never share a repository clone.
+
+The agent runs the `review-gitlab-mrs` skill in **draft mode** and ends with a
+`gitlab-review-actions` block (inline comment, thread reply, general note,
+approve). The prompt never starts with `/`, because nanobot's command router
+would answer it as an unknown command. The channel shows the draft in Telegram
+as `<iid>/<version>`; reply there with:
+
+- `публикуй !<iid>/<version>` — publish everything;
+- `публикуй !<iid>/<version> 1,3` — publish selected items (the rest are dropped);
+- `отмена !<iid>` — drop the draft.
+
+The version may be omitted until a newer draft of the same MR replaces the one
+you were reading; after that a command without it, or with an old one, is
+refused. Publishing is also refused if the MR's head moved since the review. Deliveries are
+de-duplicated by `X-Gitlab-Event-UUID`, so a GitLab retry cannot start a second run.
+
+In GitLab, add the project webhook with **Merge request events** and **Comments**
+enabled, and set *Secret token* to `webhookSecretToken`. Use a separate Telegram
+bot for this channel.
+
+Pair it with the [`claude_cli` provider](#claude-cli-provider) and keep the
+CLI from publishing on its own: list the GitLab write tools in `disallowedTools`
+(for the gitlab MCP server: `mcp__gitlab__gitlab_create_mr_discussion`,
+`mcp__gitlab__gitlab_create_mr_note`, `mcp__gitlab__gitlab_reply_to_mr_discussion`,
+`mcp__gitlab__gitlab_approve_mr`, `mcp__gitlab__gitlab_resolve_thread`,
+`mcp__gitlab__gitlab_merge_mr`, `mcp__gitlab__gitlab_update_mr_note`,
+`mcp__gitlab__gitlab_delete_mr_note`).
+
 ### Retry Behavior
 
 Retry is intentionally simple.
@@ -2097,9 +2240,6 @@ Use `enabledTools` to register only a subset of tools from an MCP server:
 - Set `enabledTools` to a non-empty list of names to register only those tools — resources and prompts are not registered.
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
-
-
-
 
 ## Security
 
