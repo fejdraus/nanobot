@@ -1766,6 +1766,9 @@ code, not in the prompt.
 | `reviewOwnMergeRequests` | `false` | Also review merge requests the reviewer authored. An approval of such an MR is never drafted nor published. |
 | `lessonsDir` | `""` | The reviewer's memory directory. Notes there tagged with `applies_to` / `keywords` that match the MR's changes are put into the prompt. Empty disables it. |
 | `lessonsBudgetChars` | `40000` | How much lesson text goes into one prompt; further matches are listed by name only. |
+| `clickupToken`, `clickupTeamId` | `""` | ClickUp API token and workspace id. Every draft and notice names the MR's task (key from the source branch, title or description) with its ClickUp name and link. |
+| `jiraUrl` | `""` | Base URL for tasks ClickUp does not know (e.g. keys from before a migration): they get a `<jiraUrl>/browse/<KEY>` link without a name. |
+| `taskKeyPattern` | `[A-Z][A-Z0-9]+-\d+` | Regular expression that finds the task key. |
 | `telegramBotToken`, `telegramChatId` | — | **Required.** Drafts go to this one chat; approvals are accepted only from it. In a private chat only its owner can approve. |
 | `telegramUserIds` | `[]` | Telegram user ids allowed to approve. **Required** when `telegramChatId` is a group (negative id): there the chat id says nothing about the sender. |
 | `host`, `port`, `webhookPath` | `127.0.0.1`, `3980`, `/gitlab/webhook` | Listener address. Expose it through a reverse proxy or Tailscale Funnel rather than binding to all interfaces. |

@@ -137,13 +137,22 @@ def parse_reply_command(text: str, iid: int, version: int) -> ApprovalCommand | 
 
 
 def render_draft(
-    iid: int, title: str, draft: ReviewDraft, *, web_url: str = "", version: int = 1
+    iid: int,
+    title: str,
+    draft: ReviewDraft,
+    *,
+    web_url: str = "",
+    version: int = 1,
+    task: str = "",
 ) -> list[str]:
     """Render a draft as Telegram messages, each within the message size limit."""
     ref = f"{iid}/{version}"
-    header = f"!{iid} {title}".strip() + f"\nЧерновик {ref}"
+    header = f"!{iid} {title}".strip()
     if web_url:
         header += f"\n{web_url}"
+    if task:
+        header += f"\n{task}"
+    header += f"\nЧерновик {ref}"
     parts = [header, draft.summary or "(без пояснений)"]
     for number, action in enumerate(draft.actions, start=1):
         text = f"{number}. [{action.label()}]"
@@ -162,8 +171,9 @@ def render_draft(
     return _chunk("\n\n".join(parts))
 
 
-def render_notice(iid: int, title: str, text: str) -> list[str]:
-    return _chunk(f"!{iid} {title}".strip() + "\n\n" + text)
+def render_notice(iid: int, title: str, text: str, *, task: str = "") -> list[str]:
+    header = f"!{iid} {title}".strip() + (f"\n{task}" if task else "")
+    return _chunk(header + "\n\n" + text)
 
 
 def _parse_action(raw: object) -> tuple[ProposedAction | None, str]:

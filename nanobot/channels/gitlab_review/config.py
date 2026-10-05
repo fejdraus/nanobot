@@ -25,6 +25,10 @@ class GitLabReviewConfig(Base):
     ``applies_to``/``keywords`` that match the merge request are put into the
     prompt by code (see :mod:`lessons`).
 
+    Every message names the tracker task of the MR (key from the branch, title
+    or description): name and link from ClickUp when ``clickupToken`` and
+    ``clickupTeamId`` are set, otherwise a link under ``jiraUrl``.
+
     The reviewer never publishes on its own. Drafts go to one Telegram chat;
     only an approval sent from that chat makes the channel post to GitLab, with
     ``gitlabToken``. The comments appear under that token's account, a real
@@ -45,6 +49,10 @@ class GitLabReviewConfig(Base):
     reviewer_usernames: list[str] = Field(default_factory=list)
     review_own_merge_requests: bool = False
     lessons_dir: str = ""
+    clickup_token: str = ""
+    clickup_team_id: str = ""
+    jira_url: str = ""
+    task_key_pattern: str = r"[A-Z][A-Z0-9]+-\d+"
     lessons_budget_chars: int = Field(default=40000, ge=0)
 
     telegram_bot_token: str = ""

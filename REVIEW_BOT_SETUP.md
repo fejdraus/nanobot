@@ -201,6 +201,9 @@ nanobot onboard --config ~/.nanobot-reviewer/config.json --workspace ~/.nanobot-
       "gitlabToken": "${GITLAB_REVIEW_TOKEN}",
       "reviewerUsernames": ["a.tyra"],
       "reviewOwnMergeRequests": true,
+      "clickupToken": "${CLICKUP_TOKEN}",
+      "clickupTeamId": "9015049156",
+      "jiraUrl": "https://boards.banzait.com",
       "lessonsDir": "/home/<USER>/.claude/projects/-home-<USER>-MotorsGit/memory",
       "telegramBotToken": "${REVIEW_TELEGRAM_BOT_TOKEN}",
       "telegramChatId": "49816954",
@@ -258,6 +261,7 @@ CLAUDE_CODE_OAUTH_TOKEN=...          # из claude setup-token
 GITLAB_WEBHOOK_TOKEN=...             # длинная случайная строка: openssl rand -hex 32
 GITLAB_REVIEW_TOKEN=...              # PAT учётки-ревьюера, scope api
 REVIEW_TELEGRAM_BOT_TOKEN=...        # от @BotFather
+CLICKUP_TOKEN=...                    # токен ClickUp (как у MCP clickup) — название и ссылка задачи в черновиках
 ```
 
 ```bash

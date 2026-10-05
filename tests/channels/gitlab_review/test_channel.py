@@ -59,6 +59,8 @@ class FakeGitLab:
             "state": "opened",
             "draft": False,
             "author": {"username": "author"},
+            "source_branch": "AMCRM-16127",
+            "description": "Closes AMCRM-16127",
             "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": SHA},
         }
         self.discussions: dict[str, list[dict[str, Any]]] = {}
@@ -125,12 +127,27 @@ class FakeTelegram:
         return "\n".join(text for _, text in self.sent)
 
 
+class FakeTasks:
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    async def lookup(self, key: str) -> Any:
+        from nanobot.channels.gitlab_review.tasks import TaskInfo
+
+        self.asked.append(key)
+        return TaskInfo(key, "Доработать интеграцию", f"https://app.clickup.com/t/{key}")
+
+    async def aclose(self) -> None:
+        return None
+
+
 class Harness:
     def __init__(self, tmp_path: Path, **overrides: Any) -> None:
         self.bus = MessageBus()
         self.inbound: list[InboundMessage] = []
         self.gitlab = FakeGitLab()
         self.telegram = FakeTelegram()
+        self.tasks = FakeTasks()
         self.port = _free_port()
 
         async def capture(message: InboundMessage) -> None:
@@ -143,6 +160,7 @@ class Harness:
             state_path=tmp_path / "state.sqlite3",
             gitlab_api=self.gitlab,  # type: ignore[arg-type]
             telegram_api=self.telegram,  # type: ignore[arg-type]
+            task_lookup=self.tasks,  # type: ignore[arg-type]
         )
 
     async def __aenter__(self) -> "Harness":
@@ -582,4 +600,20 @@ async def test_short_command_without_reply_gets_a_hint(tmp_path: Path) -> None:
         await h.channel.handle_telegram(_tg(1, "публикуй"))
     assert h.gitlab.writes == []
     assert "Ответьте на сообщение черновика" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_draft_names_the_task(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_timeout_s=0.5) as h:
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
+        await _until(lambda: len(h.inbound) == 1)
+        await h.channel.send(
+            OutboundMessage(channel="gitlab_review", chat_id="gitlab-review:42",
+                            content=f"S\n\n```{ACTIONS_FENCE}\n{{\"actions\": []}}\n```")
+        )
+        await task
+    text = h.telegram.text()
+    assert "Задача: AMCRM-16127 — Доработать интеграцию" in text
+    assert "https://app.clickup.com/t/AMCRM-16127" in text
+    assert h.tasks.asked == ["AMCRM-16127"]
 

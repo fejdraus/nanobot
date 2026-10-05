@@ -49,6 +49,7 @@ from nanobot.channels.gitlab_review.proposals import (
     render_notice,
 )
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore
+from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_key
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
 from nanobot.channels.gitlab_review.triage import triage_thread
 from nanobot.config.paths import get_runtime_subdir
@@ -81,6 +82,7 @@ class _PendingRun:
     title: str
     web_url: str
     own: bool = False
+    task: str = ""
 
 
 @dataclass
@@ -93,6 +95,8 @@ class _MergeRequestInfo:
     open: bool
     draft: bool
     diff_refs: dict[str, Any] = field(default_factory=dict)
+    source_branch: str = ""
+    description: str = ""
 
 
 class GitLabReviewChannel(BaseChannel):
@@ -109,6 +113,7 @@ class GitLabReviewChannel(BaseChannel):
         state_path: Path | None = None,
         gitlab_api: GitLabApi | None = None,
         telegram_api: TelegramApi | None = None,
+        task_lookup: TaskLookup | None = None,
     ) -> None:
         if isinstance(config, dict):
             config = GitLabReviewConfig.model_validate(config)
@@ -119,6 +124,7 @@ class GitLabReviewChannel(BaseChannel):
         )
         self._gitlab = gitlab_api
         self._telegram = telegram_api
+        self._task_lookup = task_lookup
         self._server: _ReusableThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -137,6 +143,12 @@ class GitLabReviewChannel(BaseChannel):
             )
         if self._telegram is None:
             self._telegram = TelegramApi(self.config.telegram_bot_token)
+        if self._task_lookup is None:
+            self._task_lookup = TaskLookup(
+                clickup_token=self.config.clickup_token,
+                clickup_team_id=self.config.clickup_team_id,
+                jira_url=self.config.jira_url,
+            )
         try:
             self._server = _ReusableThreadingHTTPServer(
                 (self.config.host, self.config.port), self._make_handler()
@@ -186,7 +198,7 @@ class GitLabReviewChannel(BaseChannel):
         self._loop = None
 
     async def _close_clients(self) -> None:
-        for client in (self._gitlab, self._telegram):
+        for client in (self._gitlab, self._telegram, self._task_lookup):
             if client is not None:
                 await client.aclose()
 
@@ -226,7 +238,14 @@ class GitLabReviewChannel(BaseChannel):
         else:
             self._state.delete_draft(iid)
         message_ids = await self._tell(
-            render_draft(iid, pending.title, draft, web_url=pending.web_url, version=version)
+            render_draft(
+                iid,
+                pending.title,
+                draft,
+                web_url=pending.web_url,
+                version=version,
+                task=pending.task,
+            )
         )
         if draft.actions and message_ids:
             self._state.record_draft_messages(iid, version, message_ids)
@@ -353,7 +372,7 @@ class GitLabReviewChannel(BaseChannel):
                     f"{decision.reason}.\nТред {candidate.discussion_id}, "
                     f"{decision.note_author}:\n{decision.note_body}"
                 )
-                await self._tell(render_notice(info.iid, info.title, text))
+                await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
                 return
             prompt = reply_prompt(
                 info.iid,
@@ -373,6 +392,19 @@ class GitLabReviewChannel(BaseChannel):
             )
             return
         await self._run_agent(info, prompt, own=own)
+
+    async def _task_line(self, info: _MergeRequestInfo) -> str:
+        """«Задача: KEY — name» and its link, or nothing when the MR names no task."""
+        key = find_task_key(
+            self.config.task_key_pattern, info.source_branch, info.title, info.description
+        )
+        if key is None or self._task_lookup is None:
+            return ""
+        try:
+            return (await self._task_lookup.lookup(key)).line()
+        except Exception:
+            self.logger.exception("MR !{}: task lookup failed", info.iid)
+            return f"Задача: {key}"
 
     async def _lessons_for(self, iid: int) -> str:
         """Lessons matching this MR's changes; never blocks a review on failure."""
@@ -409,7 +441,7 @@ class GitLabReviewChannel(BaseChannel):
         assert self._loop is not None
         future: asyncio.Future[None] = self._loop.create_future()
         self._pending[info.iid] = _PendingRun(
-            future, info.head_sha, info.title, info.web_url, own=own
+            future, info.head_sha, info.title, info.web_url, own=own, task=await self._task_line(info)
         )
         try:
             await self.bus.publish_inbound(
@@ -605,6 +637,8 @@ class GitLabReviewChannel(BaseChannel):
             open=mr.get("state") == "opened",
             draft=is_draft(mr),
             diff_refs=cast("dict[str, Any]", refs) if isinstance(refs, dict) else {},
+            source_branch=str(mr.get("source_branch") or ""),
+            description=str(mr.get("description") or ""),
         )
 
     async def _tell(self, chunks: list[str]) -> list[int]:
