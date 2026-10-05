@@ -59,8 +59,8 @@ class FakeGitLab:
             "state": "opened",
             "draft": False,
             "author": {"username": "author"},
-            "source_branch": "AMCRM-16127",
-            "description": "Closes AMCRM-16127",
+            "source_branch": "AMCRM-99999",
+            "description": "Closes AMCRM-16127, AMCRM-16130",
             "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": SHA},
         }
         self.discussions: dict[str, list[dict[str, Any]]] = {}
@@ -615,5 +615,6 @@ async def test_draft_names_the_task(tmp_path: Path) -> None:
     text = h.telegram.text()
     assert "Задача: AMCRM-16127 — Доработать интеграцию" in text
     assert "https://app.clickup.com/t/AMCRM-16127" in text
-    assert h.tasks.asked == ["AMCRM-16127"]
+    assert h.tasks.asked == ["AMCRM-16127", "AMCRM-16130"]
+    assert "AMCRM-99999" not in text
 

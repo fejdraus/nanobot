@@ -49,7 +49,7 @@ from nanobot.channels.gitlab_review.proposals import (
     render_notice,
 )
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore
-from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_key
+from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
 from nanobot.channels.gitlab_review.triage import triage_thread
 from nanobot.config.paths import get_runtime_subdir
@@ -60,6 +60,7 @@ TELEGRAM_OFFSET_KEY = "telegram_offset"
 POLL_RETRY_S = 5.0
 SOCKET_TIMEOUT_S = 30.0
 STOP_COMMAND = "/stop"
+MAX_TASKS = 5
 
 
 class GitLabWebhookError(ValueError):
@@ -95,7 +96,6 @@ class _MergeRequestInfo:
     open: bool
     draft: bool
     diff_refs: dict[str, Any] = field(default_factory=dict)
-    source_branch: str = ""
     description: str = ""
 
 
@@ -394,17 +394,18 @@ class GitLabReviewChannel(BaseChannel):
         await self._run_agent(info, prompt, own=own)
 
     async def _task_line(self, info: _MergeRequestInfo) -> str:
-        """«Задача: KEY — name» and its link, or nothing when the MR names no task."""
-        key = find_task_key(
-            self.config.task_key_pattern, info.source_branch, info.title, info.description
-        )
-        if key is None or self._task_lookup is None:
+        """«Задача: KEY — name» with a link per task the MR names, or nothing."""
+        keys = find_task_keys(self.config.task_key_pattern, info.title, info.description)
+        if not keys or self._task_lookup is None:
             return ""
-        try:
-            return (await self._task_lookup.lookup(key)).line()
-        except Exception:
-            self.logger.exception("MR !{}: task lookup failed", info.iid)
-            return f"Задача: {key}"
+        lines: list[str] = []
+        for key in keys[:MAX_TASKS]:
+            try:
+                lines.append((await self._task_lookup.lookup(key)).line())
+            except Exception:
+                self.logger.exception("MR !{}: lookup of {} failed", info.iid, key)
+                lines.append(f"Задача: {key}")
+        return "\n".join(lines)
 
     async def _lessons_for(self, iid: int) -> str:
         """Lessons matching this MR's changes; never blocks a review on failure."""
@@ -637,7 +638,6 @@ class GitLabReviewChannel(BaseChannel):
             open=mr.get("state") == "opened",
             draft=is_draft(mr),
             diff_refs=cast("dict[str, Any]", refs) if isinstance(refs, dict) else {},
-            source_branch=str(mr.get("source_branch") or ""),
             description=str(mr.get("description") or ""),
         )
 

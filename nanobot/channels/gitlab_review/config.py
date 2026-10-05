@@ -25,8 +25,8 @@ class GitLabReviewConfig(Base):
     ``applies_to``/``keywords`` that match the merge request are put into the
     prompt by code (see :mod:`lessons`).
 
-    Every message names the tracker task of the MR (key from the branch, title
-    or description): name and link from ClickUp when ``clickupToken`` and
+    Every message names the tracker tasks of the MR (keys from its title and
+    description): name and link from ClickUp when ``clickupToken`` and
     ``clickupTeamId`` are set, otherwise a link under ``jiraUrl``.
 
     The reviewer never publishes on its own. Drafts go to one Telegram chat;

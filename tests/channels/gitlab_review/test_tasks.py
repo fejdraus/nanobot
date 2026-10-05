@@ -1,14 +1,15 @@
 import httpx
 import pytest
 
-from nanobot.channels.gitlab_review.tasks import TaskInfo, TaskLookup, find_task_key
+from nanobot.channels.gitlab_review.tasks import TaskInfo, TaskLookup, find_task_keys
 
 
-def test_key_is_found_in_branch_then_title_then_description() -> None:
-    assert find_task_key("", "AMCRM-16127", "feat: #AMCRM-1", "") == "AMCRM-16127"
-    assert find_task_key("", "feature/no-key", "feat: #AMCRM-16127 thing", "") == "AMCRM-16127"
-    assert find_task_key("", "", "fix typo", "Closes AMCRM-14421") == "AMCRM-14421"
-    assert find_task_key("", "main", "fix typo", "") is None
+def test_keys_come_from_title_then_description_without_repeats() -> None:
+    assert find_task_keys("", "feat: #AMCRM-16127 thing", "Closes AMCRM-16127") == ["AMCRM-16127"]
+    assert find_task_keys("", "fix: AMCRM-1 and AMCRM-2", "Closes AMCRM-3, AMCRM-1") == [
+        "AMCRM-1", "AMCRM-2", "AMCRM-3",
+    ]
+    assert find_task_keys("", "fix typo", "") == []
 
 
 def _lookup(handler, **kwargs) -> tuple[TaskLookup, list[httpx.Request]]:

@@ -1,6 +1,8 @@
 """The tracker task behind a merge request: its key, name and link.
 
-The key is taken from the MR's source branch, title or description. ClickUp is
+Keys are taken from the MR's title and description, not from the source
+branch: a branch can carry commits of several tasks, while the title and the
+description name the tasks the MR is for. ClickUp is
 asked first by custom task id; a key ClickUp does not know is treated as a task
 that stayed in Jira and gets a Jira link without a name. Any failure leaves the
 task out rather than holding up a review.
@@ -31,13 +33,15 @@ class TaskInfo:
         return f"{head}\n{self.url}" if self.url else head
 
 
-def find_task_key(pattern: str, *texts: str) -> str | None:
+def find_task_keys(pattern: str, *texts: str) -> list[str]:
+    """Every distinct task key in *texts*, in order of first mention."""
     regex = re.compile(pattern or DEFAULT_KEY_PATTERN)
+    keys: list[str] = []
     for text in texts:
-        match = regex.search(text or "")
-        if match:
-            return match.group(0)
-    return None
+        for match in regex.finditer(text or ""):
+            if match.group(0) not in keys:
+                keys.append(match.group(0))
+    return keys
 
 
 class TaskLookup:
