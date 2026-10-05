@@ -2,6 +2,9 @@
 
 Reads what triage needs (merge request, thread history, author) and performs
 only the writes a human approved in Telegram.
+
+Requests carry their own ``User-Agent``: a Cloudflare rule in front of the
+GitLab instance blocks the default ``python-httpx`` agent with 403.
 """
 from __future__ import annotations
 
@@ -9,6 +12,8 @@ from typing import Any, cast
 from urllib.parse import quote
 
 import httpx
+
+USER_AGENT = "nanobot-gitlab-review"
 
 
 class GitLabApiError(RuntimeError):
@@ -30,7 +35,11 @@ class GitLabApi:
         self._project = quote(project_path, safe="")
         self._client = client or httpx.AsyncClient(
             base_url=f"{base_url.rstrip('/')}/api/v4",
-            headers={"PRIVATE-TOKEN": token, "Accept": "application/json"},
+            headers={
+                "PRIVATE-TOKEN": token,
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             timeout=timeout_s,
         )
         self._owns_client = client is None

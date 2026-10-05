@@ -78,3 +78,13 @@ def test_validation_reports_missing_settings() -> None:
     result = validate({"webhookSecretToken": "tok"}, None)  # type: ignore[arg-type]
 
     assert "gitlabToken" in str(result)
+
+
+def test_gitlab_client_sends_its_own_user_agent() -> None:
+    """The default python-httpx agent is blocked by Cloudflare in front of GitLab."""
+    from nanobot.channels.gitlab_review.gitlab_api import USER_AGENT, GitLabApi
+
+    api = GitLabApi("https://gitlab.example.com", "glpat", "group/project")
+    headers = api._client.headers  # pyright: ignore[reportPrivateUsage]
+    assert headers["User-Agent"] == USER_AGENT
+    assert "python-httpx" not in headers["User-Agent"]
