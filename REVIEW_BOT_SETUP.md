@@ -201,6 +201,7 @@ nanobot onboard --config ~/.nanobot-reviewer/config.json --workspace ~/.nanobot-
       "gitlabToken": "${GITLAB_REVIEW_TOKEN}",
       "reviewerUsernames": ["a.tyra"],
       "reviewOwnMergeRequests": true,
+      "lessonsDir": "/home/<USER>/.claude/projects/-home-<USER>-MotorsGit/memory",
       "telegramBotToken": "${REVIEW_TELEGRAM_BOT_TOKEN}",
       "telegramChatId": "49816954",
       "telegramUserIds": ["49816954"],

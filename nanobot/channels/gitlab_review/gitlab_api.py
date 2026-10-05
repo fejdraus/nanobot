@@ -61,6 +61,28 @@ class GitLabApi:
             f"/projects/{self._project}/merge_requests/{iid}/discussions/{quote(discussion_id, safe='')}"
         )
 
+    async def get_changes(self, iid: int, max_pages: int = 10) -> list[dict[str, Any]]:
+        """Changed files of a merge request with their diffs, page by page."""
+        changes: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            response = await self._client.get(
+                f"/projects/{self._project}/merge_requests/{iid}/diffs",
+                params={"per_page": 100, "page": page},
+            )
+            if response.status_code >= 400:
+                raise GitLabApiError(
+                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
+                )
+            data: object = response.json()
+            if not isinstance(data, list):
+                raise GitLabApiError("GitLab returned a non-list diff response")
+            items = [cast("dict[str, Any]", item) for item in cast("list[object]", data)
+                     if isinstance(item, dict)]
+            changes.extend(items)
+            if len(items) < 100:
+                break
+        return changes
+
     async def create_discussion(
         self, iid: int, body: str, position: dict[str, Any]
     ) -> dict[str, Any]:

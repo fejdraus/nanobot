@@ -39,15 +39,18 @@ _OWN_MR = (
 )
 
 
-def review_prompt(iid: int, *, own: bool = False) -> str:
+def review_prompt(iid: int, *, own: bool = False, lessons: str = "") -> str:
     own_note = f"{_OWN_MR}\n\n" if own else ""
+    lessons_note = f"{lessons}\n\n" if lessons else ""
     return (
         f"Выполни скилл review-gitlab-mrs для merge request !{iid}.\n\n"
-        f"Открыт merge request !{iid}. Проведи ревью.\n\n{own_note}{_DRAFT_RULES}"
+        f"Открыт merge request !{iid}. Проведи ревью.\n\n{own_note}{lessons_note}{_DRAFT_RULES}"
     )
 
 
-def reply_prompt(iid: int, discussion_id: str, note_author: str | None, note_body: str) -> str:
+def reply_prompt(
+    iid: int, discussion_id: str, note_author: str | None, note_body: str, *, lessons: str = ""
+) -> str:
     quoted = "\n".join(f"> {line}" for line in (note_body or "").splitlines()) or "> (пусто)"
     return (
         f"Выполни скилл review-gitlab-mrs для merge request !{iid}.\n\n"
@@ -55,5 +58,5 @@ def reply_prompt(iid: int, discussion_id: str, note_author: str | None, note_bod
         f"{note_author or 'участник'} ответил:\n{quoted}\n\n"
         "Работай только с этим тредом: проверь ответ по коду и задаче (шаг 9), "
         "реши, нужен ли ответ в тред, и можно ли предложить аппрув (шаг 8). "
-        f"Другие треды не трогай.\n\n{_DRAFT_RULES}"
+        f"Другие треды не трогай.\n\n{lessons + chr(10) * 2 if lessons else ''}{_DRAFT_RULES}"
     )

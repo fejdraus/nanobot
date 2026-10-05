@@ -1764,6 +1764,8 @@ code, not in the prompt.
 | `gitlabUrl`, `gitlabToken` | — | **Required.** Used to read MRs and threads and to publish approved actions. |
 | `reviewerUsernames` | — | **Required.** The reviewer's GitLab usernames. Their notes never wake the bot, which prevents a reply loop. |
 | `reviewOwnMergeRequests` | `false` | Also review merge requests the reviewer authored. An approval of such an MR is never drafted nor published. |
+| `lessonsDir` | `""` | The reviewer's memory directory. Notes there tagged with `applies_to` / `keywords` that match the MR's changes are put into the prompt. Empty disables it. |
+| `lessonsBudgetChars` | `40000` | How much lesson text goes into one prompt; further matches are listed by name only. |
 | `telegramBotToken`, `telegramChatId` | — | **Required.** Drafts go to this one chat; approvals are accepted only from it. In a private chat only its owner can approve. |
 | `telegramUserIds` | `[]` | Telegram user ids allowed to approve. **Required** when `telegramChatId` is a group (negative id): there the chat id says nothing about the sender. |
 | `host`, `port`, `webhookPath` | `127.0.0.1`, `3980`, `/gitlab/webhook` | Listener address. Expose it through a reverse proxy or Tailscale Funnel rather than binding to all interfaces. |
@@ -1798,7 +1800,22 @@ as `<iid>/<version>`; reply there with:
 
 The version may be omitted until a newer draft of the same MR replaces the one
 you were reading; after that a command without it, or with an old one, is
-refused. Publishing is also refused if the MR's head moved since the review. Deliveries are
+refused. Publishing is also refused if the MR's head moved since the review.
+
+**Lessons by changed code.** A memory note can carry two front-matter tags, both
+inline JSON lists:
+
+```yaml
+applies_to: ["Pkg/AMLead/**", "**/*.cs"]
+keywords: ["EntitySchemaQuery", "loadColumnsFromServer"]
+```
+
+Before each run the channel fetches the MR's changed files (`/merge_requests/:iid/diffs`),
+matches `applies_to` globs against their paths (`**` crosses directories, `*` does not) and
+`keywords` against the changed lines (case-insensitive, at least four characters), and puts
+the matching notes into the prompt, best matches first, within `lessonsBudgetChars`. The
+selection is made in code so a lesson about the code under review is never missed because
+the model did not open it. If fetching the diff fails, the review runs without lessons. Deliveries are
 de-duplicated by `X-Gitlab-Event-UUID`, so a GitLab retry cannot start a second run.
 
 In GitLab, add the project webhook with **Merge request events** and **Comments**

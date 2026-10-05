@@ -21,6 +21,10 @@ class GitLabReviewConfig(Base):
     ``reviewOwnMergeRequests`` also reviews merge requests the reviewer
     authored; approving them is never proposed or published.
 
+    ``lessonsDir`` points at the reviewer's memory notes; lessons tagged with
+    ``applies_to``/``keywords`` that match the merge request are put into the
+    prompt by code (see :mod:`lessons`).
+
     The reviewer never publishes on its own. Drafts go to one Telegram chat;
     only an approval sent from that chat makes the channel post to GitLab, with
     ``gitlabToken``. The comments appear under that token's account, a real
@@ -40,6 +44,8 @@ class GitLabReviewConfig(Base):
     gitlab_token: str = ""
     reviewer_usernames: list[str] = Field(default_factory=list)
     review_own_merge_requests: bool = False
+    lessons_dir: str = ""
+    lessons_budget_chars: int = Field(default=40000, ge=0)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

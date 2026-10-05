@@ -17,6 +17,8 @@ SETUP_SPEC = ChannelSetupSpec(
         "gitlabToken": field("secret"),
         "reviewerUsernames": field("list"),
         "reviewOwnMergeRequests": field("bool", default=False),
+        "lessonsDir": field(),
+        "lessonsBudgetChars": field("int", default=40000),
         "telegramBotToken": field("secret"),
         "telegramChatId": field(),
         "telegramUserIds": field("list"),

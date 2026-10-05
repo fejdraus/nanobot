@@ -64,9 +64,22 @@ class FakeGitLab:
         self.discussions: dict[str, list[dict[str, Any]]] = {}
         self.writes: list[tuple[str, Any]] = []
         self.fail_writes = False
+        self.fail_changes = False
+        self.changes: list[dict[str, Any]] = [
+            {
+                "new_path": "Pkg/AMLead/Schemas/LeadPage/LeadPage.js",
+                "old_path": "Pkg/AMLead/Schemas/LeadPage/LeadPage.js",
+                "diff": '@@ -1 +1 @@\n-old\n+this.set("X", 1, {silent: true});',
+            },
+        ]
 
     async def get_merge_request(self, iid: int) -> dict[str, Any]:
         return dict(self.mr, iid=iid)
+
+    async def get_changes(self, iid: int) -> list[dict[str, Any]]:
+        if self.fail_changes:
+            raise GitLabApiError("diffs down", 502)
+        return self.changes
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
         return {"id": discussion_id, "notes": self.discussions.get(discussion_id, [])}
@@ -488,3 +501,36 @@ async def test_approval_of_own_mr_is_never_drafted_or_published(tmp_path: Path) 
         await h.channel.handle_telegram(_tg(1, "публикуй !42/9"))
     assert ("approve", SHA) not in h.gitlab.writes
     assert "это ваш MR" in h.telegram.text()
+
+
+def _write_lessons(directory: Path) -> None:
+    directory.mkdir()
+    for name, glob, body in (
+        ("lead.md", "Pkg/AMLead/**", "Урок про лиды."),
+        ("cs.md", "**/*.cs", "Урок про C#."),
+    ):
+        (directory / name).write_text(
+            f'---\nname: {name}\ndescription: "x"\napplies_to: ["{glob}"]\nkeywords: []\n---\n\n{body}\n',
+            encoding="utf-8",
+        )
+
+
+@pytest.mark.asyncio
+async def test_matching_lessons_go_into_the_review_prompt(tmp_path: Path) -> None:
+    _write_lessons(tmp_path / "memory")
+    async with Harness(tmp_path, lessons_dir=str(tmp_path / "memory"), review_timeout_s=0.05) as h:
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    prompt = h.inbound[0].content
+    assert "Урок про лиды." in prompt
+    assert "Урок про C#." not in prompt
+
+
+@pytest.mark.asyncio
+async def test_lesson_failure_does_not_block_the_review(tmp_path: Path) -> None:
+    _write_lessons(tmp_path / "memory")
+    async with Harness(tmp_path, lessons_dir=str(tmp_path / "memory"), review_timeout_s=0.05) as h:
+        h.gitlab.fail_changes = True
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    assert "review-gitlab-mrs" in h.inbound[0].content
+    assert "Уроки из памяти" not in h.inbound[0].content
+

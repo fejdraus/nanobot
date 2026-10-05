@@ -1,0 +1,159 @@
+"""Pick the reviewer's lessons that concern the files a merge request changes.
+
+A lesson is a memory note whose front matter may carry two tags, both inline
+JSON lists so that plain YAML readers keep working:
+
+- ``applies_to``: path globs relative to the repository root (``**`` crosses
+  directories, ``*`` does not), matched against the changed file paths;
+- ``keywords``: terms matched case-insensitively against the changed lines.
+
+The selection is made here, in code, rather than left to the model: a lesson
+about the code under review must reach the prompt even when the model would not
+think of opening it.
+"""
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+
+from loguru import logger
+
+INDEX_FILES = frozenset({"MEMORY.md"})
+INDEX_PREFIX = "topic_"
+_FIELD_RE = re.compile(r"^(applies_to|keywords|description):\s*(.*)$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class Lesson:
+    name: str
+    description: str
+    applies_to: tuple[str, ...]
+    keywords: tuple[str, ...]
+    body: str
+
+
+@dataclass(frozen=True)
+class MatchedLesson:
+    lesson: Lesson
+    reasons: tuple[str, ...]
+
+
+def load_lessons(directory: Path) -> list[Lesson]:
+    """Read every tagged note in *directory*; notes without tags are skipped."""
+    lessons: list[Lesson] = []
+    for path in sorted(directory.glob("*.md")):
+        if path.name in INDEX_FILES or path.name.startswith(INDEX_PREFIX):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("lessons: cannot read {}: {}", path.name, exc)
+            continue
+        lesson = parse_lesson(path.name, text)
+        if lesson is not None and (lesson.applies_to or lesson.keywords):
+            lessons.append(lesson)
+    return lessons
+
+
+def parse_lesson(name: str, text: str) -> Lesson | None:
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None
+    head, body = text[3:end], text[end + 4:].strip()
+    fields = {match.group(1): match.group(2).strip() for match in _FIELD_RE.finditer(head)}
+    return Lesson(
+        name=name,
+        description=fields.get("description", "").strip().strip('"'),
+        applies_to=_string_list(fields.get("applies_to")),
+        keywords=tuple(k for k in _string_list(fields.get("keywords")) if len(k) >= 4),
+        body=body,
+    )
+
+
+def select_lessons(
+    lessons: Iterable[Lesson], changed_paths: Iterable[str], diff_text: str
+) -> list[MatchedLesson]:
+    """Lessons whose globs match a changed path or whose keywords occur in the diff."""
+    paths = [p.lstrip("/") for p in changed_paths if p]
+    haystack = diff_text.casefold()
+    matched: list[MatchedLesson] = []
+    for lesson in lessons:
+        reasons: list[str] = []
+        for pattern in lesson.applies_to:
+            regex = glob_to_regex(pattern)
+            hit = next((p for p in paths if regex.fullmatch(p)), None)
+            if hit is not None:
+                reasons.append(f"{pattern} ← {hit}")
+        reasons.extend(f"«{k}» в диффе" for k in lesson.keywords if k.casefold() in haystack)
+        if reasons:
+            matched.append(MatchedLesson(lesson, tuple(reasons)))
+    matched.sort(key=lambda m: -len(m.reasons))
+    return matched
+
+
+def render_lessons(matched: list[MatchedLesson], budget_chars: int) -> str:
+    """Prompt block: full text of the best matches within the budget, pointers to the rest."""
+    if not matched:
+        return ""
+    parts = [
+        "Уроки из памяти ревью, относящиеся к изменённому коду (подобраны по файлам и диффу MR). "
+        "Учти их при ревью; полные заметки лежат в памяти под теми же именами."
+    ]
+    used = len(parts[0])
+    pointers: list[str] = []
+    for item in matched:
+        block = (
+            f"\n### {item.lesson.name}\nПочему: {'; '.join(item.reasons[:3])}\n"
+            f"{item.lesson.body}"
+        )
+        if used + len(block) <= budget_chars:
+            parts.append(block)
+            used += len(block)
+        else:
+            pointers.append(f"- {item.lesson.name} — {item.lesson.description}")
+    if pointers:
+        parts.append("\nЕщё подходят (прочитай нужные сам):\n" + "\n".join(pointers))
+    return "\n".join(parts)
+
+
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """``**`` spans directories, ``*`` and ``?`` stay within one path segment."""
+    out: list[str] = []
+    i = 0
+    text = pattern.lstrip("/")
+    while i < len(text):
+        if text.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif text.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif text[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif text[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(text[i]))
+            i += 1
+    return re.compile("".join(out), re.IGNORECASE)
+
+
+def _string_list(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    try:
+        value: object = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(value, list):
+        return ()
+    items = cast("list[object]", value)
+    return tuple(str(item).strip() for item in items if isinstance(item, str) and item.strip())

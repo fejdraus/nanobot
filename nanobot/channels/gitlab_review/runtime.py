@@ -36,6 +36,7 @@ from nanobot.channels.base import BaseChannel
 from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate, is_draft, parse_event
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApi, GitLabApiError
+from nanobot.channels.gitlab_review.lessons import load_lessons, render_lessons, select_lessons
 from nanobot.channels.gitlab_review.prompts import reply_prompt, review_prompt
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
@@ -331,7 +332,7 @@ class GitLabReviewChannel(BaseChannel):
         if candidate.kind == "merge_request":
             if own and not self.config.review_own_merge_requests:
                 return
-            prompt = review_prompt(info.iid, own=own)
+            prompt = review_prompt(info.iid, own=own, lessons=await self._lessons_for(info.iid))
         else:
             assert self._gitlab is not None and candidate.discussion_id
             discussion = await self._gitlab.get_discussion(info.iid, candidate.discussion_id)
@@ -352,7 +353,11 @@ class GitLabReviewChannel(BaseChannel):
                 await self._tell(render_notice(info.iid, info.title, text))
                 return
             prompt = reply_prompt(
-                info.iid, candidate.discussion_id, decision.note_author, decision.note_body
+                info.iid,
+                candidate.discussion_id,
+                decision.note_author,
+                decision.note_body,
+                lessons=await self._lessons_for(info.iid),
             )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):
@@ -365,6 +370,37 @@ class GitLabReviewChannel(BaseChannel):
             )
             return
         await self._run_agent(info, prompt, own=own)
+
+    async def _lessons_for(self, iid: int) -> str:
+        """Lessons matching this MR's changes; never blocks a review on failure."""
+        directory = self.config.lessons_dir.strip()
+        if not directory or self.config.lessons_budget_chars <= 0:
+            return ""
+        assert self._gitlab is not None
+        try:
+            lessons = await asyncio.to_thread(load_lessons, Path(directory).expanduser())
+            if not lessons:
+                return ""
+            changes = await self._gitlab.get_changes(iid)
+            paths = {
+                str(change.get(key) or "")
+                for change in changes
+                for key in ("new_path", "old_path")
+            }
+            diff_text = "\n".join(
+                line[1:]
+                for change in changes
+                for line in str(change.get("diff") or "").splitlines()
+                if line[:1] in "+-" and not line.startswith(("+++", "---"))
+            )
+            matched = select_lessons(lessons, paths, diff_text)
+        except Exception:
+            self.logger.exception("MR !{}: lesson selection failed, reviewing without it", iid)
+            return ""
+        self.logger.info(
+            "MR !{}: {} of {} tagged lessons match", iid, len(matched), len(lessons)
+        )
+        return render_lessons(matched, self.config.lessons_budget_chars)
 
     async def _run_agent(self, info: _MergeRequestInfo, prompt: str, *, own: bool = False) -> None:
         assert self._loop is not None
