@@ -1792,7 +1792,9 @@ The agent runs the `review-gitlab-mrs` skill in **draft mode** and ends with a
 `gitlab-review-actions` block (inline comment, thread reply, general note,
 approve). The prompt never starts with `/`, because nanobot's command router
 would answer it as an unknown command. The channel shows the draft in Telegram
-as `<iid>/<version>`; reply there with:
+as `<iid>/<version>`. The simplest way to answer is to reply to the draft message itself with
+`публикуй`, `публикуй 1,3` or `отмена` — the reply names exactly that draft and version, so
+several drafts can wait in the chat and be answered in any order. Full commands work too:
 
 - `публикуй !<iid>/<version>` — publish everything;
 - `публикуй !<iid>/<version> 1,3` — publish selected items (the rest are dropped);

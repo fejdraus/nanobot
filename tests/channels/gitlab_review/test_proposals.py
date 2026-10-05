@@ -103,7 +103,8 @@ def test_render_draft_numbers_actions_and_explains_commands() -> None:
     assert "1. [общий комментарий]" in text
     assert "2. [аппрув MR]" in text
     assert "Черновик 6260/2" in text
-    assert "публикуй !6260/2 1,3" in text
+    assert "публикуй !6260/2" in text
+    assert "«публикуй 1,3»" in text
 
 
 def test_render_draft_splits_long_messages() -> None:

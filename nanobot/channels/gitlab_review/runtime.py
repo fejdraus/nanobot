@@ -44,6 +44,7 @@ from nanobot.channels.gitlab_review.proposals import (
     ReviewDraft,
     parse_command,
     parse_draft,
+    parse_reply_command,
     render_draft,
     render_notice,
 )
@@ -224,9 +225,11 @@ class GitLabReviewChannel(BaseChannel):
             self._state.save_draft(iid, pending.head_sha, draft.actions, version)
         else:
             self._state.delete_draft(iid)
-        await self._tell(
+        message_ids = await self._tell(
             render_draft(iid, pending.title, draft, web_url=pending.web_url, version=version)
         )
+        if draft.actions and message_ids:
+            self._state.record_draft_messages(iid, version, message_ids)
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         channel = self
@@ -471,12 +474,27 @@ class GitLabReviewChannel(BaseChannel):
         """Act on a message from the approver; ignore every other chat and sender."""
         if not self.config.is_approver(message.chat_id, message.sender_id):
             return
-        command = parse_command(message.text)
+        command = None
+        if message.reply_to is not None:
+            ref = self._state.draft_for_message(message.reply_to)
+            if ref is not None:
+                command = parse_reply_command(message.text, *ref)
         if command is None:
-            await self._tell(
-                ["Команды: «публикуй !N/V», «публикуй !N/V 1,3», «отмена !N»."]
-            )
+            command = parse_command(message.text)
+        if command is None:
+            await self._tell([
+                "Ответьте на сообщение черновика: «публикуй», «публикуй 1,3» или «отмена». "
+                "Или командой: «публикуй !N/V», «публикуй !N/V 1,3», «отмена !N»."
+            ])
             return
+        if not command.publish and command.version is not None:
+            stored = self._state.load_draft(command.iid)
+            if stored is not None and stored.version != command.version:
+                await self._tell([
+                    f"!{command.iid}: черновик {command.iid}/{command.version} уже заменён, "
+                    f"актуальный — !{command.iid}/{stored.version}. Ничего не отменено."
+                ])
+                return
         if not command.publish:
             self._state.delete_draft(command.iid)
             await self._tell([f"!{command.iid}: черновик отменён, ничего не опубликовано."])
@@ -589,10 +607,14 @@ class GitLabReviewChannel(BaseChannel):
             diff_refs=cast("dict[str, Any]", refs) if isinstance(refs, dict) else {},
         )
 
-    async def _tell(self, chunks: list[str]) -> None:
+    async def _tell(self, chunks: list[str]) -> list[int]:
         assert self._telegram is not None
+        message_ids: list[int] = []
         for chunk in chunks:
-            await self._telegram.send_message(str(self.config.telegram_chat_id), chunk)
+            message_id = await self._telegram.send_message(str(self.config.telegram_chat_id), chunk)
+            if message_id is not None:
+                message_ids.append(message_id)
+        return message_ids
 
     async def _tell_safe(self, chunks: list[str]) -> None:
         try:

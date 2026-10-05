@@ -22,6 +22,7 @@ from typing import NamedTuple
 from nanobot.channels.gitlab_review.proposals import ProposedAction
 
 DELIVERY_RETENTION = timedelta(days=14)
+DRAFT_MESSAGE_RETENTION = timedelta(days=30)
 
 
 class StoredDraft(NamedTuple):
@@ -63,6 +64,12 @@ class GitLabReviewStateStore:
                     created_at TEXT NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
                     replaced INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS draft_messages (
+                    message_id INTEGER PRIMARY KEY,
+                    mr_iid INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS draft_versions (
                     mr_iid INTEGER PRIMARY KEY,
@@ -119,6 +126,27 @@ class GitLabReviewStateStore:
                 (iid, moment.isoformat()),
             )
             return True
+
+    def record_draft_messages(self, iid: int, version: int, message_ids: list[int]) -> None:
+        """Remember which Telegram messages show this draft, so a reply can name it."""
+        moment = datetime.now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM draft_messages WHERE created_at < ?",
+                ((moment - DRAFT_MESSAGE_RETENTION).isoformat(),),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO draft_messages (message_id, mr_iid, version, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                [(mid, iid, version, moment.isoformat()) for mid in message_ids],
+            )
+
+    def draft_for_message(self, message_id: int) -> tuple[int, int] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT mr_iid, version FROM draft_messages WHERE message_id = ?", (message_id,)
+            ).fetchone()
+        return (int(row[0]), int(row[1])) if row else None
 
     def next_draft_version(self, iid: int) -> int:
         """Reserve the version number of the next draft of this MR."""

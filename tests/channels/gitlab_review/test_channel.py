@@ -110,8 +110,9 @@ class FakeTelegram:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
-    async def send_message(self, chat_id: str, text: str) -> None:
+    async def send_message(self, chat_id: str, text: str) -> int:
         self.sent.append((chat_id, text))
+        return 1000 + len(self.sent)
 
     async def get_updates(self, offset: int | None, timeout_s: int = 30) -> list[TelegramMessage]:
         await asyncio.sleep(3600)
@@ -170,8 +171,10 @@ class Harness:
         self.channel._pending.pop(iid, None)
 
 
-def _tg(update_id: int, text: str, *, chat: str = CHAT, sender: str = CHAT) -> TelegramMessage:
-    return TelegramMessage(update_id, chat, text, sender)
+def _tg(
+    update_id: int, text: str, *, chat: str = CHAT, sender: str = CHAT, reply_to: int | None = None
+) -> TelegramMessage:
+    return TelegramMessage(update_id, chat, text, sender, reply_to)
 
 
 def _post(
@@ -253,6 +256,7 @@ async def test_opened_mr_runs_one_review_and_drafts_go_to_telegram(tmp_path: Pat
         await h.answer(42, [{"type": "note", "body": "замечание"}])
 
         assert "замечание" in h.telegram.text()
+        assert "Ответьте на это сообщение" in h.telegram.text()
         assert "публикуй !42/1" in h.telegram.text()
         assert h.gitlab.writes == []
 
@@ -533,4 +537,49 @@ async def test_lesson_failure_does_not_block_the_review(tmp_path: Path) -> None:
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     assert "review-gitlab-mrs" in h.inbound[0].content
     assert "Уроки из памяти" not in h.inbound[0].content
+
+
+@pytest.mark.asyncio
+async def test_reply_to_draft_publishes_that_draft(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "first"}, {"type": "note", "body": "second"}])
+        draft_message = 1000 + len(h.telegram.sent)
+        await h.answer(43, [{"type": "note", "body": "other mr"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй 2", reply_to=draft_message))
+        await h.channel.handle_telegram(_tg(2, "публикуй 1,3", reply_to=draft_message))
+    assert h.gitlab.writes == [("note", "second")]
+    assert "нет черновика для публикации" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_reply_to_replaced_draft_is_refused(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "old"}])
+        old_message = 1000 + len(h.telegram.sent)
+        await h.answer(42, [{"type": "note", "body": "new"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй", reply_to=old_message))
+        await h.channel.handle_telegram(_tg(2, "отмена", reply_to=old_message))
+    assert h.gitlab.writes == []
+    assert "уже заменён" in h.telegram.text()
+    assert "Ничего не отменено" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_reply_cancel_drops_the_draft(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "general"}])
+        message = 1000 + len(h.telegram.sent)
+        await h.channel.handle_telegram(_tg(1, "отмена", reply_to=message))
+        await h.channel.handle_telegram(_tg(2, "публикуй !42"))
+    assert h.gitlab.writes == []
+    assert "черновик отменён" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_short_command_without_reply_gets_a_hint(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "general"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй"))
+    assert h.gitlab.writes == []
+    assert "Ответьте на сообщение черновика" in h.telegram.text()
 

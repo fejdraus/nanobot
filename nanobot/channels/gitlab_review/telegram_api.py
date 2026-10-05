@@ -22,6 +22,7 @@ class TelegramMessage:
     chat_id: str
     text: str
     sender_id: str = ""
+    reply_to: int | None = None
 
 
 class TelegramApi:
@@ -41,12 +42,15 @@ class TelegramApi:
         if self._owns_client:
             await self._client.aclose()
 
-    async def send_message(self, chat_id: str, text: str) -> None:
+    async def send_message(self, chat_id: str, text: str) -> int | None:
+        """Send *text*; return the Telegram message id so replies can be traced back."""
         response = await self._client.post(
             "/sendMessage",
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
         )
-        self._result(response)
+        result = self._result(response)
+        message_id = cast("dict[str, Any]", result).get("message_id") if isinstance(result, dict) else None
+        return message_id if isinstance(message_id, int) else None
 
     async def get_updates(self, offset: int | None, timeout_s: int = 30) -> list[TelegramMessage]:
         params: dict[str, Any] = {"timeout": timeout_s, "allowed_updates": '["message"]'}
@@ -73,12 +77,17 @@ class TelegramApi:
             sender_id: object = (
                 cast("dict[str, Any]", sender).get("id") if isinstance(sender, dict) else None
             )
+            replied = message.get("reply_to_message")
+            reply_to: object = (
+                cast("dict[str, Any]", replied).get("message_id") if isinstance(replied, dict) else None
+            )
             messages.append(
                 TelegramMessage(
                     update_id=update_id,
                     chat_id=str(chat_id) if chat_id is not None else "",
                     text=text if isinstance(text, str) else "",
                     sender_id=str(sender_id) if sender_id is not None else "",
+                    reply_to=reply_to if isinstance(reply_to, int) else None,
                 )
             )
         return messages

@@ -28,6 +28,11 @@ _COMMAND_RE = re.compile(
     r"(?:/(?P<version>\d+))?(?P<items>(?:[\s,]+\d+)*)\s*$",
     re.IGNORECASE,
 )
+_REPLY_RE = re.compile(
+    r"^\s*/?(?P<verb>публикуй|опубликуй|publish|отмена|отмени|cancel)"
+    r"(?P<items>(?:[\s,]+\d+)*)\s*$",
+    re.IGNORECASE,
+)
 _PUBLISH_VERBS = frozenset({"публикуй", "опубликуй", "publish"})
 
 
@@ -117,6 +122,20 @@ def parse_command(text: str) -> ApprovalCommand | None:
     )
 
 
+def parse_reply_command(text: str, iid: int, version: int) -> ApprovalCommand | None:
+    """Recognise «публикуй», «публикуй 1,3», «отмена» sent as a reply to a draft message."""
+    match = _REPLY_RE.match(text or "")
+    if match is None:
+        return None
+    items = tuple(int(item) for item in re.findall(r"\d+", match.group("items") or ""))
+    return ApprovalCommand(
+        publish=match.group("verb").casefold() in _PUBLISH_VERBS,
+        iid=iid,
+        items=items,
+        version=version,
+    )
+
+
 def render_draft(
     iid: int, title: str, draft: ReviewDraft, *, web_url: str = "", version: int = 1
 ) -> list[str]:
@@ -135,8 +154,8 @@ def render_draft(
         parts.append("Не разобрано:\n" + "\n".join(draft.errors))
     if draft.actions:
         parts.append(
-            f"Ответьте: «публикуй !{ref}» (всё), «публикуй !{ref} 1,3» (выборочно) "
-            f"или «отмена !{iid}»."
+            "Ответьте на это сообщение: «публикуй» (всё), «публикуй 1,3» (выборочно) или «отмена». "
+            f"Или командой: «публикуй !{ref}»."
         )
     else:
         parts.append("Публиковать нечего.")
