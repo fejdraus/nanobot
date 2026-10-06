@@ -804,3 +804,55 @@ async def test_slash_message_is_talked_about_like_any_other(tmp_path: Path) -> N
     assert not turn.content.startswith("/")
     assert "> /start" in turn.content
     assert h.telegram.sent[-1][1] == "Я ревьюер."
+
+
+def _people(body: str) -> str:
+    return f"\n\n```gitlab-review-people\n{body}\n```"
+
+
+@pytest.mark.asyncio
+async def test_review_files_notes_about_the_author_and_uses_them_next_time(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    async with Harness(tmp_path, people_dir=str(people)) as h:
+        first = await h.review(42, [{"type": "note", "body": "a"}])
+        assert "Писать можно только о: author" in first.content
+        before = len(h.inbound)
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
+        await _until(lambda: len(h.inbound) > before)
+        await h.reply_as_agent(
+            "gitlab-review:42",
+            _answer("S", [])
+            + _people('{"people": [{"username": "author", "notes": ["не сбрасывает флаги"]},'
+                      ' {"username": "stranger", "notes": ["что-то"]}]}'),
+        )
+        await task
+        await h.channel.handle_telegram(_tg(1, "отмена !42"))
+        third = await h.review(42, [])
+    profile = (people / "author.md").read_text(encoding="utf-8")
+    assert "!42: не сбрасывает флаги" in profile
+    assert not (people / "stranger.md").exists()
+    assert "Запомнил о разработчиках:\n- author: не сбрасывает флаги" in h.telegram.text()
+    assert "### author" in third.content and "не сбрасывает флаги" in third.content
+    assert "Ревьюировано его MR: 1" in third.content
+    assert "```gitlab-review-people" not in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_human_can_ask_to_remember_a_mentioned_developer(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    async with Harness(tmp_path, people_dir=str(people)) as h:
+        await h.review(42, [{"type": "note", "body": "a"}])
+        turn = await h.say(1, "запомни: @i.petrov просит пример кода к замечанию")
+        assert "i.petrov" in turn.content and "author" in turn.content
+        await h.reply_as_agent(
+            "gitlab-review:42",
+            "Запомнил." + _people('{"people": [{"username": "i.petrov", "notes": ["просит пример кода"]}]}'),
+        )
+    assert "!42: просит пример кода" in (people / "i.petrov.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_without_a_people_directory_nothing_is_asked_or_filed(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        review = await h.review(42, [])
+    assert "gitlab-review-people" not in review.content

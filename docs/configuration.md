@@ -1837,6 +1837,21 @@ task key brings the matching archive entries into the prompt; for anything
 else the agent searches the archive directory, so add it to `allowedTools`
 (`Read(<runtime>/gitlab_review/archive/**)`).
 
+**Developer profiles.** With `lessonsDir` set (or `peopleDir` explicitly), the
+agent may end a review, a thread reply or a conversation with a
+`gitlab-review-people` block of observations about the developers involved:
+recurring mistakes and habits in their code, the modules they know, how they
+take a remark and what helps them understand one. The channel files them in
+`<lessonsDir>/people/<username>.md`, one dated line per observation tied to its
+MR, and puts the profile of the MR author (and of whoever answered in a
+thread), with review counts computed from the archive, into the next prompt
+about them, within `peopleBudgetChars` (default 6000). Code-side guards: only
+the people of the work at hand (the MR author, the thread's participant, or a
+user `@mentioned` by the approver) can be written about, at most five notes
+per person per run, and notes judging character are refused. Every filed note
+is echoed to Telegram. Profiles adapt how the reviewer talks, not how strictly
+it reviews.
+
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:
 

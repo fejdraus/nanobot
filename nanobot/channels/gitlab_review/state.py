@@ -48,6 +48,7 @@ class ReviewRecord(NamedTuple):
     head_sha: str
     started_at: str
     status: str
+    author: str = ""
 
 
 class ReviewEvent(NamedTuple):
@@ -57,7 +58,7 @@ class ReviewEvent(NamedTuple):
 
 
 _REVIEW_COLUMNS = (
-    "id, mr_iid, title, web_url, task_keys, kind, session_id, head_sha, started_at, status"
+    "id, mr_iid, title, web_url, task_keys, kind, session_id, head_sha, started_at, status, author"
 )
 
 
@@ -142,6 +143,11 @@ class GitLabReviewStateStore:
                 conn.execute(
                     "ALTER TABLE review_drafts ADD COLUMN replaced INTEGER NOT NULL DEFAULT 0"
                 )
+            review_columns = {row[1] for row in conn.execute("PRAGMA table_info(reviews)")}
+            if "author" not in review_columns:
+                conn.execute("ALTER TABLE reviews ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+            if "published" not in review_columns:
+                conn.execute("ALTER TABLE reviews ADD COLUMN published INTEGER NOT NULL DEFAULT 0")
 
     def claim(self, delivery_key: str, iid: int) -> bool:
         """Record a delivery; return ``False`` when it was already claimed."""
@@ -262,14 +268,15 @@ class GitLabReviewStateStore:
         kind: str,
         session_id: str,
         head_sha: str,
+        author: str = "",
     ) -> ReviewRecord:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO reviews (mr_iid, title, web_url, task_keys, kind, session_id, "
-                "head_sha, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "head_sha, started_at, status, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     iid, title, web_url, " ".join(task_keys), kind, session_id, head_sha,
-                    datetime.now().isoformat(timespec="seconds"), "в работе",
+                    datetime.now().isoformat(timespec="seconds"), "в работе", author,
                 ),
             )
             review_id = int(cursor.lastrowid or 0)
@@ -314,6 +321,24 @@ class GitLabReviewStateStore:
                 (*params, limit),
             ).fetchall()
         return [_record(row) for row in rows]
+
+    def add_published(self, review_id: int, count: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE reviews SET published = published + ? WHERE id = ?", (count, review_id)
+            )
+
+    def author_stats(self, username: str) -> str:
+        """How often this developer's MRs were reviewed and commented on, counted in code."""
+        with self._lock, self._connect() as conn:
+            reviewed, published = conn.execute(
+                "SELECT COUNT(DISTINCT mr_iid), COALESCE(SUM(published), 0) FROM reviews "
+                "WHERE kind != 'chat' AND author = ? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+        if not reviewed:
+            return ""
+        return f"Ревьюировано его MR: {reviewed}, опубликовано замечаний: {published}."
 
     def set_review_status(self, review_id: int, status: str) -> None:
         with self._lock, self._connect() as conn:
@@ -363,6 +388,8 @@ class GitLabReviewStateStore:
         lines.append("")
         if record.task_keys:
             lines.append(f"- Задачи: {', '.join(record.task_keys)}")
+        if record.author:
+            lines.append(f"- Автор MR: {record.author}")
         lines += [
             f"- Вид: {record.kind}",
             f"- Начато: {record.started_at}",
@@ -396,7 +423,7 @@ class GitLabReviewStateStore:
 
 
 def _record(row: tuple[object, ...]) -> ReviewRecord:
-    review_id, iid, title, web_url, keys, kind, session_id, head_sha, started_at, status = row
+    review_id, iid, title, web_url, keys, kind, session_id, head_sha, started_at, status, author = row
     return ReviewRecord(
         id=int(str(review_id)),
         iid=int(str(iid)) if iid is not None else None,
@@ -408,4 +435,5 @@ def _record(row: tuple[object, ...]) -> ReviewRecord:
         head_sha=str(head_sha),
         started_at=str(started_at),
         status=str(status),
+        author=str(author or ""),
     )

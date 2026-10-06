@@ -23,6 +23,9 @@ Flow:
    publication, which the channel performs only if the human's own words ask
    for it. Every review, draft, decision and message is kept in an archive the
    agent can consult when asked about an earlier review.
+7. The agent may also note what it learned about the developers involved;
+   :mod:`people` files it per GitLab username and the profile comes back in the
+   next prompt about that person.
 """
 
 from __future__ import annotations
@@ -47,6 +50,13 @@ from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate, is_draft, parse_event
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApi, GitLabApiError
 from nanobot.channels.gitlab_review.lessons import load_lessons, render_lessons, select_lessons
+from nanobot.channels.gitlab_review.people import (
+    PeopleStore,
+    PersonNote,
+    accept_notes,
+    extract_people,
+    mentioned_usernames,
+)
 from nanobot.channels.gitlab_review.prompts import chat_prompt, reply_prompt, review_prompt
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
@@ -108,6 +118,7 @@ class _PendingRun:
     review_id: int | None = None
     iid: int | None = None
     user_text: str = ""
+    authors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +168,8 @@ class GitLabReviewChannel(BaseChannel):
         self._gitlab = gitlab_api
         self._telegram = telegram_api
         self._task_lookup = task_lookup
+        people_path = self.config.people_path()
+        self._people = PeopleStore(Path(people_path).expanduser()) if people_path else None
         self._server: _ReusableThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -241,6 +254,7 @@ class GitLabReviewChannel(BaseChannel):
         if not msg.content.strip():
             return
         pending = self._pending.get(msg.chat_id)
+        notes, content = extract_people(msg.content)
         if pending is None:
             iid = self.config.iid_from_chat_id(msg.chat_id)
             if iid is None:
@@ -254,14 +268,57 @@ class GitLabReviewChannel(BaseChannel):
             return
         try:
             if pending.kind == "chat":
-                await self._deliver_chat(msg.content, pending)
+                await self._deliver_chat(content, pending)
             else:
                 iid = pending.iid if pending.iid is not None else self.config.iid_from_chat_id(msg.chat_id)
                 assert iid is not None
-                await self._deliver_draft(iid, msg.content, pending)
+                await self._deliver_draft(iid, content, pending)
+            await self._file_people(notes, pending)
         finally:
             if not pending.future.done():
                 pending.future.set_result(None)
+
+    async def _file_people(self, notes: list[PersonNote], pending: _PendingRun) -> None:
+        """File what the agent noted about the developers of this work, after the guards."""
+        if self._people is None or not notes:
+            return
+        kept, refused = accept_notes(notes, pending.authors)
+        if refused:
+            self.logger.warning("people notes refused: {}", "; ".join(refused))
+        if not kept:
+            return
+        try:
+            written = await asyncio.to_thread(self._people.append, kept, iid=pending.iid)
+        except OSError:
+            self.logger.exception("people notes could not be written")
+            return
+        summary = "Запомнил о разработчиках:\n" + "\n".join(
+            f"- {note.username}: {note.text}" for note in kept
+        )
+        self.logger.info("people: {} notes filed", written)
+        if pending.review_id is not None:
+            self._state.add_event(pending.review_id, "система", summary)
+        message_ids = await self._tell_safe_ids(summary)
+        if pending.review_id is not None:
+            self._state.record_review_messages(pending.review_id, message_ids)
+
+    async def _tell_safe_ids(self, text: str) -> list[int]:
+        try:
+            return await self._tell([text])
+        except Exception:
+            self.logger.exception("Telegram notification failed")
+            return []
+
+    def _people_for(self, usernames: list[str]) -> str:
+        """Profiles of *usernames* for a prompt; never blocks a run on failure."""
+        if self._people is None or not usernames:
+            return ""
+        try:
+            stats = {name: self._state.author_stats(name) for name in usernames}
+            return self._people.render(usernames, self.config.people_budget_chars, stats)
+        except Exception:
+            self.logger.exception("people profiles unavailable, continuing without them")
+            return ""
 
     async def _deliver_draft(self, iid: int, answer: str, pending: _PendingRun) -> None:
         draft = parse_draft(answer)
@@ -405,10 +462,17 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         own = self.config.is_reviewer(info.author)
+        authors = [info.author] if info.author and self._people is not None else []
         if candidate.kind == "merge_request":
             if own and not self.config.review_own_merge_requests:
                 return
-            prompt = review_prompt(info.iid, own=own, lessons=await self._lessons_for(info.iid))
+            prompt = review_prompt(
+                info.iid,
+                own=own,
+                lessons=await self._lessons_for(info.iid),
+                people=self._people_for(authors),
+                authors=authors,
+            )
         else:
             assert self._gitlab is not None and candidate.discussion_id
             discussion = await self._gitlab.get_discussion(info.iid, candidate.discussion_id)
@@ -428,12 +492,17 @@ class GitLabReviewChannel(BaseChannel):
                 )
                 await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
                 return
+            authors = list(dict.fromkeys(name for name in (decision.note_author, info.author) if name))
+            if self._people is None:
+                authors = []
             prompt = reply_prompt(
                 info.iid,
                 candidate.discussion_id,
                 decision.note_author,
                 decision.note_body,
                 lessons=await self._lessons_for(info.iid),
+                people=self._people_for(authors),
+                authors=authors,
             )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):
@@ -446,7 +515,11 @@ class GitLabReviewChannel(BaseChannel):
             )
             return
         await self._run_agent(
-            info, prompt, own=own, kind="review" if candidate.kind == "merge_request" else "thread"
+            info,
+            prompt,
+            own=own,
+            kind="review" if candidate.kind == "merge_request" else "thread",
+            authors=authors,
         )
 
     async def _task_line(self, info: _MergeRequestInfo) -> str:
@@ -495,7 +568,13 @@ class GitLabReviewChannel(BaseChannel):
         return render_lessons(matched, self.config.lessons_budget_chars)
 
     async def _run_agent(
-        self, info: _MergeRequestInfo, prompt: str, *, own: bool = False, kind: str = "review"
+        self,
+        info: _MergeRequestInfo,
+        prompt: str,
+        *,
+        own: bool = False,
+        kind: str = "review",
+        authors: list[str] | None = None,
     ) -> None:
         """Run one review in a Claude session of its own."""
         assert self._loop is not None
@@ -507,6 +586,7 @@ class GitLabReviewChannel(BaseChannel):
             kind=kind,
             session_id=str(uuid.uuid4()),
             head_sha=info.head_sha,
+            author=info.author or "",
         )
         pending = _PendingRun(
             self._loop.create_future(),
@@ -517,6 +597,7 @@ class GitLabReviewChannel(BaseChannel):
             task=await self._task_line(info),
             review_id=record.id,
             iid=info.iid,
+            authors=tuple(authors or ()),
         )
         finished = await self._ask_agent(
             self.config.review_chat_id(info.iid), prompt, pending, session=record.session_id
@@ -732,6 +813,10 @@ class GitLabReviewChannel(BaseChannel):
                 head_sha="",
             )
         self._state.add_event(target.id, "вы", request.text)
+        named: list[str] = [target.author] if target.author else []
+        authors = list(dict.fromkeys([*named, *mentioned_usernames(request.text)]))
+        if self._people is None:
+            authors = []
         prompt = chat_prompt(
             request.text,
             target=self._describe_review(target) if target.iid is not None else "",
@@ -741,6 +826,8 @@ class GitLabReviewChannel(BaseChannel):
                 self._state.render_review(review)[:ARCHIVE_ENTRY_CHARS] for review in archive
             ],
             archive_dir=str(self._state.archive_dir),
+            people=self._people_for(authors),
+            authors=authors,
         )
         pending = _PendingRun(
             self._loop.create_future(),
@@ -751,6 +838,7 @@ class GitLabReviewChannel(BaseChannel):
             review_id=target.id,
             iid=target.iid,
             user_text=request.text,
+            authors=tuple(authors),
         )
         chat_id = (
             self.config.review_chat_id(target.iid)
@@ -779,6 +867,7 @@ class GitLabReviewChannel(BaseChannel):
             kind="review",
             session_id=str(uuid.uuid4()),
             head_sha=stored.head_sha if stored is not None else info.head_sha,
+            author=info.author or "",
         )
 
     def _describe_review(self, review: ReviewRecord) -> str:
@@ -877,6 +966,7 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         report: list[str] = []
+        published = 0
         for number, action in selected:
             if action.type == "approve" and self.config.is_reviewer(info.author):
                 report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
@@ -886,6 +976,7 @@ class GitLabReviewChannel(BaseChannel):
             except GitLabApiError as exc:
                 report.append(f"{number}. {action.label()}: ошибка — {exc}")
             else:
+                published += 1
                 report.append(f"{number}. {action.label()}: опубликовано")
         self._state.delete_draft(command.iid)
         if len(selected) < len(actions):
@@ -894,6 +985,7 @@ class GitLabReviewChannel(BaseChannel):
         review = self._state.latest_review(command.iid)
         if review is not None:
             self._state.add_event(review.id, "система", summary)
+            self._state.add_published(review.id, published)
             self._state.set_review_status(review.id, f"опубликовано (черновик {current})")
         message_ids = await self._tell([summary])
         if review is not None:

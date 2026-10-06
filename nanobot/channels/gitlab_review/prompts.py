@@ -9,6 +9,7 @@ an unknown slash command and answer it without running the model.
 """
 from __future__ import annotations
 
+from nanobot.channels.gitlab_review.people import PEOPLE_FENCE
 from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, DECISION_FENCE
 
 _DRAFT_RULES = f"""\
@@ -39,17 +40,46 @@ _OWN_MR = (
 )
 
 
-def review_prompt(iid: int, *, own: bool = False, lessons: str = "") -> str:
+def people_rules(usernames: list[str]) -> str:
+    """How to record observations about the developers of this work, or nothing."""
+    names = [name for name in usernames if name]
+    if not names:
+        return ""
+    return (
+        "Если в этой работе ты заметил о разработчике то, что поможет обсуждать с ним дальше, "
+        f"добавь в конце ещё один блок:\n\n```{PEOPLE_FENCE}\n"
+        '{"people": [{"username": "<логин GitLab>", "notes": ["наблюдение одной фразой"]}]}\n```\n\n'
+        f"Писать можно только о: {', '.join(names)}. Записывай факты из этой работы: повторяющиеся "
+        "ошибки и привычки в коде, сильные стороны и модули, как он принимает замечания и что "
+        "помогает ему понять (пример кода, ссылка на правило, коротко или подробно). Не записывай "
+        "оценки характера, ярлыки, личное вне работы и догадки. Повторять уже известное из профиля "
+        "не нужно. Записать нечего — блок не выводи."
+    )
+
+
+def review_prompt(
+    iid: int, *, own: bool = False, lessons: str = "", people: str = "", authors: list[str] | None = None
+) -> str:
     own_note = f"{_OWN_MR}\n\n" if own else ""
     lessons_note = f"{lessons}\n\n" if lessons else ""
+    people_note = f"{people}\n\n" if people else ""
+    rules = people_rules(authors or [])
     return (
         f"Выполни скилл review-gitlab-mrs для merge request !{iid}.\n\n"
-        f"Открыт merge request !{iid}. Проведи ревью.\n\n{own_note}{lessons_note}{_DRAFT_RULES}"
+        f"Открыт merge request !{iid}. Проведи ревью.\n\n{own_note}{lessons_note}{people_note}"
+        f"{_DRAFT_RULES}" + (f"\n\n{rules}" if rules else "")
     )
 
 
 def reply_prompt(
-    iid: int, discussion_id: str, note_author: str | None, note_body: str, *, lessons: str = ""
+    iid: int,
+    discussion_id: str,
+    note_author: str | None,
+    note_body: str,
+    *,
+    lessons: str = "",
+    people: str = "",
+    authors: list[str] | None = None,
 ) -> str:
     quoted = "\n".join(f"> {line}" for line in (note_body or "").splitlines()) or "> (пусто)"
     return (
@@ -58,7 +88,9 @@ def reply_prompt(
         f"{note_author or 'участник'} ответил:\n{quoted}\n\n"
         "Работай только с этим тредом: проверь ответ по коду и задаче (шаг 9), "
         "реши, нужен ли ответ в тред, и можно ли предложить аппрув (шаг 8). "
-        f"Другие треды не трогай.\n\n{lessons + chr(10) * 2 if lessons else ''}{_DRAFT_RULES}"
+        f"Другие треды не трогай.\n\n{lessons + chr(10) * 2 if lessons else ''}"
+        f"{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
+        + (f"\n\n{people_rules(authors or [])}" if people_rules(authors or []) else "")
     )
 
 
@@ -89,6 +121,8 @@ def chat_prompt(
     pending: list[str] | None = None,
     archive: list[str] | None = None,
     archive_dir: str = "",
+    people: str = "",
+    authors: list[str] | None = None,
 ) -> str:
     """One message of the approver's conversation with the reviewer.
 
@@ -113,7 +147,14 @@ def chat_prompt(
             "ревью, которого здесь нет, найди его там (Grep по номеру задачи, MR или теме). "
             "Протокол сессии каждого ревью — ~/.claude/projects/*/<Сессия Claude>.jsonl."
         )
+    if people:
+        parts.append(people)
     quoted = "\n".join(f"> {line}" for line in (text or "").splitlines()) or "> (пусто)"
     parts.append(f"Сообщение человека:\n{quoted}")
     parts.append(_CHAT_RULES)
+    rules = people_rules(authors or [])
+    if rules:
+        parts.append(
+            rules + " Если человек сам просит запомнить что-то о разработчике — запиши это так же."
+        )
     return "\n\n".join(parts)

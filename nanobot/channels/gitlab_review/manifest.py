@@ -23,6 +23,8 @@ SETUP_SPEC = ChannelSetupSpec(
         "jiraUrl": field(),
         "taskKeyPattern": field(default="[A-Z][A-Z0-9]+-\\d+"),
         "lessonsBudgetChars": field("int", default=40000),
+        "peopleDir": field(),
+        "peopleBudgetChars": field("int", default=6000),
         "telegramBotToken": field("secret"),
         "telegramChatId": field(),
         "telegramUserIds": field("list"),

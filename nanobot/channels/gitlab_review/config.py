@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field, field_validator, model_validator
 
 from nanobot.config_base import Base
@@ -54,6 +56,8 @@ class GitLabReviewConfig(Base):
     jira_url: str = ""
     task_key_pattern: str = r"[A-Z][A-Z0-9]+-\d+"
     lessons_budget_chars: int = Field(default=40000, ge=0)
+    people_dir: str = ""
+    people_budget_chars: int = Field(default=6000, ge=0)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -144,6 +148,14 @@ class GitLabReviewConfig(Base):
         if sender_id in self.telegram_user_ids:
             return True
         return not chat.startswith("-") and sender_id == chat
+
+    def people_path(self) -> str:
+        """Where developer profiles live: ``peopleDir``, else ``people/`` under ``lessonsDir``."""
+        if self.people_dir.strip():
+            return self.people_dir.strip()
+        if self.lessons_dir.strip():
+            return str(Path(self.lessons_dir.strip()).expanduser() / "people")
+        return ""
 
     def is_reviewer(self, username: str | None) -> bool:
         if not username:
