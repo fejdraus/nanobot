@@ -38,7 +38,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -60,6 +60,7 @@ from nanobot.channels.gitlab_review.people import (
 from nanobot.channels.gitlab_review.prompts import chat_prompt, reply_prompt, review_prompt
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
+    ChatAnswer,
     ProposedAction,
     ReviewDraft,
     parse_bare_command,
@@ -91,6 +92,7 @@ ARCHIVE_LIMIT = 5
 ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
+CONTINUE_WINDOW = timedelta(hours=12)
 
 
 class GitLabWebhookError(ValueError):
@@ -790,8 +792,10 @@ class GitLabReviewChannel(BaseChannel):
         if target is None and request.reply_to is not None:
             ref = self._state.draft_for_message(request.reply_to)
             iid = ref[0] if ref is not None else None
-        elif target is None and len(drafts) == 1:
-            iid = drafts[0][0]
+        elif target is None:
+            target = self._state.latest_active_review(datetime.now() - CONTINUE_WINDOW)
+            if target is None and len(drafts) == 1:
+                iid = drafts[0][0]
         if target is None and iid is not None:
             target = self._state.latest_review(iid)
         archive = [
@@ -891,6 +895,37 @@ class GitLabReviewChannel(BaseChannel):
             lines.append(f"{number}. [{action.label()}] {action.body}".rstrip())
         return "\n".join(lines)
 
+    async def _bind_draft(self, iid: int | None, pending: _PendingRun) -> bool:
+        """Find the MR a draft from a conversation belongs to; say so when there is none."""
+        if pending.iid is not None:
+            if iid is None or iid == pending.iid:
+                return True
+            await self._tell([
+                f"Черновик назван для !{iid}, а разговор о !{pending.iid}. Не сохранён — уточните MR."
+            ])
+            return False
+        if iid is None:
+            await self._tell([
+                "Предложенные действия не сохранены: не указан MR. Напишите, к какому MR они относятся."
+            ])
+            return False
+        info = await self._merge_request(iid)
+        if pending.review_id is not None:
+            self._state.bind_review(
+                pending.review_id,
+                iid=iid,
+                title=info.title,
+                web_url=info.web_url,
+                head_sha=info.head_sha,
+                author=info.author or "",
+            )
+        pending.iid = iid
+        pending.head_sha = info.head_sha
+        pending.title = info.title
+        pending.web_url = info.web_url
+        pending.task = await self._task_line(info)
+        return True
+
     async def _deliver_chat(self, answer: str, pending: _PendingRun) -> None:
         """Show the agent's reply; turn a revised draft or a decision into action."""
         parsed = parse_chat_answer(answer, pending.iid)
@@ -899,6 +934,8 @@ class GitLabReviewChannel(BaseChannel):
             self._state.record_review_messages(pending.review_id, message_ids)
             self._state.add_event(pending.review_id, "ревьюер", parsed.text)
 
+        if parsed.draft is not None and not await self._bind_draft(parsed.draft_iid, pending):
+            parsed = ChatAnswer(parsed.text, None, parsed.decision)
         if parsed.draft is not None and pending.iid is not None:
             if parsed.draft.actions:
                 await self._send_draft(

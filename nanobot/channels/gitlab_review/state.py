@@ -340,6 +340,28 @@ class GitLabReviewStateStore:
             return ""
         return f"Ревьюировано его MR: {reviewed}, опубликовано замечаний: {published}."
 
+    def latest_active_review(self, since: datetime) -> ReviewRecord | None:
+        """The review or conversation with the most recent message after *since*."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT review_id FROM review_events WHERE at >= ? ORDER BY rowid DESC LIMIT 1",
+                (since.isoformat(timespec="seconds"),),
+            ).fetchone()
+        return self.get_review(int(row[0])) if row else None
+
+    def bind_review(
+        self, review_id: int, *, iid: int, title: str, web_url: str, head_sha: str, author: str
+    ) -> ReviewRecord | None:
+        """Tie a conversation that started without an MR to the MR it turned out to be about."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE reviews SET mr_iid = ?, title = ?, web_url = ?, head_sha = ?, author = ?, "
+                "kind = 'conversation' WHERE id = ? AND mr_iid IS NULL",
+                (iid, title, web_url, head_sha, author, review_id),
+            )
+        self._export_id(review_id)
+        return self.get_review(review_id)
+
     def set_review_status(self, review_id: int, status: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("UPDATE reviews SET status = ? WHERE id = ?", (status, review_id))

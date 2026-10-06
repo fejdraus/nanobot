@@ -878,3 +878,45 @@ async def test_excluded_developer_is_never_profiled(tmp_path: Path) -> None:
     assert "новое" not in (people / "author.md").read_text(encoding="utf-8")
     assert "Запомнил" not in h.telegram.text()
 
+
+@pytest.mark.asyncio
+async def test_plain_message_continues_the_latest_conversation(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        first = await h.say(1, "есть ещё MR без ревью?")
+        await h.reply_as_agent(first.chat_id, "Разобрать ответ в !42?")
+        second = await h.say(2, "Да")
+        await h.reply_as_agent(second.chat_id, "Разобрал.")
+    assert second.chat_id == first.chat_id
+    assert second.metadata["claude_cli"] == {
+        "session_id": first.metadata["claude_cli"]["session_id"], "resume": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_draft_from_a_conversation_names_its_mr_and_can_be_published(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        turn = await h.say(1, "разбери ответ в треде !42")
+        await h.reply_as_agent(
+            turn.chat_id,
+            "Предлагаю ответить так:\n\n```gitlab-review-actions\n"
+            '{"iid": 42, "actions": [{"type": "reply", "discussion_id": "d1", "body": "Принято"}]}\n```',
+        )
+        assert "Черновик 42/1" in h.telegram.text()
+        assert "Принято" in h.telegram.text()
+        await h.channel.handle_telegram(_tg(2, "публикуй", reply_to=1000 + len(h.telegram.sent)))
+        review = h.channel._state.latest_review(42)
+    assert h.gitlab.writes == [("reply", ("d1", "Принято"))]
+    assert review is not None and review.kind == "conversation"
+
+
+@pytest.mark.asyncio
+async def test_draft_without_an_mr_is_not_dropped_silently(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        turn = await h.say(1, "что ответить?")
+        await h.reply_as_agent(
+            turn.chat_id,
+            'Так:\n\n```gitlab-review-actions\n{"actions": [{"type": "note", "body": "x"}]}\n```',
+        )
+    assert "не указан MR" in h.telegram.text()
+    assert h.channel._state.pending_drafts() == []
+

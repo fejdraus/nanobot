@@ -98,6 +98,7 @@ class ChatAnswer:
     text: str
     draft: ReviewDraft | None = None
     decision: ApprovalCommand | None = None
+    draft_iid: int | None = None
 
 
 def parse_draft(answer: str) -> ReviewDraft:
@@ -188,10 +189,18 @@ def parse_chat_answer(answer: str, iid: int | None) -> ChatAnswer:
         for match in reversed(decisions):
             text = text[: match.start()] + text[match.end():]
     draft: ReviewDraft | None = None
-    if _FENCE_RE.search(text):
+    draft_iid: int | None = None
+    fences = list(_FENCE_RE.finditer(text))
+    if fences:
+        try:
+            block: object = json.loads(fences[-1].group("body"))
+        except json.JSONDecodeError:
+            block = None
+        mapping = _as_mapping(block)
+        draft_iid = _int(mapping.get("iid")) if mapping is not None else None
         draft = parse_draft(text)
         text = draft.summary
-    return ChatAnswer(text=text.strip(), draft=draft, decision=decision)
+    return ChatAnswer(text=text.strip(), draft=draft, decision=decision, draft_iid=draft_iid)
 
 
 def _parse_decision(body: str, iid: int | None) -> ApprovalCommand | None:
