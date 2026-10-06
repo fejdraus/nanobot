@@ -25,6 +25,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "lessonsBudgetChars": field("int", default=40000),
         "peopleDir": field(),
         "peopleBudgetChars": field("int", default=6000),
+        "peopleExcluded": field("list"),
         "telegramBotToken": field("secret"),
         "telegramChatId": field(),
         "telegramUserIds": field("list"),

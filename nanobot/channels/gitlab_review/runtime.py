@@ -309,6 +309,12 @@ class GitLabReviewChannel(BaseChannel):
             self.logger.exception("Telegram notification failed")
             return []
 
+    def _profiled(self, usernames: list[str]) -> list[str]:
+        """The people of this work who may have a profile, without repeats."""
+        if self._people is None:
+            return []
+        return list(dict.fromkeys(name for name in usernames if self.config.may_profile(name)))
+
     def _people_for(self, usernames: list[str]) -> str:
         """Profiles of *usernames* for a prompt; never blocks a run on failure."""
         if self._people is None or not usernames:
@@ -462,7 +468,7 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         own = self.config.is_reviewer(info.author)
-        authors = [info.author] if info.author and self._people is not None else []
+        authors = self._profiled([info.author] if info.author else [])
         if candidate.kind == "merge_request":
             if own and not self.config.review_own_merge_requests:
                 return
@@ -492,9 +498,7 @@ class GitLabReviewChannel(BaseChannel):
                 )
                 await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
                 return
-            authors = list(dict.fromkeys(name for name in (decision.note_author, info.author) if name))
-            if self._people is None:
-                authors = []
+            authors = self._profiled([decision.note_author or "", info.author or ""])
             prompt = reply_prompt(
                 info.iid,
                 candidate.discussion_id,
@@ -814,9 +818,7 @@ class GitLabReviewChannel(BaseChannel):
             )
         self._state.add_event(target.id, "вы", request.text)
         named: list[str] = [target.author] if target.author else []
-        authors = list(dict.fromkeys([*named, *mentioned_usernames(request.text)]))
-        if self._people is None:
-            authors = []
+        authors = self._profiled([*named, *mentioned_usernames(request.text)])
         prompt = chat_prompt(
             request.text,
             target=self._describe_review(target) if target.iid is not None else "",

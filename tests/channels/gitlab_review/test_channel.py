@@ -856,3 +856,25 @@ async def test_without_a_people_directory_nothing_is_asked_or_filed(tmp_path: Pa
     async with Harness(tmp_path) as h:
         review = await h.review(42, [])
     assert "gitlab-review-people" not in review.content
+
+
+@pytest.mark.asyncio
+async def test_excluded_developer_is_never_profiled(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    people.mkdir()
+    (people / "author.md").write_text("# author\n- 2026-01-01 !1: старое\n", encoding="utf-8")
+    async with Harness(tmp_path, people_dir=str(people), people_excluded=["Author"]) as h:
+        review = await h.review(42, [])
+        assert "gitlab-review-people" not in review.content
+        assert "старое" not in review.content
+        before = len(h.inbound)
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
+        await _until(lambda: len(h.inbound) > before)
+        await h.reply_as_agent(
+            "gitlab-review:42",
+            _answer("S", []) + _people('{"people": [{"username": "author", "notes": ["новое"]}]}'),
+        )
+        await task
+    assert "новое" not in (people / "author.md").read_text(encoding="utf-8")
+    assert "Запомнил" not in h.telegram.text()
+

@@ -58,6 +58,7 @@ class GitLabReviewConfig(Base):
     lessons_budget_chars: int = Field(default=40000, ge=0)
     people_dir: str = ""
     people_budget_chars: int = Field(default=6000, ge=0)
+    people_excluded: list[str] = Field(default_factory=list)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -91,7 +92,7 @@ class GitLabReviewConfig(Base):
             raise ValueError("gitlabUrl must start with https:// or http://")
         return url
 
-    @field_validator("reviewer_usernames", "telegram_user_ids")
+    @field_validator("reviewer_usernames", "telegram_user_ids", "people_excluded")
     @classmethod
     def normalize_names(cls, value: list[str]) -> list[str]:
         return [str(name).strip() for name in value if str(name).strip()]
@@ -156,6 +157,11 @@ class GitLabReviewConfig(Base):
         if self.lessons_dir.strip():
             return str(Path(self.lessons_dir.strip()).expanduser() / "people")
         return ""
+
+    def may_profile(self, username: str) -> bool:
+        """Whether observations about *username* may be kept: not for those who opted out."""
+        excluded = {name.casefold() for name in self.people_excluded}
+        return bool(username) and username.casefold() not in excluded
 
     def is_reviewer(self, username: str | None) -> bool:
         if not username:

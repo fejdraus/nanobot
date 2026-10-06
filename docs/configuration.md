@@ -1851,6 +1851,8 @@ user `@mentioned` by the approver) can be written about, at most five notes
 per person per run, and notes judging character are refused. Every filed note
 is echoed to Telegram. Profiles adapt how the reviewer talks, not how strictly
 it reviews.
+Developers who did not agree to this are listed in `peopleExcluded` (GitLab
+usernames): they are never asked about, profiled or shown with statistics.
 
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:
