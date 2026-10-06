@@ -1815,6 +1815,27 @@ several drafts can wait in the chat and be answered in any order. Full commands 
 The version may be omitted until a newer draft of the same MR replaces the one
 you were reading; after that a command without it, or with an old one, is
 refused. Publishing is also refused if the MR's head moved since the review.
+A bare `публикуй` or `отмена` without a reply applies to the only waiting draft;
+with several waiting, the channel lists them instead.
+
+**Talking to the reviewer.** Any other message from the approver goes to the
+agent. It continues the Claude session of the review it concerns — the one
+whose message you replied to, or the only waiting draft — so the agent keeps
+what it read during the review; every new review starts a new session (the
+channel passes `claude_cli.session_id` in the inbound metadata, and the
+`claude_cli` provider runs `claude -p --session-id` for a review and
+`--resume` for the conversation). The agent may answer, send a revised draft
+(a new version), or ask for a publication with a `gitlab-review-decision`
+block. The channel publishes on that request only if your own message says
+`публикуй`/`опубликуй` (`отмена` to cancel), and never in the same answer as a
+revised draft you have not seen yet.
+
+**Archive.** Every review, its drafts, your decisions and the conversation are
+stored in `state.sqlite3` and exported as one Markdown file per review into
+`gitlab_review/archive/` next to it. A question naming an MR (`!6318`) or a
+task key brings the matching archive entries into the prompt; for anything
+else the agent searches the archive directory, so add it to `allowedTools`
+(`Read(<runtime>/gitlab_review/archive/**)`).
 
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:

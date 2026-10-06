@@ -4,6 +4,10 @@ The agent never publishes. It ends its answer with a machine-readable block of
 proposed GitLab actions; the channel stores them, shows them in Telegram, and
 publishes only the items the human approves there. Keeping the format and its
 validation here makes "what can reach GitLab" a closed, testable list.
+
+In a conversation about a review the agent may also ask for a publication or a
+cancellation with a decision block. That is only a request: the channel acts on
+it when the human's own message says so, never on the agent's word alone.
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 ACTIONS_FENCE = "gitlab-review-actions"
+DECISION_FENCE = "gitlab-review-decision"
 TELEGRAM_LIMIT = 4000
 
 ActionType = Literal["discussion", "note", "reply", "approve"]
@@ -34,6 +39,12 @@ _REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 _PUBLISH_VERBS = frozenset({"публикуй", "опубликуй", "publish"})
+_DECISION_RE = re.compile(
+    r"```" + re.escape(DECISION_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
+    re.DOTALL,
+)
+_SAYS_PUBLISH_RE = re.compile(r"публик|publish", re.IGNORECASE)
+_SAYS_CANCEL_RE = re.compile(r"отмен|cancel", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,20 @@ class ApprovalCommand:
     iid: int
     items: tuple[int, ...]
     version: int | None = None
+
+
+@dataclass(frozen=True)
+class ChatAnswer:
+    """The agent's answer in a conversation about a review.
+
+    ``draft`` is set only when the answer carries a new actions block: a
+    revised draft replacing the current one. ``decision`` is the agent's
+    reading of a publish or cancel request, still subject to the human's words.
+    """
+
+    text: str
+    draft: ReviewDraft | None = None
+    decision: ApprovalCommand | None = None
 
 
 def parse_draft(answer: str) -> ReviewDraft:
@@ -122,7 +147,7 @@ def parse_command(text: str) -> ApprovalCommand | None:
     )
 
 
-def parse_reply_command(text: str, iid: int, version: int) -> ApprovalCommand | None:
+def parse_reply_command(text: str, iid: int, version: int | None) -> ApprovalCommand | None:
     """Recognise «публикуй», «публикуй 1,3», «отмена» sent as a reply to a draft message."""
     match = _REPLY_RE.match(text or "")
     if match is None:
@@ -134,6 +159,73 @@ def parse_reply_command(text: str, iid: int, version: int) -> ApprovalCommand | 
         items=items,
         version=version,
     )
+
+
+def parse_bare_command(text: str) -> tuple[bool, tuple[int, ...]] | None:
+    """Recognise «публикуй», «публикуй 1,3», «отмена» naming no draft: ``(publish, items)``."""
+    match = _REPLY_RE.match(text or "")
+    if match is None:
+        return None
+    items = tuple(int(item) for item in re.findall(r"\d+", match.group("items") or ""))
+    return match.group("verb").casefold() in _PUBLISH_VERBS, items
+
+
+def says_publish(text: str) -> bool:
+    return _SAYS_PUBLISH_RE.search(text or "") is not None
+
+
+def says_cancel(text: str) -> bool:
+    return _SAYS_CANCEL_RE.search(text or "") is not None
+
+
+def parse_chat_answer(answer: str, iid: int | None) -> ChatAnswer:
+    """Split a conversation answer into its text, a revised draft and a decision."""
+    text = answer or ""
+    decision: ApprovalCommand | None = None
+    decisions = list(_DECISION_RE.finditer(text))
+    if decisions:
+        decision = _parse_decision(decisions[-1].group("body"), iid)
+        for match in reversed(decisions):
+            text = text[: match.start()] + text[match.end():]
+    draft: ReviewDraft | None = None
+    if _FENCE_RE.search(text):
+        draft = parse_draft(text)
+        text = draft.summary
+    return ChatAnswer(text=text.strip(), draft=draft, decision=decision)
+
+
+def _parse_decision(body: str, iid: int | None) -> ApprovalCommand | None:
+    try:
+        data: object = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    mapping = _as_mapping(data)
+    if mapping is None:
+        return None
+    kind = mapping.get("decision")
+    if kind not in ("publish", "cancel"):
+        return None
+    target = _int(mapping.get("iid")) or iid
+    if target is None:
+        return None
+    raw_items = mapping.get("items")
+    items = tuple(
+        number
+        for number in (_int(item) for item in cast("list[object]", raw_items))
+        if number is not None
+    ) if isinstance(raw_items, list) else ()
+    return ApprovalCommand(
+        publish=kind == "publish",
+        iid=target,
+        items=items,
+        version=_int(mapping.get("version")),
+    )
+
+
+def render_chat(iid: int | None, text: str) -> list[str]:
+    """A conversation answer, marked with its MR so parallel talks stay apart."""
+    prefix = f"!{iid} · " if iid is not None else ""
+    return _chunk(prefix + (text or "(пустой ответ)"))
 
 
 def render_draft(

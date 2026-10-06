@@ -8,6 +8,10 @@
   MR gets the next version, and ``replaced`` marks a draft that overwrote one
   the human may still have been reading.
 - telegram offset: so a restart does not replay old approvals.
+- reviews: the archive. One row per review run with its Claude session, the
+  task keys it concerns, and a log of everything said about it, so a later
+  question can be answered from it. Each review is also exported as a Markdown
+  file the agent can search.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ from nanobot.channels.gitlab_review.proposals import ProposedAction
 
 DELIVERY_RETENTION = timedelta(days=14)
 DRAFT_MESSAGE_RETENTION = timedelta(days=30)
+MAX_EVENT_CHARS = 20000
 
 
 class StoredDraft(NamedTuple):
@@ -32,10 +37,35 @@ class StoredDraft(NamedTuple):
     replaced: bool
 
 
+class ReviewRecord(NamedTuple):
+    id: int
+    iid: int | None
+    title: str
+    web_url: str
+    task_keys: tuple[str, ...]
+    kind: str
+    session_id: str
+    head_sha: str
+    started_at: str
+    status: str
+
+
+class ReviewEvent(NamedTuple):
+    at: str
+    who: str
+    text: str
+
+
+_REVIEW_COLUMNS = (
+    "id, mr_iid, title, web_url, task_keys, kind, session_id, head_sha, started_at, status"
+)
+
+
 class GitLabReviewStateStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, archive_dir: Path | None = None) -> None:
         self._path = db_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self.archive_dir = archive_dir or db_path.parent / "archive"
         self._lock = threading.Lock()
         self._ensure_schema()
 
@@ -78,6 +108,28 @@ class GitLabReviewStateStore:
                 CREATE TABLE IF NOT EXISTS kv (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mr_iid INTEGER,
+                    title TEXT NOT NULL,
+                    web_url TEXT NOT NULL,
+                    task_keys TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_events (
+                    review_id INTEGER NOT NULL,
+                    at TEXT NOT NULL,
+                    who TEXT NOT NULL,
+                    text TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_messages (
+                    message_id INTEGER PRIMARY KEY,
+                    review_id INTEGER NOT NULL
                 );
                 """
             )
@@ -192,6 +244,147 @@ class GitLabReviewStateStore:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM review_drafts WHERE mr_iid = ?", (iid,))
 
+    def pending_drafts(self) -> list[tuple[int, int]]:
+        """``(iid, version)`` of every draft still waiting for a decision, oldest first."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mr_iid, version FROM review_drafts ORDER BY created_at"
+            ).fetchall()
+        return [(int(iid), int(version)) for iid, version in rows]
+
+    def start_review(
+        self,
+        *,
+        iid: int | None,
+        title: str,
+        web_url: str,
+        task_keys: list[str],
+        kind: str,
+        session_id: str,
+        head_sha: str,
+    ) -> ReviewRecord:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO reviews (mr_iid, title, web_url, task_keys, kind, session_id, "
+                "head_sha, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    iid, title, web_url, " ".join(task_keys), kind, session_id, head_sha,
+                    datetime.now().isoformat(timespec="seconds"), "в работе",
+                ),
+            )
+            review_id = int(cursor.lastrowid or 0)
+        record = self.get_review(review_id)
+        assert record is not None
+        self._export(record)
+        return record
+
+    def get_review(self, review_id: int) -> ReviewRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {_REVIEW_COLUMNS} FROM reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+        return _record(row) if row else None
+
+    def latest_review(self, iid: int) -> ReviewRecord | None:
+        """The newest review of this MR (a reply in its thread counts too)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {_REVIEW_COLUMNS} FROM reviews WHERE mr_iid = ? AND kind != 'chat' "
+                "ORDER BY id DESC LIMIT 1",
+                (iid,),
+            ).fetchone()
+        return _record(row) if row else None
+
+    def find_reviews(self, iids: list[int], keys: list[str], limit: int) -> list[ReviewRecord]:
+        """Reviews of the given MRs or naming the given task keys, newest first."""
+        if not iids and not keys:
+            return []
+        clauses: list[str] = []
+        params: list[object] = []
+        if iids:
+            clauses.append(f"mr_iid IN ({', '.join('?' * len(iids))})")
+            params.extend(iids)
+        for key in keys:
+            clauses.append("(' ' || task_keys || ' ') LIKE ?")
+            params.append(f"% {key} %")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_REVIEW_COLUMNS} FROM reviews WHERE kind != 'chat' AND "
+                f"({' OR '.join(clauses)}) ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [_record(row) for row in rows]
+
+    def set_review_status(self, review_id: int, status: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE reviews SET status = ? WHERE id = ?", (status, review_id))
+        self._export_id(review_id)
+
+    def add_event(self, review_id: int, who: str, text: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO review_events (review_id, at, who, text) VALUES (?, ?, ?, ?)",
+                (
+                    review_id, datetime.now().isoformat(timespec="seconds"), who,
+                    text[:MAX_EVENT_CHARS],
+                ),
+            )
+        self._export_id(review_id)
+
+    def events(self, review_id: int) -> list[ReviewEvent]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT at, who, text FROM review_events WHERE review_id = ? ORDER BY rowid",
+                (review_id,),
+            ).fetchall()
+        return [ReviewEvent(str(at), str(who), str(text)) for at, who, text in rows]
+
+    def record_review_messages(self, review_id: int, message_ids: list[int]) -> None:
+        """Remember which Telegram messages belong to this review's conversation."""
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO review_messages (message_id, review_id) VALUES (?, ?)",
+                [(mid, review_id) for mid in message_ids],
+            )
+
+    def review_for_message(self, message_id: int) -> ReviewRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT review_id FROM review_messages WHERE message_id = ?", (message_id,)
+            ).fetchone()
+        return self.get_review(int(row[0])) if row else None
+
+    def render_review(self, record: ReviewRecord) -> str:
+        """The archive entry of one review as Markdown."""
+        mr = f"MR !{record.iid}" if record.iid is not None else "Разговор без MR"
+        lines = [f"# {mr} {record.title}".rstrip()]
+        if record.web_url:
+            lines.append(record.web_url)
+        lines.append("")
+        if record.task_keys:
+            lines.append(f"- Задачи: {', '.join(record.task_keys)}")
+        lines += [
+            f"- Вид: {record.kind}",
+            f"- Начато: {record.started_at}",
+            f"- Статус: {record.status}",
+            f"- Коммит: {record.head_sha or '—'}",
+            f"- Сессия Claude: {record.session_id}",
+        ]
+        for event in self.events(record.id):
+            lines += ["", f"## {event.at} — {event.who}", "", event.text]
+        return "\n".join(lines) + "\n"
+
+    def _export_id(self, review_id: int) -> None:
+        record = self.get_review(review_id)
+        if record is not None:
+            self._export(record)
+
+    def _export(self, record: ReviewRecord) -> None:
+        suffix = f"mr{record.iid}" if record.iid is not None else "chat"
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        path = self.archive_dir / f"{record.id:05d}-{suffix}.md"
+        path.write_text(self.render_review(record), encoding="utf-8")
+
     def get_value(self, key: str) -> str | None:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
@@ -200,3 +393,19 @@ class GitLabReviewStateStore:
     def set_value(self, key: str, value: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, value))
+
+
+def _record(row: tuple[object, ...]) -> ReviewRecord:
+    review_id, iid, title, web_url, keys, kind, session_id, head_sha, started_at, status = row
+    return ReviewRecord(
+        id=int(str(review_id)),
+        iid=int(str(iid)) if iid is not None else None,
+        title=str(title),
+        web_url=str(web_url),
+        task_keys=tuple(str(keys).split()),
+        kind=str(kind),
+        session_id=str(session_id),
+        head_sha=str(head_sha),
+        started_at=str(started_at),
+        status=str(status),
+    )

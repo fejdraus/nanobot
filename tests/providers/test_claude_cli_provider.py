@@ -311,3 +311,51 @@ async def test_chat_stream_does_not_stream_an_error_as_model_text() -> None:
 
     assert response.finish_reason == "error"
     assert deltas == []
+
+
+SESSION = "bc4f411c-bff0-488b-a92c-7ac7073eeb0a"
+
+
+def _in_session(metadata: dict[str, Any]) -> Any:
+    from nanobot.agent.tools.context import RequestContext, request_context
+
+    return request_context(RequestContext(channel="gitlab_review", chat_id="c", metadata=metadata))
+
+
+@pytest.mark.asyncio
+async def test_requested_session_is_started_then_resumed(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _patch_spawn(monkeypatch, _FakeProcess())
+    with _in_session({"claude_cli": {"session_id": SESSION}}):
+        await _provider().chat([{"role": "user", "content": "review"}])
+    assert seen["argv"][seen["argv"].index("--session-id") + 1] == SESSION
+    assert "--resume" not in seen["argv"]
+
+    with _in_session({"claude_cli": {"session_id": SESSION, "resume": True}}):
+        await _provider().chat([{"role": "user", "content": "why?"}])
+    assert seen["argv"][seen["argv"].index("--resume") + 1] == SESSION
+
+
+@pytest.mark.asyncio
+async def test_malformed_session_id_never_reaches_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _patch_spawn(monkeypatch, _FakeProcess())
+    with _in_session({"claude_cli": {"session_id": "--dangerously-skip-permissions", "resume": True}}):
+        await _provider().chat([{"role": "user", "content": "hi"}])
+    assert "--resume" not in seen["argv"] and "--session-id" not in seen["argv"]
+    assert "--dangerously-skip-permissions" not in seen["argv"]
+
+
+@pytest.mark.asyncio
+async def test_lost_session_is_started_afresh_under_the_same_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    runs: list[list[str]] = []
+
+    async def _run(self: ClaudeCLIProvider, args: list[str], prompt: str) -> Any:
+        runs.append(args)
+        if "--resume" in args:
+            raise ClaudeCLIError(f"Claude Code CLI exited with 1: No conversation found with session ID: {SESSION}")
+        return _parse_result(b'{"result": "fresh"}', b"", 0)
+
+    monkeypatch.setattr(ClaudeCLIProvider, "_run", _run)
+    with _in_session({"claude_cli": {"session_id": SESSION, "resume": True}}):
+        response = await _provider().chat([{"role": "user", "content": "why?"}])
+    assert response.content == "fresh"
+    assert runs[1][runs[1].index("--session-id") + 1] == SESSION

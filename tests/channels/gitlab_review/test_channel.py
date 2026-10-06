@@ -116,6 +116,9 @@ class FakeTelegram:
         self.sent.append((chat_id, text))
         return 1000 + len(self.sent)
 
+    async def send_typing(self, chat_id: str) -> None:
+        return None
+
     async def get_updates(self, offset: int | None, timeout_s: int = 30) -> list[TelegramMessage]:
         await asyncio.sleep(3600)
         return []
@@ -171,10 +174,11 @@ class Harness:
         await self.channel.stop()
 
     def expect(self, iid: int) -> None:
-        if iid not in self.channel._pending:
+        chat_id = f"gitlab-review:{iid}"
+        if chat_id not in self.channel._pending:
             future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            self.channel._pending[iid] = _PendingRun(
-                future, str(self.gitlab.mr["sha"]), str(self.gitlab.mr["title"]), ""
+            self.channel._pending[chat_id] = _PendingRun(
+                future, str(self.gitlab.mr["sha"]), str(self.gitlab.mr["title"]), "", iid=iid
             )
 
     async def answer(
@@ -186,7 +190,37 @@ class Harness:
         await self.channel.send(
             OutboundMessage(channel="gitlab_review", chat_id=f"gitlab-review:{iid}", content=content)
         )
-        self.channel._pending.pop(iid, None)
+        self.channel._pending.pop(f"gitlab-review:{iid}", None)
+
+    async def review(self, iid: int, actions: list[dict[str, Any]], summary: str = "Сводка") -> InboundMessage:
+        """Run a real review of MR *iid* and answer it with *actions*."""
+        before = len(self.inbound)
+        task = asyncio.create_task(self.channel.process(ReviewCandidate(kind="merge_request", iid=iid)))
+        await _until(lambda: len(self.inbound) > before)
+        await self.reply_as_agent(f"gitlab-review:{iid}", _answer(summary, actions))
+        await task
+        return self.inbound[before]
+
+    async def say(self, update_id: int, text: str, *, reply_to: int | None = None) -> InboundMessage:
+        """Send the approver's message and wait for the agent turn it starts."""
+        before = len(self.inbound)
+        await self.channel.handle_telegram(_tg(update_id, text, reply_to=reply_to))
+        await _until(lambda: len(self.inbound) > before)
+        return self.inbound[-1]
+
+    async def reply_as_agent(self, chat_id: str, content: str) -> None:
+        await _until(lambda: chat_id in self.channel._pending)
+        await self.channel.send(OutboundMessage(channel="gitlab_review", chat_id=chat_id, content=content))
+        await _until(lambda: chat_id not in self.channel._pending)
+
+
+def _answer(summary: str, actions: list[dict[str, Any]] | None = None, decision: dict[str, Any] | None = None) -> str:
+    content = summary
+    if actions is not None:
+        content += f"\n\n```{ACTIONS_FENCE}\n{json.dumps({'actions': actions})}\n```"
+    if decision is not None:
+        content += f"\n\n```gitlab-review-decision\n{json.dumps(decision)}\n```"
+    return content
 
 
 def _tg(
@@ -516,7 +550,7 @@ async def test_approval_of_own_mr_is_never_drafted_or_published(tmp_path: Path) 
     async with Harness(tmp_path, review_own_merge_requests=True) as h:
         h.gitlab.mr["author"] = {"username": "a.tyra"}
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        h.channel._pending[42] = _PendingRun(future, SHA, "feat: thing", "", own=True)
+        h.channel._pending["gitlab-review:42"] = _PendingRun(future, SHA, "feat: thing", "", own=True, iid=42)
         await h.answer(42, [{"type": "note", "body": "general"}, {"type": "approve"}], waiting=False)
         assert "аппрув своего MR снят" in h.telegram.text()
         h.channel._state.save_draft(42, SHA, (ProposedAction("approve"),), 9)
@@ -594,12 +628,23 @@ async def test_reply_cancel_drops_the_draft(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_short_command_without_reply_gets_a_hint(tmp_path: Path) -> None:
+async def test_bare_publish_applies_to_the_only_waiting_draft(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
         await h.answer(42, [{"type": "note", "body": "general"}])
+        await h.channel.handle_telegram(_tg(1, "Публикуй"))
+    assert h.gitlab.writes == [("note", "general")]
+
+
+@pytest.mark.asyncio
+async def test_bare_publish_with_several_drafts_asks_which(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "first"}])
+        await h.answer(43, [{"type": "note", "body": "second"}])
         await h.channel.handle_telegram(_tg(1, "публикуй"))
+        await h.channel.handle_telegram(_tg(2, "отмена"))
     assert h.gitlab.writes == []
-    assert "Ответьте на сообщение черновика" in h.telegram.text()
+    assert "Черновиков несколько" in h.telegram.text()
+    assert "!42/1" in h.telegram.text() and "!43/1" in h.telegram.text()
 
 
 @pytest.mark.asyncio
@@ -618,3 +663,142 @@ async def test_draft_names_the_task(tmp_path: Path) -> None:
     assert h.tasks.asked == ["AMCRM-16127", "AMCRM-16130"]
     assert "AMCRM-99999" not in text
 
+
+@pytest.mark.asyncio
+async def test_each_review_starts_its_own_claude_session(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        first = await h.review(42, [{"type": "note", "body": "a"}])
+        second = await h.review(42, [{"type": "note", "body": "b"}])
+    sessions = [message.metadata["claude_cli"] for message in (first, second)]
+    assert sessions[0]["session_id"] != sessions[1]["session_id"]
+    assert not sessions[0]["resume"] and not sessions[1]["resume"]
+
+
+@pytest.mark.asyncio
+async def test_question_about_a_draft_continues_its_review_session(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        review = await h.review(42, [{"type": "note", "body": "флаг не сбрасывается"}])
+        draft_message = 1000 + len(h.telegram.sent)
+        turn = await h.say(1, "почему флаг не сбрасывается?", reply_to=draft_message)
+        assert turn.metadata["claude_cli"] == {
+            "session_id": review.metadata["claude_cli"]["session_id"], "resume": True,
+        }
+        assert "почему флаг не сбрасывается?" in turn.content
+        assert "1. [общий комментарий] флаг не сбрасывается" in turn.content
+        await h.reply_as_agent("gitlab-review:42", "Потому что присваивается только true.")
+        answer_message = 1000 + len(h.telegram.sent)
+        assert h.telegram.sent[-1][1] == "!42 · Потому что присваивается только true."
+
+        follow_up = await h.say(2, "а в C#?", reply_to=answer_message)
+        assert follow_up.metadata["claude_cli"]["session_id"] == review.metadata["claude_cli"]["session_id"]
+        await h.reply_as_agent("gitlab-review:42", "Тоже нет.")
+    assert h.gitlab.writes == []
+
+
+@pytest.mark.asyncio
+async def test_question_without_reply_goes_to_the_only_waiting_draft(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        review = await h.review(42, [{"type": "note", "body": "a"}])
+        turn = await h.say(1, "уточни второе замечание")
+        await h.reply_as_agent("gitlab-review:42", "Уточняю.")
+    assert turn.metadata["claude_cli"]["session_id"] == review.metadata["claude_cli"]["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_revised_draft_becomes_a_new_version(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.review(42, [{"type": "note", "body": "old"}, {"type": "note", "body": "keep"}])
+        await h.say(1, "убери первое замечание")
+        await h.reply_as_agent("gitlab-review:42", _answer("Убрал.", [{"type": "note", "body": "keep"}]))
+        assert "Черновик 42/2" in h.telegram.text()
+        await h.channel.handle_telegram(_tg(2, "публикуй !42/1"))
+        assert h.gitlab.writes == []
+        await h.channel.handle_telegram(_tg(3, "публикуй !42/2"))
+    assert h.gitlab.writes == [("note", "keep")]
+
+
+@pytest.mark.asyncio
+async def test_agent_decision_publishes_only_when_the_human_said_so(tmp_path: Path) -> None:
+    decision = {"decision": "publish", "iid": 42, "items": [2]}
+    async with Harness(tmp_path) as h:
+        await h.review(42, [{"type": "note", "body": "one"}, {"type": "note", "body": "two"}])
+        await h.say(1, "второе замечание верное?")
+        await h.reply_as_agent("gitlab-review:42", _answer("Да.", decision=decision))
+        assert h.gitlab.writes == []
+        assert "чтобы выполнить, ответьте на черновик «публикуй»" in h.telegram.text()
+
+        await h.say(2, "ок, опубликуй только второе")
+        await h.reply_as_agent("gitlab-review:42", _answer("Публикую второе.", decision=decision))
+    assert h.gitlab.writes == [("note", "two")]
+
+
+@pytest.mark.asyncio
+async def test_decision_next_to_a_revised_draft_is_not_executed(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.review(42, [{"type": "note", "body": "one"}])
+        await h.say(1, "перепиши и публикуй")
+        await h.reply_as_agent(
+            "gitlab-review:42",
+            _answer("Готово.", [{"type": "note", "body": "new"}], {"decision": "publish", "iid": 42}),
+        )
+    assert h.gitlab.writes == []
+    assert "сначала посмотрите новую версию" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_question_about_an_earlier_review_brings_its_archive_entry(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.review(42, [{"type": "note", "body": "старое замечание про флаг"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+        h.gitlab.mr["description"] = "Closes AMCRM-20000"
+        await h.review(43, [{"type": "note", "body": "новое"}])
+        turn = await h.say(2, "что было в ревью по AMCRM-16127?", reply_to=1000 + len(h.telegram.sent))
+        await h.reply_as_agent("gitlab-review:43", "Там был флаг.")
+    assert "Из архива" in turn.content
+    assert "старое замечание про флаг" in turn.content
+    assert "опубликовано" in turn.content
+    entries = sorted((tmp_path / "archive").glob("*.md"))
+    assert [entry.name for entry in entries] == ["00001-mr42.md", "00002-mr43.md"]
+    assert "AMCRM-16127" in entries[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_talk_without_any_review_gets_its_own_session(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        turn = await h.say(1, "что ты умеешь?")
+        chat_id = turn.chat_id
+        assert chat_id.startswith("gitlab-review:chat-")
+        assert turn.metadata["claude_cli"]["resume"] is False
+        await h.reply_as_agent(chat_id, "Ревьюить MR.")
+        follow_up = await h.say(2, "а ещё?", reply_to=1000 + len(h.telegram.sent))
+        await h.reply_as_agent(chat_id, "Всё.")
+    assert follow_up.metadata["claude_cli"] == {
+        "session_id": turn.metadata["claude_cli"]["session_id"], "resume": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_draft_says_so(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.channel.handle_telegram(_tg(1, "отмена !42"))
+    assert "нет черновика для отмены" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_question_about_a_draft_without_archive_entry_starts_one(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "old draft"}])
+        turn = await h.say(1, "почему так?", reply_to=1000 + len(h.telegram.sent))
+        await h.reply_as_agent("gitlab-review:42", "Потому что.")
+    assert turn.metadata["claude_cli"]["resume"] is False
+    assert "old draft" in turn.content
+    assert "MR !42" in turn.content
+    assert h.channel._state.latest_review(42) is not None
+
+
+@pytest.mark.asyncio
+async def test_slash_message_gets_help_without_the_agent(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.channel.handle_telegram(_tg(1, "/start"))
+    assert h.inbound == []
+    assert "Любой другой текст — вопрос ревьюеру" in h.telegram.text()

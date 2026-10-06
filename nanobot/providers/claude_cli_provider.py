@@ -26,8 +26,10 @@ the agent loop must not emit tool calls it expects the CLI to have executed.
 
 One turn, one run
 -----------------
-Every call starts a fresh CLI run with only the newest user message. The
-prompt goes through stdin, never through argv: argv has a size limit, a text
+Every call starts a CLI run with only the newest user message. A channel that
+wants a conversation to continue names a Claude session in the inbound
+message metadata (``claude_cli.session_id``, plus ``claude_cli.resume`` to
+continue it); the CLI then keeps the history itself. The prompt goes through stdin, never through argv: argv has a size limit, a text
 starting with ``--`` would be read as a CLI flag, and on Windows the npm
 ``claude.cmd`` shim would pass it through ``cmd.exe`` unescaped.
 
@@ -43,6 +45,7 @@ import os
 import shutil
 import signal
 import sys
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +53,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from nanobot.agent.tools.context import current_request_context
 from nanobot.providers.base import LLMProvider, LLMResponse, LLMUsage
 
 DEFAULT_TIMEOUT_S = 3600.0
@@ -66,6 +70,10 @@ _ENV_NAMES = frozenset({
     "HOMEDRIVE", "HOMEPATH",
 })
 _ENV_PREFIXES = ("LC_", "XDG_", "CLAUDE_", "ANTHROPIC_", "NODE_", "NPM_CONFIG_")
+
+SESSION_METADATA_KEY = "claude_cli"
+
+_MISSING_SESSION = "No conversation found"
 
 
 class ClaudeCLIError(RuntimeError):
@@ -160,8 +168,9 @@ class ClaudeCLIProvider(LLMProvider):
                 error_should_retry=False,
             )
 
+        session = _requested_session()
         try:
-            result = await self._run(self._build_args(model=model), prompt)
+            result = await self._run_in_session(model, prompt, session)
         except ClaudeCLIError as exc:
             return LLMResponse(
                 content=f"Claude Code CLI error: {exc}",
@@ -227,8 +236,36 @@ class ClaudeCLIProvider(LLMProvider):
     def get_default_model(self) -> str:
         return self.default_model
 
-    def _build_args(self, *, model: str | None) -> list[str]:
+    async def _run_in_session(
+        self, model: str | None, prompt: str, session: tuple[str, bool] | None
+    ) -> ClaudeCLIResult:
+        """Run the CLI, continuing the requested session when there is one.
+
+        A session the CLI no longer has (cleaned up, other machine) is started
+        afresh under the same id, so later turns still find it; the caller's
+        prompt is written to make sense without the lost history.
+        """
+        if session is None:
+            return await self._run(self._build_args(model=model), prompt)
+        session_id, resume = session
+        if not resume:
+            return await self._run(self._build_args(model=model, session_id=session_id), prompt)
+        try:
+            return await self._run(
+                self._build_args(model=model, session_id=session_id, resume=True), prompt
+            )
+        except ClaudeCLIError as exc:
+            if _MISSING_SESSION not in str(exc):
+                raise
+            logger.warning("claude_cli: session {} is gone, starting it afresh", session_id)
+            return await self._run(self._build_args(model=model, session_id=session_id), prompt)
+
+    def _build_args(
+        self, *, model: str | None, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
         args: list[str] = [self.cli_path, "-p", "--output-format", "json"]
+        if session_id:
+            args += ["--resume" if resume else "--session-id", session_id]
 
         selected = self._resolve_model(model)
         if selected:
@@ -467,6 +504,27 @@ def _parse_usage(raw: object) -> LLMUsage | None:
     )
 
 
+def _requested_session() -> tuple[str, bool] | None:
+    """The Claude session the current request asks for, as ``(id, resume)``.
+
+    Only a well-formed UUID is accepted: the value ends up in argv, and
+    anything else could be read by the CLI as a flag.
+    """
+    ctx = current_request_context()
+    raw = _as_dict(ctx.metadata.get(SESSION_METADATA_KEY)) if ctx is not None else None
+    if raw is None:
+        return None
+    value = raw.get("session_id")
+    if not isinstance(value, str):
+        return None
+    try:
+        session_id = str(uuid.UUID(value))
+    except ValueError:
+        logger.warning("claude_cli: ignoring malformed session id {!r}", value)
+        return None
+    return session_id, bool(raw.get("resume"))
+
+
 def _newest_user_text(messages: list[dict[str, Any]]) -> str:
     """Text of the newest user message: the only thing a fresh CLI run needs."""
     for message in reversed(messages):
@@ -492,4 +550,5 @@ __all__ = [
     "ClaudeCLIProvider",
     "ClaudeCLIResult",
     "DEFAULT_MODEL",
+    "SESSION_METADATA_KEY",
 ]

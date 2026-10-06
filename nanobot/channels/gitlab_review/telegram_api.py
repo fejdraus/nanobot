@@ -3,6 +3,10 @@
 Only one chat is ever served, and only approved senders in it: messages from
 any other chat or sender are dropped before they are parsed, so nobody else
 can approve a publication under the reviewer's name.
+
+The bot token is part of every request URL. Transport errors are therefore
+re-raised without their cause: a logged traceback of an ``httpx`` error would
+print the request, token included.
 """
 from __future__ import annotations
 
@@ -44,7 +48,8 @@ class TelegramApi:
 
     async def send_message(self, chat_id: str, text: str) -> int | None:
         """Send *text*; return the Telegram message id so replies can be traced back."""
-        response = await self._client.post(
+        response = await self._request(
+            "POST",
             "/sendMessage",
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
         )
@@ -56,8 +61,8 @@ class TelegramApi:
         params: dict[str, Any] = {"timeout": timeout_s, "allowed_updates": '["message"]'}
         if offset is not None:
             params["offset"] = offset
-        response = await self._client.get(
-            "/getUpdates", params=params, timeout=timeout_s + 15
+        response = await self._request(
+            "GET", "/getUpdates", params=params, timeout=timeout_s + 15
         )
         result = self._result(response)
         messages: list[TelegramMessage] = []
@@ -91,6 +96,19 @@ class TelegramApi:
                 )
             )
         return messages
+
+    async def send_typing(self, chat_id: str) -> None:
+        """Show «печатает…» for a few seconds while an answer is being prepared."""
+        self._result(
+            await self._request("POST", "/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+        )
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        try:
+            return await self._client.request(method, path, **kwargs)
+        except httpx.HTTPError as exc:
+            message = f"Telegram {path}: {type(exc).__name__}"
+        raise TelegramApiError(message)
 
     @staticmethod
     def _result(response: httpx.Response) -> object:

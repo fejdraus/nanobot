@@ -11,10 +11,18 @@ Flow:
    a note passes :mod:`triage`; the MR is within its hourly run budget. An
    approval of the reviewer's own MR is never drafted nor published.
 4. The agent reviews in draft mode and answers with proposed actions.
-5. The draft goes to one Telegram chat. Only «публикуй !N/V» from its approver
-   makes the channel post to GitLab, and only if the branch has not moved since
-   the review. A review that runs out of time is stopped, and an answer that
-   arrives after that is not turned into a draft.
+5. The draft goes to one Telegram chat. Only an explicit «публикуй» from its
+   approver makes the channel post to GitLab — as a reply to the draft, with
+   its number, or bare when exactly one draft is waiting — and only if the
+   branch has not moved since the review. A review that runs out of time is
+   stopped, and an answer that arrives after that is not turned into a draft.
+6. Any other message from the approver is a conversation. It continues the
+   Claude session of the review it is about (the one replied to, or the only
+   waiting draft), so the agent remembers what it read; every new review
+   starts a new session. The agent may answer, revise the draft, or ask for a
+   publication, which the channel performs only if the human's own words ask
+   for it. Every review, draft, decision and message is kept in an archive the
+   agent can consult when asked about an earlier review.
 """
 
 from __future__ import annotations
@@ -23,7 +31,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,23 +47,29 @@ from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate, is_draft, parse_event
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApi, GitLabApiError
 from nanobot.channels.gitlab_review.lessons import load_lessons, render_lessons, select_lessons
-from nanobot.channels.gitlab_review.prompts import reply_prompt, review_prompt
+from nanobot.channels.gitlab_review.prompts import chat_prompt, reply_prompt, review_prompt
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
     ProposedAction,
     ReviewDraft,
+    parse_bare_command,
+    parse_chat_answer,
     parse_command,
     parse_draft,
     parse_reply_command,
+    render_chat,
     render_draft,
     render_notice,
+    says_cancel,
+    says_publish,
 )
-from nanobot.channels.gitlab_review.state import GitLabReviewStateStore
+from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
 from nanobot.channels.gitlab_review.triage import triage_thread
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.events import ResponseSourceEvent
+from nanobot.providers.claude_cli_provider import SESSION_METADATA_KEY
 
 MAX_WEBHOOK_BYTES = 1024 * 1024
 TELEGRAM_OFFSET_KEY = "telegram_offset"
@@ -61,6 +77,16 @@ POLL_RETRY_S = 5.0
 SOCKET_TIMEOUT_S = 30.0
 STOP_COMMAND = "/stop"
 MAX_TASKS = 5
+ARCHIVE_LIMIT = 5
+ARCHIVE_ENTRY_CHARS = 6000
+TYPING_INTERVAL_S = 4.0
+_MR_REF_RE = re.compile(r"!(\d+)")
+HELP_TEXT = (
+    "Черновик: ответьте на него «публикуй», «публикуй 1,3» или «отмена»; без ответа — "
+    "если черновик один; или «публикуй !N/V». Любой другой текст — вопрос ревьюеру: ответом "
+    "на сообщение ревью — о нём, без ответа — о единственном черновике или о прошлых ревью "
+    "(назовите MR или задачу)."
+)
 
 
 class GitLabWebhookError(ValueError):
@@ -84,6 +110,18 @@ class _PendingRun:
     web_url: str
     own: bool = False
     task: str = ""
+    kind: str = "review"
+    review_id: int | None = None
+    iid: int | None = None
+    user_text: str = ""
+
+
+@dataclass(frozen=True)
+class _ChatRequest:
+    """A message from the approver that is not a command."""
+
+    text: str
+    reply_to: int | None = None
 
 
 @dataclass
@@ -128,10 +166,10 @@ class GitLabReviewChannel(BaseChannel):
         self._server: _ReusableThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue[ReviewCandidate] | None = None
+        self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest] | None = None
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._tasks: list[asyncio.Task[None]] = []
-        self._pending: dict[int, _PendingRun] = {}
+        self._pending: dict[str, _PendingRun] = {}
 
     async def start(self) -> None:
         self.config.validate_runtime()
@@ -203,14 +241,16 @@ class GitLabReviewChannel(BaseChannel):
                 await client.aclose()
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Receive the agent's answer for one MR and forward it as a draft."""
+        """Receive the agent's answer and forward it as a draft or a conversation reply."""
         if msg.event is not None and not isinstance(msg.event, ResponseSourceEvent):
             return
-        iid = self.config.iid_from_chat_id(msg.chat_id)
-        if iid is None or not msg.content.strip():
+        if not msg.content.strip():
             return
-        pending = self._pending.get(iid)
+        pending = self._pending.get(msg.chat_id)
         if pending is None:
+            iid = self.config.iid_from_chat_id(msg.chat_id)
+            if iid is None:
+                return
             self.logger.warning("MR !{}: answer arrived with no review waiting, dropped", iid)
             await self._tell_safe(
                 render_notice(
@@ -219,7 +259,12 @@ class GitLabReviewChannel(BaseChannel):
             )
             return
         try:
-            await self._deliver_draft(iid, msg.content, pending)
+            if pending.kind == "chat":
+                await self._deliver_chat(msg.content, pending)
+            else:
+                iid = pending.iid if pending.iid is not None else self.config.iid_from_chat_id(msg.chat_id)
+                assert iid is not None
+                await self._deliver_draft(iid, msg.content, pending)
         finally:
             if not pending.future.done():
                 pending.future.set_result(None)
@@ -232,23 +277,33 @@ class GitLabReviewChannel(BaseChannel):
                 actions=tuple(action for action in draft.actions if action.type != "approve"),
                 errors=(*draft.errors, "аппрув своего MR снят"),
             )
+        await self._send_draft(iid, draft, pending)
+
+    async def _send_draft(self, iid: int, draft: ReviewDraft, pending: _PendingRun) -> None:
+        """Store a new draft version of this MR, show it, and file it in the archive."""
         version = self._state.next_draft_version(iid)
         if draft.actions:
             self._state.save_draft(iid, pending.head_sha, draft.actions, version)
         else:
             self._state.delete_draft(iid)
-        message_ids = await self._tell(
-            render_draft(
-                iid,
-                pending.title,
-                draft,
-                web_url=pending.web_url,
-                version=version,
-                task=pending.task,
-            )
+        chunks = render_draft(
+            iid,
+            pending.title,
+            draft,
+            web_url=pending.web_url,
+            version=version,
+            task=pending.task,
         )
+        message_ids = await self._tell(chunks)
         if draft.actions and message_ids:
             self._state.record_draft_messages(iid, version, message_ids)
+        if pending.review_id is not None:
+            self._state.record_review_messages(pending.review_id, message_ids)
+            self._state.add_event(pending.review_id, "ревьюер", "\n\n".join(chunks))
+            self._state.set_review_status(
+                pending.review_id,
+                f"черновик {iid}/{version} ждёт решения" if draft.actions else "публиковать нечего",
+            )
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         channel = self
@@ -331,16 +386,21 @@ class GitLabReviewChannel(BaseChannel):
     async def _worker(self) -> None:
         assert self._queue is not None
         while True:
-            candidate = await self._queue.get()
+            item = await self._queue.get()
             try:
-                await self.process(candidate)
+                if isinstance(item, _ChatRequest):
+                    await self.converse(item)
+                else:
+                    await self.process(item)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.logger.exception("review of MR !{} failed", candidate.iid)
-                await self._tell_safe(
-                    render_notice(candidate.iid, "", f"Ревью не выполнено: {exc}")
-                )
+                if isinstance(item, _ChatRequest):
+                    self.logger.exception("conversation turn failed")
+                    await self._tell_safe([f"Ответ не получен: {exc}"])
+                else:
+                    self.logger.exception("review of MR !{} failed", item.iid)
+                    await self._tell_safe(render_notice(item.iid, "", f"Ревью не выполнено: {exc}"))
             finally:
                 self._queue.task_done()
 
@@ -391,7 +451,9 @@ class GitLabReviewChannel(BaseChannel):
                 )
             )
             return
-        await self._run_agent(info, prompt, own=own)
+        await self._run_agent(
+            info, prompt, own=own, kind="review" if candidate.kind == "merge_request" else "thread"
+        )
 
     async def _task_line(self, info: _MergeRequestInfo) -> str:
         """«Задача: KEY — name» with a link per task the MR names, or nothing."""
@@ -438,42 +500,90 @@ class GitLabReviewChannel(BaseChannel):
         )
         return render_lessons(matched, self.config.lessons_budget_chars)
 
-    async def _run_agent(self, info: _MergeRequestInfo, prompt: str, *, own: bool = False) -> None:
+    async def _run_agent(
+        self, info: _MergeRequestInfo, prompt: str, *, own: bool = False, kind: str = "review"
+    ) -> None:
+        """Run one review in a Claude session of its own."""
         assert self._loop is not None
-        future: asyncio.Future[None] = self._loop.create_future()
-        self._pending[info.iid] = _PendingRun(
-            future, info.head_sha, info.title, info.web_url, own=own, task=await self._task_line(info)
+        record = self._state.start_review(
+            iid=info.iid,
+            title=info.title,
+            web_url=info.web_url,
+            task_keys=find_task_keys(self.config.task_key_pattern, info.title, info.description),
+            kind=kind,
+            session_id=str(uuid.uuid4()),
+            head_sha=info.head_sha,
         )
+        pending = _PendingRun(
+            self._loop.create_future(),
+            info.head_sha,
+            info.title,
+            info.web_url,
+            own=own,
+            task=await self._task_line(info),
+            review_id=record.id,
+            iid=info.iid,
+        )
+        finished = await self._ask_agent(
+            self.config.review_chat_id(info.iid), prompt, pending, session=record.session_id
+        )
+        if not finished:
+            self._state.set_review_status(record.id, "остановлено по таймауту")
+            await self._tell(
+                render_notice(
+                    info.iid, info.title, "Ревью не завершилось за отведённое время и остановлено."
+                )
+            )
+
+    async def _ask_agent(
+        self, chat_id: str, prompt: str, pending: _PendingRun, *, session: str, resume: bool = False
+    ) -> bool:
+        """Hand *prompt* to the agent and wait for its answer; ``False`` on timeout."""
+        self._pending[chat_id] = pending
+        metadata: dict[str, Any] = {SESSION_METADATA_KEY: {"session_id": session, "resume": resume}}
+        if pending.iid is not None:
+            metadata["gitlab"] = {"iid": pending.iid, "project": self.config.project_path}
+        typing = asyncio.create_task(self._keep_typing()) if pending.kind == "chat" else None
         try:
             await self.bus.publish_inbound(
                 InboundMessage(
                     channel=self.name,
-                    sender_id=f"gitlab-mr-{info.iid}",
-                    chat_id=self.config.review_chat_id(info.iid),
+                    sender_id=f"gitlab-mr-{pending.iid}" if pending.iid is not None else "gitlab-chat",
+                    chat_id=chat_id,
                     content=prompt,
                     timestamp=datetime.now(),
-                    metadata={"gitlab": {"iid": info.iid, "project": self.config.project_path}},
+                    metadata=metadata,
                 )
             )
             try:
-                await asyncio.wait_for(asyncio.shield(future), self.config.review_timeout_s)
+                await asyncio.wait_for(asyncio.shield(pending.future), self.config.review_timeout_s)
             except TimeoutError:
-                await self._stop_turn(info.iid)
-                await self._tell(
-                    render_notice(
-                        info.iid, info.title, "Ревью не завершилось за отведённое время и остановлено."
-                    )
-                )
+                await self._stop_turn(chat_id)
+                return False
+            return True
         finally:
-            self._pending.pop(info.iid, None)
+            if typing is not None:
+                typing.cancel()
+            self._pending.pop(chat_id, None)
 
-    async def _stop_turn(self, iid: int) -> None:
-        """Cancel the agent turn of this MR so it cannot run alongside the next one."""
+    async def _keep_typing(self) -> None:
+        assert self._telegram is not None
+        while True:
+            try:
+                await self._telegram.send_typing(str(self.config.telegram_chat_id))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.debug("typing indicator failed: {}", exc)
+            await asyncio.sleep(TYPING_INTERVAL_S)
+
+    async def _stop_turn(self, chat_id: str) -> None:
+        """Cancel the agent turn so it cannot run alongside the next one."""
         await self.bus.publish_inbound(
             InboundMessage(
                 channel=self.name,
-                sender_id=f"gitlab-mr-{iid}",
-                chat_id=self.config.review_chat_id(iid),
+                sender_id="gitlab-review",
+                chat_id=chat_id,
                 content=STOP_COMMAND,
                 timestamp=datetime.now(),
             )
@@ -488,8 +598,8 @@ class GitLabReviewChannel(BaseChannel):
                 messages = await self._telegram.get_updates(offset)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger.exception("Telegram polling failed")
+            except Exception as exc:
+                self.logger.warning("Telegram polling failed: {}", exc)
                 await asyncio.sleep(POLL_RETRY_S)
                 continue
             for message in messages:
@@ -504,22 +614,77 @@ class GitLabReviewChannel(BaseChannel):
                     await self._tell_safe([f"Команда не выполнена: {exc}"])
 
     async def handle_telegram(self, message: TelegramMessage) -> None:
-        """Act on a message from the approver; ignore every other chat and sender."""
+        """Act on a message from the approver; ignore every other chat and sender.
+
+        Commands are recognised in code and run at once. Anything else is a
+        question or a request to the reviewer and goes to the agent.
+        """
         if not self.config.is_approver(message.chat_id, message.sender_id):
             return
-        command = None
-        if message.reply_to is not None:
-            ref = self._state.draft_for_message(message.reply_to)
-            if ref is not None:
-                command = parse_reply_command(message.text, *ref)
-        if command is None:
-            command = parse_command(message.text)
-        if command is None:
-            await self._tell([
-                "Ответьте на сообщение черновика: «публикуй», «публикуй 1,3» или «отмена». "
-                "Или командой: «публикуй !N/V», «публикуй !N/V 1,3», «отмена !N»."
-            ])
+        text = message.text or ""
+        if not text.strip():
             return
+        if text.lstrip().startswith("/"):
+            await self._tell([HELP_TEXT])
+            return
+        command = self._command_for(text, message.reply_to)
+        if command is None and message.reply_to is None:
+            bare = parse_bare_command(text)
+            if bare is not None:
+                command = await self._command_for_only_draft(*bare)
+                if command is None:
+                    return
+        if command is not None:
+            await self.apply_command(command, text)
+            return
+        assert self._queue is not None
+        if self._pending or not self._queue.empty():
+            await self._tell(["Принял. Отвечу, как закончу текущую работу."])
+        self._queue.put_nowait(_ChatRequest(text, message.reply_to))
+
+    def _command_for(self, text: str, reply_to: int | None) -> ApprovalCommand | None:
+        """A command naming its draft: by reply to a draft or its review, or by number."""
+        if reply_to is not None:
+            ref = self._state.draft_for_message(reply_to)
+            if ref is not None:
+                return parse_reply_command(text, *ref) or parse_command(text)
+            review = self._state.review_for_message(reply_to)
+            if review is not None and review.iid is not None:
+                stored = self._state.load_draft(review.iid)
+                command = parse_reply_command(
+                    text, review.iid, stored.version if stored is not None else None
+                )
+                if command is not None:
+                    return command
+        return parse_command(text)
+
+    async def _command_for_only_draft(
+        self, publish: bool, items: tuple[int, ...]
+    ) -> ApprovalCommand | None:
+        """Apply a bare «публикуй»/«отмена» to the only waiting draft, or say why not."""
+        drafts = self._state.pending_drafts()
+        if len(drafts) == 1:
+            iid, version = drafts[0]
+            return ApprovalCommand(publish=publish, iid=iid, items=items, version=version)
+        if not drafts:
+            await self._tell(["Нет черновиков, ждущих решения."])
+            return None
+        await self._tell([
+            "Черновиков несколько — ответьте на сообщение нужного или укажите номер "
+            "(«публикуй !N/V»):\n" + "\n".join(self._describe_draft(iid, v) for iid, v in drafts)
+        ])
+        return None
+
+    def _describe_draft(self, iid: int, version: int) -> str:
+        review = self._state.latest_review(iid)
+        title = f" {review.title}" if review is not None and review.title else ""
+        return f"!{iid}/{version}{title}"
+
+    async def apply_command(self, command: ApprovalCommand, text: str = "") -> None:
+        """Publish or cancel a draft, and file the decision in the archive."""
+        review = self._state.latest_review(command.iid)
+        if review is not None and text:
+            self._state.add_event(review.id, "вы", text)
         if not command.publish and command.version is not None:
             stored = self._state.load_draft(command.iid)
             if stored is not None and stored.version != command.version:
@@ -529,10 +694,162 @@ class GitLabReviewChannel(BaseChannel):
                 ])
                 return
         if not command.publish:
+            if self._state.load_draft(command.iid) is None:
+                await self._tell([f"!{command.iid}: нет черновика для отмены."])
+                return
             self._state.delete_draft(command.iid)
-            await self._tell([f"!{command.iid}: черновик отменён, ничего не опубликовано."])
+            message_ids = await self._tell([f"!{command.iid}: черновик отменён, ничего не опубликовано."])
+            if review is not None:
+                self._state.set_review_status(review.id, "черновик отменён")
+                self._state.record_review_messages(review.id, message_ids)
             return
         await self.publish(command)
+
+    async def converse(self, request: _ChatRequest) -> None:
+        """Answer one message of the approver in the session of the review it is about."""
+        assert self._loop is not None
+        target = self._state.review_for_message(request.reply_to) if request.reply_to else None
+        drafts = self._state.pending_drafts()
+        iid: int | None = None
+        if target is None and request.reply_to is not None:
+            ref = self._state.draft_for_message(request.reply_to)
+            iid = ref[0] if ref is not None else None
+        elif target is None and len(drafts) == 1:
+            iid = drafts[0][0]
+        if target is None and iid is not None:
+            target = self._state.latest_review(iid)
+        archive = [
+            review
+            for review in self._state.find_reviews(
+                [int(number) for number in _MR_REF_RE.findall(request.text)],
+                find_task_keys(self.config.task_key_pattern, request.text),
+                ARCHIVE_LIMIT,
+            )
+            if target is None or review.id != target.id
+        ]
+        resume = target is not None
+        if target is None and iid is not None:
+            target = await self._review_without_session(iid)
+        elif target is None:
+            target = self._state.start_review(
+                iid=None,
+                title="",
+                web_url="",
+                task_keys=find_task_keys(self.config.task_key_pattern, request.text),
+                kind="chat",
+                session_id=str(uuid.uuid4()),
+                head_sha="",
+            )
+        self._state.add_event(target.id, "вы", request.text)
+        prompt = chat_prompt(
+            request.text,
+            target=self._describe_review(target) if target.iid is not None else "",
+            draft=self._current_draft_text(target),
+            pending=[self._describe_draft(iid, version) for iid, version in drafts],
+            archive=[
+                self._state.render_review(review)[:ARCHIVE_ENTRY_CHARS] for review in archive
+            ],
+            archive_dir=str(self._state.archive_dir),
+        )
+        pending = _PendingRun(
+            self._loop.create_future(),
+            target.head_sha,
+            target.title,
+            target.web_url,
+            kind="chat",
+            review_id=target.id,
+            iid=target.iid,
+            user_text=request.text,
+        )
+        chat_id = (
+            self.config.review_chat_id(target.iid)
+            if target.iid is not None
+            else f"{self.config.chat_id}:chat-{target.id}"
+        )
+        finished = await self._ask_agent(
+            chat_id, prompt, pending, session=target.session_id, resume=resume
+        )
+        if not finished:
+            await self._tell(["Ответ не уложился в отведённое время и остановлен."])
+
+    async def _review_without_session(self, iid: int) -> ReviewRecord:
+        """An archive entry for a draft whose review left none behind.
+
+        The conversation then starts a fresh session; the draft in the prompt
+        is all the agent knows of the review.
+        """
+        info = await self._merge_request(iid)
+        stored = self._state.load_draft(iid)
+        return self._state.start_review(
+            iid=iid,
+            title=info.title,
+            web_url=info.web_url,
+            task_keys=find_task_keys(self.config.task_key_pattern, info.title, info.description),
+            kind="review",
+            session_id=str(uuid.uuid4()),
+            head_sha=stored.head_sha if stored is not None else info.head_sha,
+        )
+
+    def _describe_review(self, review: ReviewRecord) -> str:
+        parts = [f"MR !{review.iid} «{review.title}»", f"начато {review.started_at}", review.status]
+        if review.task_keys:
+            parts.append("задачи " + ", ".join(review.task_keys))
+        if review.web_url:
+            parts.append(review.web_url)
+        return "; ".join(parts)
+
+    def _current_draft_text(self, review: ReviewRecord) -> str:
+        if review.iid is None:
+            return ""
+        stored = self._state.load_draft(review.iid)
+        if stored is None:
+            return ""
+        lines = [f"Черновик {review.iid}/{stored.version}:"]
+        for number, action in enumerate(stored.actions, start=1):
+            lines.append(f"{number}. [{action.label()}] {action.body}".rstrip())
+        return "\n".join(lines)
+
+    async def _deliver_chat(self, answer: str, pending: _PendingRun) -> None:
+        """Show the agent's reply; turn a revised draft or a decision into action."""
+        parsed = parse_chat_answer(answer, pending.iid)
+        message_ids = await self._tell(render_chat(pending.iid, parsed.text))
+        if pending.review_id is not None:
+            self._state.record_review_messages(pending.review_id, message_ids)
+            self._state.add_event(pending.review_id, "ревьюер", parsed.text)
+
+        if parsed.draft is not None and pending.iid is not None:
+            if parsed.draft.actions:
+                await self._send_draft(
+                    pending.iid,
+                    ReviewDraft("Исправленный черновик.", parsed.draft.actions, parsed.draft.errors),
+                    pending,
+                )
+            elif self._state.load_draft(pending.iid) is not None:
+                self._state.delete_draft(pending.iid)
+                if pending.review_id is not None:
+                    self._state.set_review_status(pending.review_id, "черновик снят")
+                await self._tell([f"!{pending.iid}: черновик снят, публиковать нечего."])
+
+        decision = parsed.decision
+        if decision is None:
+            return
+        if parsed.draft is not None:
+            await self._tell([
+                f"!{decision.iid}: сначала посмотрите новую версию черновика, потом ответьте на неё."
+            ])
+            return
+        asked = says_publish(pending.user_text) if decision.publish else says_cancel(pending.user_text)
+        if not asked:
+            verb = "публикуй" if decision.publish else "отмена"
+            await self._tell([f"!{decision.iid}: чтобы выполнить, ответьте на черновик «{verb}»."])
+            return
+        if decision.version is None:
+            stored = self._state.load_draft(decision.iid)
+            if stored is not None:
+                decision = ApprovalCommand(
+                    decision.publish, decision.iid, decision.items, stored.version
+                )
+        await self.apply_command(decision)
 
     async def publish(self, command: ApprovalCommand) -> None:
         """Publish approved actions, refusing if the branch moved since the review."""
@@ -582,7 +899,14 @@ class GitLabReviewChannel(BaseChannel):
         self._state.delete_draft(command.iid)
         if len(selected) < len(actions):
             report.append("Остальные пункты черновика сняты.")
-        await self._tell([f"!{command.iid}:\n" + "\n".join(report)])
+        summary = f"!{command.iid}:\n" + "\n".join(report)
+        review = self._state.latest_review(command.iid)
+        if review is not None:
+            self._state.add_event(review.id, "система", summary)
+            self._state.set_review_status(review.id, f"опубликовано (черновик {current})")
+        message_ids = await self._tell([summary])
+        if review is not None:
+            self._state.record_review_messages(review.id, message_ids)
 
     @staticmethod
     def _select(
