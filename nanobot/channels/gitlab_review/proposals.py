@@ -6,8 +6,8 @@ publishes only the items the human approves there. Keeping the format and its
 validation here makes "what can reach GitLab" a closed, testable list.
 
 In a conversation about a review the agent may also ask for a publication or a
-cancellation with a decision block. That is only a request: the channel acts on
-it when the human's own message says so, never on the agent's word alone.
+cancellation with a decision block, when it reads the human's message as such a
+request. The channel acts on it only for the draft the human was shown.
 """
 from __future__ import annotations
 
@@ -44,8 +44,6 @@ _DECISION_RE = re.compile(
     r"```" + re.escape(DECISION_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
     re.DOTALL,
 )
-_SAYS_PUBLISH_RE = re.compile(r"публик|publish", re.IGNORECASE)
-_SAYS_CANCEL_RE = re.compile(r"отмен|cancel", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -93,7 +91,7 @@ class ChatAnswer:
 
     ``draft`` is set only when the answer carries a new actions block: a
     revised draft replacing the current one. ``decision`` is the agent's
-    reading of a publish or cancel request, still subject to the human's words.
+    reading of the human's message as a publish or cancel request.
     """
 
     text: str
@@ -170,14 +168,6 @@ def parse_bare_command(text: str) -> tuple[bool, tuple[int, ...]] | None:
         return None
     items = tuple(int(item) for item in re.findall(r"\d+", match.group("items") or ""))
     return match.group("verb").casefold() in _PUBLISH_VERBS, items
-
-
-def says_publish(text: str) -> bool:
-    return _SAYS_PUBLISH_RE.search(text or "") is not None
-
-
-def says_cancel(text: str) -> bool:
-    return _SAYS_CANCEL_RE.search(text or "") is not None
 
 
 def parse_chat_answer(answer: str, iid: int | None) -> ChatAnswer:

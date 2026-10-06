@@ -718,18 +718,14 @@ async def test_revised_draft_becomes_a_new_version(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_decision_publishes_only_when_the_human_said_so(tmp_path: Path) -> None:
+async def test_agent_decision_publishes_on_the_humans_own_words(tmp_path: Path) -> None:
     decision = {"decision": "publish", "iid": 42, "items": [2]}
     async with Harness(tmp_path) as h:
         await h.review(42, [{"type": "note", "body": "one"}, {"type": "note", "body": "two"}])
-        await h.say(1, "второе замечание верное?")
-        await h.reply_as_agent("gitlab-review:42", _answer("Да.", decision=decision))
-        assert h.gitlab.writes == []
-        assert "чтобы выполнить, ответьте на черновик «публикуй»" in h.telegram.text()
-
-        await h.say(2, "ок, опубликуй только второе")
-        await h.reply_as_agent("gitlab-review:42", _answer("Публикую второе.", decision=decision))
+        await h.say(1, "выкатывай второе")
+        await h.reply_as_agent("gitlab-review:42", _answer("Понял.", decision=decision))
     assert h.gitlab.writes == [("note", "two")]
+    assert "!42: публикую по вашему «выкатывай второе»." in h.telegram.text()
 
 
 @pytest.mark.asyncio

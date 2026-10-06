@@ -20,8 +20,8 @@ Flow:
    Claude session of the review it is about (the one replied to, or the only
    waiting draft), so the agent remembers what it read; every new review
    starts a new session. The agent may answer, revise the draft, or ask for a
-   publication, which the channel performs only if the human's own words ask
-   for it. Every review, draft, decision and message is kept in an archive the
+   publication or a cancellation, which the channel then performs on the draft
+   the human was shown, if the branch has not moved. Every review, draft, decision and message is kept in an archive the
    agent can consult when asked about an earlier review.
 7. The agent may also note what it learned about the developers involved;
    :mod:`people` files it per GitLab username and the profile comes back in the
@@ -71,8 +71,6 @@ from nanobot.channels.gitlab_review.proposals import (
     render_chat,
     render_draft,
     render_notice,
-    says_cancel,
-    says_publish,
 )
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
@@ -957,17 +955,14 @@ class GitLabReviewChannel(BaseChannel):
                 f"!{decision.iid}: сначала посмотрите новую версию черновика, потом ответьте на неё."
             ])
             return
-        asked = says_publish(pending.user_text) if decision.publish else says_cancel(pending.user_text)
-        if not asked:
-            verb = "публикуй" if decision.publish else "отмена"
-            await self._tell([f"!{decision.iid}: чтобы выполнить, ответьте на черновик «{verb}»."])
-            return
         if decision.version is None:
             stored = self._state.load_draft(decision.iid)
             if stored is not None:
                 decision = ApprovalCommand(
                     decision.publish, decision.iid, decision.items, stored.version
                 )
+        action = "публикую" if decision.publish else "отменяю"
+        await self._tell([f"!{decision.iid}: {action} по вашему «{pending.user_text[:200]}»."])
         await self.apply_command(decision)
 
     async def publish(self, command: ApprovalCommand) -> None:

@@ -1826,9 +1826,11 @@ channel passes `claude_cli.session_id` in the inbound metadata, and the
 `claude_cli` provider runs `claude -p --session-id` for a review and
 `--resume` for the conversation). The agent may answer, send a revised draft
 (a new version), or ask for a publication with a `gitlab-review-decision`
-block. The channel publishes on that request only if your own message says
-`публикуй`/`опубликуй` (`отмена` to cancel), and never in the same answer as a
-revised draft you have not seen yet.
+block when it reads your message as such a request, in any words. The
+channel then publishes the draft you were shown (refusing a replaced version,
+a moved branch, or an approval of your own MR), says which message of yours it
+acted on, and never acts in the same answer as a revised draft you have not
+seen yet.
 
 **Archive.** Every review, its drafts, your decisions and the conversation are
 stored in `state.sqlite3` and exported as one Markdown file per review into
