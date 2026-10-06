@@ -29,6 +29,7 @@ class ReviewCandidate:
     author_id: int | None = None
     discussion_id: str | None = None
     note_id: int | None = None
+    requested: bool = False
 
     @property
     def debounce_key(self) -> str:

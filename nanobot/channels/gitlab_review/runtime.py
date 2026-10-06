@@ -99,6 +99,10 @@ ARCHIVE_LIMIT = 5
 ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
+_REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
+_REVERTED_RE = re.compile(
+    r"^This reverts (?:merge request (?P<mr>![0-9]+)|commit (?P<sha>[0-9a-f]{40}))", re.MULTILINE
+)
 CONTINUE_WINDOW = timedelta(hours=12)
 DREAM_CURSOR_KEY = "people_dream_cursor"
 DREAM_MR_LIMIT = 30
@@ -616,6 +620,15 @@ class GitLabReviewChannel(BaseChannel):
         if not info.open or info.draft:
             return
 
+        if candidate.kind == "merge_request" and not candidate.requested:
+            reverted = await self._reverted_by(info.iid)
+            if reverted:
+                await self._tell([
+                    f"!{info.iid} — ревёрт {', '.join(reverted)}, ревью пропущено. "
+                    f"Проверить всё же: «проверь !{info.iid}»."
+                ])
+                return
+
         own = self.config.is_reviewer(info.author)
         authors = self._profiled([info.author] if info.author else [])
         if candidate.kind == "merge_request":
@@ -674,6 +687,27 @@ class GitLabReviewChannel(BaseChannel):
             kind="review" if candidate.kind == "merge_request" else "thread",
             authors=authors,
         )
+
+    async def _reverted_by(self, iid: int) -> list[str]:
+        """What the MR reverts, when every commit in it is a revert; otherwise nothing.
+
+        Git and GitLab's Revert button both write «This reverts …» into the
+        commit message. A title can be edited, the trailer cannot be faked by
+        accident, and an MR that mixes a revert with new commits is reviewed.
+        """
+        assert self._gitlab is not None
+        try:
+            commits = await self._gitlab.get_commits(iid)
+        except GitLabApiError as exc:
+            self.logger.warning("MR !{}: commits unavailable, reviewing as usual: {}", iid, exc)
+            return []
+        reverted: list[str] = []
+        for commit in commits:
+            match = _REVERTED_RE.search(str(commit.get("message") or ""))
+            if match is None:
+                return []
+            reverted.append(match.group("mr") or match.group("sha")[:8])
+        return list(dict.fromkeys(reverted))
 
     async def _task_line(self, info: _MergeRequestInfo) -> str:
         """«Задача: KEY — name» with a link per task the MR names, or nothing."""
@@ -852,6 +886,14 @@ class GitLabReviewChannel(BaseChannel):
             return
         text = message.text or ""
         if not text.strip():
+            return
+        requested = _REVIEW_REQUEST_RE.match(text)
+        if requested is not None:
+            assert self._queue is not None
+            iid = int(requested.group(1))
+            self._queue.put_nowait(ReviewCandidate(kind="merge_request", iid=iid, requested=True))
+            busy = " после текущей работы" if self._pending else ""
+            await self._tell([f"!{iid}: запускаю ревью{busy}."])
             return
         command = self._command_for(text, message.reply_to)
         if command is None and message.reply_to is None:

@@ -67,6 +67,7 @@ class FakeGitLab:
         self.discussions: dict[str, list[dict[str, Any]]] = {}
         self.writes: list[tuple[str, Any]] = []
         self.fail_writes = False
+        self.commits: list[str] = ["feat: thing"]
         self.fail_changes = False
         self.changes: list[dict[str, Any]] = [
             {
@@ -86,6 +87,9 @@ class FakeGitLab:
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
         return {"id": discussion_id, "notes": self.discussions.get(discussion_id, [])}
+
+    async def get_commits(self, iid: int) -> list[dict[str, Any]]:
+        return [{"message": message} for message in self.commits]
 
     async def list_discussions(self, iid: int) -> list[dict[str, Any]]:
         return [{"id": key, "notes": notes} for key, notes in self.discussions.items()]
@@ -1038,3 +1042,35 @@ def test_russian_prose_with_code_is_not_english() -> None:
     assert not written_in_english(text)
     assert written_in_english(ENGLISH)
 
+
+@pytest.mark.asyncio
+async def test_revert_is_skipped_with_a_notice(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.mr["title"] = "Откат интеграции"
+        h.gitlab.commits = [
+            'Revert "Merge branch \'AMDEV-310\' into \'test\'"\n\nThis reverts merge request !5937',
+            "Revert \"fix\"\n\nThis reverts commit " + "ab" * 20 + ".",
+        ]
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    assert h.inbound == []
+    assert "!42 — ревёрт !5937, abababab, ревью пропущено. Проверить всё же: «проверь !42»." in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_revert_mixed_with_new_commits_is_reviewed(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_timeout_s=0.05) as h:
+        h.gitlab.mr["title"] = 'Revert "feat: thing"'
+        h.gitlab.commits = ["Revert \"x\"\n\nThis reverts merge request !1", "fix: new code"]
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    assert "review-gitlab-mrs" in h.inbound[0].content
+
+
+@pytest.mark.asyncio
+async def test_requested_review_runs_even_for_a_revert(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.commits = ["Revert \"x\"\n\nThis reverts merge request !1"]
+        await h.channel.handle_telegram(_tg(1, "Проверь !42"))
+        await _until(lambda: len(h.inbound) == 1)
+        assert "review-gitlab-mrs" in h.inbound[0].content
+        assert "!42: запускаю ревью." in h.telegram.text()
+        await h.reply_as_agent("gitlab-review:42", _answer("Ревёрт точный.", []))

@@ -61,6 +61,19 @@ class GitLabApi:
             f"/projects/{self._project}/merge_requests/{iid}/discussions/{quote(discussion_id, safe='')}"
         )
 
+    async def get_commits(self, iid: int) -> list[dict[str, Any]]:
+        response = await self._client.get(
+            f"/projects/{self._project}/merge_requests/{iid}/commits", params={"per_page": 100}
+        )
+        if response.status_code >= 400:
+            raise GitLabApiError(
+                f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
+            )
+        data: object = response.json()
+        if not isinstance(data, list):
+            raise GitLabApiError("GitLab returned a non-list response")
+        return [cast("dict[str, Any]", item) for item in cast("list[object]", data) if isinstance(item, dict)]
+
     async def list_discussions(self, iid: int, max_pages: int = 5) -> list[dict[str, Any]]:
         discussions: list[dict[str, Any]] = []
         for page in range(1, max_pages + 1):

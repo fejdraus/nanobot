@@ -1818,6 +1818,10 @@ refused. Publishing is also refused if the MR's head moved since the review.
 A bare `публикуй` or `отмена` without a reply applies to the only waiting draft;
 with several waiting, the channel lists them instead.
 
+**Reverts.** A merge request whose every commit is a revert (git's «This reverts
+commit …» or GitLab's «This reverts merge request !N» trailer) is not reviewed;
+the channel only says so in Telegram. `проверь !N` asks for a review of any MR.
+
 **Talking to the reviewer.** Any other message from the approver goes to the
 agent. It continues the Claude session of the review it concerns — the one
 whose message you replied to, or the only waiting draft — so the agent keeps
