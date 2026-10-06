@@ -992,3 +992,49 @@ async def test_draft_without_an_mr_is_not_dropped_silently(tmp_path: Path) -> No
     assert "не указан MR" in h.telegram.text()
     assert h.channel._state.pending_drafts() == []
 
+
+ENGLISH = (
+    "The revert is exact. Excluding the CI scripts, the branch matches the commit before the merge "
+    "with no differences, and nothing references the removed code anymore."
+)
+
+
+@pytest.mark.asyncio
+async def test_english_summary_is_asked_again_in_russian_in_the_same_session(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
+        await _until(lambda: len(h.inbound) == 1)
+        session = h.inbound[0].metadata["claude_cli"]["session_id"]
+        await h.channel.send(OutboundMessage(channel="gitlab_review", chat_id="gitlab-review:42",
+                                             content=_answer(ENGLISH, [{"type": "note", "body": "Ревёрт точный"}])))
+        await _until(lambda: len(h.inbound) == 2)
+        assert h.inbound[1].metadata["claude_cli"] == {"session_id": session, "resume": True}
+        assert "in Russian" in h.inbound[1].content
+        assert h.telegram.sent == []
+        await h.channel.send(OutboundMessage(channel="gitlab_review", chat_id="gitlab-review:42",
+                                             content=_answer("Ревёрт точный, замечаний нет.", [{"type": "note", "body": "Ревёрт точный"}])))
+        await task
+    assert "Ревёрт точный, замечаний нет." in h.telegram.text()
+    assert "The revert is exact" not in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_english_twice_is_delivered_rather_than_looping(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
+        await _until(lambda: len(h.inbound) == 1)
+        for expected in (2, 2):
+            await h.channel.send(OutboundMessage(channel="gitlab_review", chat_id="gitlab-review:42",
+                                                 content=_answer(ENGLISH, [])))
+            await _until(lambda: len(h.inbound) == expected)
+        await task
+    assert "The revert is exact" in h.telegram.text()
+
+
+def test_russian_prose_with_code_is_not_english() -> None:
+    from nanobot.channels.gitlab_review.proposals import written_in_english
+
+    text = "Флаг `BnzIsHideSendForImplementationButton` нигде не сбрасывается в `false`, см. https://gitlab.example.com/a/b"
+    assert not written_in_english(text)
+    assert written_in_english(ENGLISH)
+

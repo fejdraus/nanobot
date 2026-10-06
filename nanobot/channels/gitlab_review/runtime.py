@@ -60,6 +60,7 @@ from nanobot.channels.gitlab_review.people import (
     parse_profile,
 )
 from nanobot.channels.gitlab_review.prompts import (
+    RUSSIAN_RETRY,
     chat_prompt,
     dream_prompt,
     reply_prompt,
@@ -78,6 +79,7 @@ from nanobot.channels.gitlab_review.proposals import (
     render_chat,
     render_draft,
     render_notice,
+    written_in_english,
 )
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
@@ -130,6 +132,8 @@ class _PendingRun:
     iid: int | None = None
     user_text: str = ""
     authors: tuple[str, ...] = ()
+    session: str = ""
+    retried: bool = False
 
 
 @dataclass(frozen=True)
@@ -282,6 +286,22 @@ class GitLabReviewChannel(BaseChannel):
             await self._tell_safe(
                 render_notice(
                     iid, "", "Ответ ревью пришёл после таймаута; черновик не сохранён."
+                )
+            )
+            return
+        if pending.kind != "dream" and not pending.retried and written_in_english(
+            parse_draft(content).summary
+        ):
+            pending.retried = True
+            self.logger.info("{}: answer came in English, asking for it in Russian", msg.chat_id)
+            await self.bus.publish_inbound(
+                InboundMessage(
+                    channel=self.name,
+                    sender_id="gitlab-review",
+                    chat_id=msg.chat_id,
+                    content=RUSSIAN_RETRY,
+                    timestamp=datetime.now(),
+                    metadata={SESSION_METADATA_KEY: {"session_id": pending.session, "resume": True}},
                 )
             )
             return
@@ -748,6 +768,7 @@ class GitLabReviewChannel(BaseChannel):
     ) -> bool:
         """Hand *prompt* to the agent and wait for its answer; ``False`` on timeout."""
         self._pending[chat_id] = pending
+        pending.session = session
         metadata: dict[str, Any] = {SESSION_METADATA_KEY: {"session_id": session, "resume": resume}}
         if pending.iid is not None:
             metadata["gitlab"] = {"iid": pending.iid, "project": self.config.project_path}

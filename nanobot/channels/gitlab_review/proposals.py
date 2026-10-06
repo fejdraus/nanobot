@@ -224,6 +224,19 @@ def _parse_decision(body: str, iid: int | None) -> ApprovalCommand | None:
     )
 
 
+_CODE_RE = re.compile(r"```.*?```|`[^`\n]*`|https?://\S+", re.DOTALL)
+_CYRILLIC_RE = re.compile(r"[а-яёіїєґ]", re.IGNORECASE)
+_LATIN_RE = re.compile(r"[a-z]", re.IGNORECASE)
+
+
+def written_in_english(text: str) -> bool:
+    """Whether prose meant for a Russian reader came out in English (code and links aside)."""
+    prose = _CODE_RE.sub(" ", text or "")
+    latin = len(_LATIN_RE.findall(prose))
+    cyrillic = len(_CYRILLIC_RE.findall(prose))
+    return latin >= 80 and latin > 2 * cyrillic
+
+
 def render_chat(iid: int | None, text: str) -> list[str]:
     """A conversation answer, marked with its MR so parallel talks stay apart."""
     prefix = f"!{iid} · " if iid is not None else ""
