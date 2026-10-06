@@ -902,6 +902,8 @@ async def test_draft_from_a_conversation_names_its_mr_and_can_be_published(tmp_p
             '{"iid": 42, "actions": [{"type": "reply", "discussion_id": "d1", "body": "Принято"}]}\n```',
         )
         assert "Черновик 42/1" in h.telegram.text()
+        assert "Черновик из разговора." in h.telegram.text()
+        assert "!42 · Предлагаю ответить так:\n\n(черновик — следующим сообщением)" in h.telegram.text()
         assert "Принято" in h.telegram.text()
         await h.channel.handle_telegram(_tg(2, "публикуй", reply_to=1000 + len(h.telegram.sent)))
         review = h.channel._state.latest_review(42)

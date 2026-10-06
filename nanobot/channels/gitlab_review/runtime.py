@@ -895,20 +895,14 @@ class GitLabReviewChannel(BaseChannel):
             lines.append(f"{number}. [{action.label()}] {action.body}".rstrip())
         return "\n".join(lines)
 
-    async def _bind_draft(self, iid: int | None, pending: _PendingRun) -> bool:
-        """Find the MR a draft from a conversation belongs to; say so when there is none."""
+    async def _bind_draft(self, iid: int | None, pending: _PendingRun) -> str:
+        """Tie a draft from a conversation to its MR; return why not, or ``""``."""
         if pending.iid is not None:
             if iid is None or iid == pending.iid:
-                return True
-            await self._tell([
-                f"Черновик назван для !{iid}, а разговор о !{pending.iid}. Не сохранён — уточните MR."
-            ])
-            return False
+                return ""
+            return f"Черновик назван для !{iid}, а разговор о !{pending.iid}. Не сохранён — уточните MR."
         if iid is None:
-            await self._tell([
-                "Предложенные действия не сохранены: не указан MR. Напишите, к какому MR они относятся."
-            ])
-            return False
+            return "Предложенные действия не сохранены: не указан MR. Напишите, к какому MR они относятся."
         info = await self._merge_request(iid)
         if pending.review_id is not None:
             self._state.bind_review(
@@ -924,23 +918,29 @@ class GitLabReviewChannel(BaseChannel):
         pending.title = info.title
         pending.web_url = info.web_url
         pending.task = await self._task_line(info)
-        return True
+        return ""
 
     async def _deliver_chat(self, answer: str, pending: _PendingRun) -> None:
         """Show the agent's reply; turn a revised draft or a decision into action."""
         parsed = parse_chat_answer(answer, pending.iid)
+        problem = await self._bind_draft(parsed.draft_iid, pending) if parsed.draft is not None else ""
         message_ids = await self._tell(render_chat(pending.iid, parsed.text))
         if pending.review_id is not None:
             self._state.record_review_messages(pending.review_id, message_ids)
             self._state.add_event(pending.review_id, "ревьюер", parsed.text)
-
-        if parsed.draft is not None and not await self._bind_draft(parsed.draft_iid, pending):
+        if problem:
+            await self._tell([problem])
             parsed = ChatAnswer(parsed.text, None, parsed.decision)
         if parsed.draft is not None and pending.iid is not None:
             if parsed.draft.actions:
+                revised = self._state.load_draft(pending.iid) is not None
                 await self._send_draft(
                     pending.iid,
-                    ReviewDraft("Исправленный черновик.", parsed.draft.actions, parsed.draft.errors),
+                    ReviewDraft(
+                        "Исправленный черновик." if revised else "Черновик из разговора.",
+                        parsed.draft.actions,
+                        parsed.draft.errors,
+                    ),
                     pending,
                 )
             elif self._state.load_draft(pending.iid) is not None:

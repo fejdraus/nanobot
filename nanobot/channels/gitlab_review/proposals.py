@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 ACTIONS_FENCE = "gitlab-review-actions"
 DECISION_FENCE = "gitlab-review-decision"
 TELEGRAM_LIMIT = 4000
+DRAFT_FOLLOWS = "(черновик — следующим сообщением)"
 
 ActionType = Literal["discussion", "note", "reply", "approve"]
 _ACTION_TYPES: frozenset[str] = frozenset({"discussion", "note", "reply", "approve"})
@@ -199,7 +200,9 @@ def parse_chat_answer(answer: str, iid: int | None) -> ChatAnswer:
         mapping = _as_mapping(block)
         draft_iid = _int(mapping.get("iid")) if mapping is not None else None
         draft = parse_draft(text)
-        text = draft.summary
+        last = fences[-1]
+        text = text[: last.start()] + DRAFT_FOLLOWS + text[last.end():]
+        text = re.sub(r"\n{3,}", "\n\n", text)
     return ChatAnswer(text=text.strip(), draft=draft, decision=decision, draft_iid=draft_iid)
 
 
