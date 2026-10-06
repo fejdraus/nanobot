@@ -81,7 +81,14 @@ from nanobot.channels.gitlab_review.proposals import (
     render_notice,
     written_in_english,
 )
-from nanobot.channels.gitlab_review.reverts import is_exact_revert, label, reverted_refs
+from nanobot.channels.gitlab_review.reverts import (
+    Net,
+    is_exact_revert,
+    label,
+    net_from_changes,
+    net_from_raw,
+    reverted_refs,
+)
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
@@ -699,16 +706,17 @@ class GitLabReviewChannel(BaseChannel):
             refs = reverted_refs(str(commit.get("message") or "") for commit in commits)
             if not refs:
                 return []
-            originals: list[list[dict[str, Any]]] = []
+            originals: list[Net | None] = []
             for kind, value in refs:
                 if kind == "mr":
-                    originals.append(await self._gitlab.get_changes(int(value)))
+                    originals.append(net_from_raw(await self._gitlab.get_raw_diff(int(value))))
                     continue
                 parents = (await self._gitlab.get_commit(value)).get("parent_ids")
                 if not isinstance(parents, list) or not parents:
                     return []
-                originals.append(await self._gitlab.compare(str(cast("list[object]", parents)[0]), value))
-            current = await self._gitlab.get_changes(iid)
+                first = str(cast("list[object]", parents)[0])
+                originals.append(net_from_changes(await self._gitlab.compare(first, value)))
+            current = net_from_raw(await self._gitlab.get_raw_diff(iid))
         except GitLabApiError as exc:
             self.logger.warning("MR !{}: revert not verifiable, reviewing as usual: {}", iid, exc)
             return []

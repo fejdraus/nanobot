@@ -1,10 +1,16 @@
-from nanobot.channels.gitlab_review.reverts import is_exact_revert, label, reverted_refs
+from nanobot.channels.gitlab_review.reverts import (
+    is_exact_revert,
+    label,
+    net_from_changes,
+    net_from_raw,
+    reverted_refs,
+)
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
-def _change(path: str, diff: str, **extra: object) -> dict[str, object]:
-    return {"old_path": path, "new_path": path, "diff": diff, **extra}
+def _raw(path: str, hunks: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{hunks}\n"
 
 
 def test_every_commit_must_name_what_it_reverts() -> None:
@@ -17,19 +23,33 @@ def test_every_commit_must_name_what_it_reverts() -> None:
 
 
 def test_exact_inverse_is_a_revert_and_anything_more_is_not() -> None:
-    original = [_change("a.cs", "@@\n-old\n+new\n context")]
-    assert is_exact_revert([_change("a.cs", "@@\n-new\n+old\n context")], [original])
-    assert not is_exact_revert([_change("a.cs", "@@\n-new\n+old\n+extra")], [original])
-    assert not is_exact_revert([_change("a.cs", "@@\n-new\n+old"), _change("b.cs", "+x")], [original])
-    assert not is_exact_revert([], [original])
+    original = net_from_raw(_raw("a.cs", "@@ -1 +1 @@\n-old\n+new\n context"))
+    assert is_exact_revert(net_from_raw(_raw("a.cs", "@@ -1 +1 @@\n-new\n+old\n context")), [original])
+    assert not is_exact_revert(net_from_raw(_raw("a.cs", "@@ -1 +1,2 @@\n-new\n+old\n+extra")), [original])
+    assert not is_exact_revert(
+        net_from_raw(_raw("a.cs", "@@ -1 +1 @@\n-new\n+old") + _raw("b.cs", "@@ -0,0 +1 @@\n+x")), [original]
+    )
+    assert not is_exact_revert({}, [original])
 
 
-def test_renamed_and_created_files_are_matched_by_both_paths() -> None:
-    original = [{"old_path": "A.cs", "new_path": "B.cs", "diff": "-a\n+b"}, _change("N.cs", "+n", new_file=True)]
-    revert = [{"old_path": "B.cs", "new_path": "A.cs", "diff": "-b\n+a"}, _change("N.cs", "-n", deleted_file=True)]
+def test_lines_that_look_like_headers_inside_a_hunk_are_content() -> None:
+    original = net_from_raw(_raw("a.sql", "@@ -1 +1 @@\n--- old comment\n+++ new value"))
+    assert original == {frozenset({"a.sql"}): {"-- old comment": -1, "++ new value": 1}}
+
+
+def test_new_deleted_and_renamed_files_match_by_their_paths() -> None:
+    original = net_from_raw(
+        "diff --git a/N.cs b/N.cs\nnew file mode 100644\n--- /dev/null\n+++ b/N.cs\n@@ -0,0 +1 @@\n+n\n"
+        "diff --git a/A.cs b/B.cs\nrename from A.cs\nrename to B.cs\n--- a/A.cs\n+++ b/B.cs\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+    revert = net_from_raw(
+        "diff --git a/N.cs b/N.cs\ndeleted file mode 100644\n--- a/N.cs\n+++ /dev/null\n@@ -1 +0,0 @@\n-n\n"
+        "diff --git a/B.cs b/A.cs\nrename from B.cs\nrename to A.cs\n--- a/B.cs\n+++ b/A.cs\n@@ -1 +1 @@\n-b\n+a\n"
+    )
     assert is_exact_revert(revert, [original])
 
 
-def test_a_cut_short_diff_is_never_trusted() -> None:
-    original = [_change("big.json", "", too_large=True)]
-    assert not is_exact_revert([_change("big.json", "", too_large=True)], [original])
+def test_binary_or_collapsed_changes_are_never_trusted() -> None:
+    assert net_from_raw("diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n") is None
+    assert net_from_changes([{"old_path": "big.json", "new_path": "big.json", "diff": "", "collapsed": True}]) is None
+    assert not is_exact_revert(None, [{}])

@@ -69,6 +69,7 @@ class FakeGitLab:
         self.fail_writes = False
         self.commits: list[str] = ["feat: thing"]
         self.changes_by_iid: dict[int, list[dict[str, Any]]] = {}
+        self.raw_by_iid: dict[int, str] = {}
         self.changes_by_sha: dict[str, list[dict[str, Any]]] = {}
         self.fail_changes = False
         self.changes: list[dict[str, Any]] = [
@@ -86,6 +87,9 @@ class FakeGitLab:
         if self.fail_changes:
             raise GitLabApiError("diffs down", 502)
         return self.changes_by_iid.get(iid, self.changes)
+
+    async def get_raw_diff(self, iid: int) -> str:
+        return self.raw_by_iid.get(iid, "")
 
     async def get_commit(self, sha: str) -> dict[str, Any]:
         return {"id": sha, "parent_ids": ["p" * 40]}
@@ -1063,12 +1067,13 @@ def _revert_setup(h: Harness, revert_diff: str) -> None:
         'Revert "Merge branch \'AMDEV-310\'"\n\nThis reverts merge request !5937',
         f'Revert "fix"\n\nThis reverts commit {SHA_B}.',
     ]
-    h.gitlab.changes_by_iid[5937] = [_change("a.cs", "@@ -1 +1 @@\n-old\n+new\n+added")]
+    h.gitlab.raw_by_iid[5937] = _raw("a.cs", "@@ -1 +1,2 @@\n-old\n+new\n+added")
     h.gitlab.changes_by_sha[SHA_B] = [_change("b.js", "@@ -1 +1 @@\n-x\n+y")]
-    h.gitlab.changes_by_iid[42] = [
-        _change("a.cs", revert_diff),
-        _change("b.js", "@@ -1 +1 @@\n-y\n+x"),
-    ]
+    h.gitlab.raw_by_iid[42] = _raw("a.cs", revert_diff) + _raw("b.js", "@@ -1 +1 @@\n-y\n+x")
+
+
+def _raw(path: str, hunks: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{hunks}\n"
 
 
 @pytest.mark.asyncio

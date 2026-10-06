@@ -95,6 +95,15 @@ class GitLabApi:
                 break
         return discussions
 
+    async def get_raw_diff(self, iid: int) -> str:
+        """The full unified diff of a merge request, large files included."""
+        response = await self._client.get(f"/projects/{self._project}/merge_requests/{iid}/raw_diffs")
+        if response.status_code >= 400:
+            raise GitLabApiError(
+                f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
+            )
+        return response.text
+
     async def get_commit(self, sha: str) -> dict[str, Any]:
         return await self._get_object(f"/projects/{self._project}/repository/commits/{quote(sha, safe='')}")
 
