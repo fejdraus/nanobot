@@ -95,6 +95,19 @@ class GitLabApi:
                 break
         return discussions
 
+    async def get_commit(self, sha: str) -> dict[str, Any]:
+        return await self._get_object(f"/projects/{self._project}/repository/commits/{quote(sha, safe='')}")
+
+    async def compare(self, base: str, head: str) -> list[dict[str, Any]]:
+        """Changed files between two commits, with their diffs."""
+        response = await self._client.get(
+            f"/projects/{self._project}/repository/compare", params={"from": base, "to": head}
+        )
+        data = self._object(response)
+        diffs = data.get("diffs")
+        return [cast("dict[str, Any]", item) for item in cast("list[object]", diffs) if isinstance(item, dict)] \
+            if isinstance(diffs, list) else []
+
     async def get_changes(self, iid: int, max_pages: int = 10) -> list[dict[str, Any]]:
         """Changed files of a merge request with their diffs, page by page."""
         changes: list[dict[str, Any]] = []

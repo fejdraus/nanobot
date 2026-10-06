@@ -68,6 +68,8 @@ class FakeGitLab:
         self.writes: list[tuple[str, Any]] = []
         self.fail_writes = False
         self.commits: list[str] = ["feat: thing"]
+        self.changes_by_iid: dict[int, list[dict[str, Any]]] = {}
+        self.changes_by_sha: dict[str, list[dict[str, Any]]] = {}
         self.fail_changes = False
         self.changes: list[dict[str, Any]] = [
             {
@@ -83,7 +85,13 @@ class FakeGitLab:
     async def get_changes(self, iid: int) -> list[dict[str, Any]]:
         if self.fail_changes:
             raise GitLabApiError("diffs down", 502)
-        return self.changes
+        return self.changes_by_iid.get(iid, self.changes)
+
+    async def get_commit(self, sha: str) -> dict[str, Any]:
+        return {"id": sha, "parent_ids": ["p" * 40]}
+
+    async def compare(self, base: str, head: str) -> list[dict[str, Any]]:
+        return self.changes_by_sha.get(head, [])
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
         return {"id": discussion_id, "notes": self.discussions.get(discussion_id, [])}
@@ -1043,24 +1051,48 @@ def test_russian_prose_with_code_is_not_english() -> None:
     assert written_in_english(ENGLISH)
 
 
+def _change(path: str, diff: str) -> dict[str, Any]:
+    return {"old_path": path, "new_path": path, "diff": diff}
+
+
+SHA_B = "ab" * 20
+
+
+def _revert_setup(h: Harness, revert_diff: str) -> None:
+    h.gitlab.commits = [
+        'Revert "Merge branch \'AMDEV-310\'"\n\nThis reverts merge request !5937',
+        f'Revert "fix"\n\nThis reverts commit {SHA_B}.',
+    ]
+    h.gitlab.changes_by_iid[5937] = [_change("a.cs", "@@ -1 +1 @@\n-old\n+new\n+added")]
+    h.gitlab.changes_by_sha[SHA_B] = [_change("b.js", "@@ -1 +1 @@\n-x\n+y")]
+    h.gitlab.changes_by_iid[42] = [
+        _change("a.cs", revert_diff),
+        _change("b.js", "@@ -1 +1 @@\n-y\n+x"),
+    ]
+
+
 @pytest.mark.asyncio
-async def test_revert_is_skipped_with_a_notice(tmp_path: Path) -> None:
+async def test_exact_revert_is_skipped_with_a_notice(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
-        h.gitlab.mr["title"] = "Откат интеграции"
-        h.gitlab.commits = [
-            'Revert "Merge branch \'AMDEV-310\' into \'test\'"\n\nThis reverts merge request !5937',
-            "Revert \"fix\"\n\nThis reverts commit " + "ab" * 20 + ".",
-        ]
+        _revert_setup(h, "@@ -1,2 +1 @@\n-new\n-added\n+old")
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     assert h.inbound == []
     assert "!42 — ревёрт !5937, abababab, ревью пропущено. Проверить всё же: «проверь !42»." in h.telegram.text()
 
 
 @pytest.mark.asyncio
+async def test_revert_that_changes_anything_else_is_reviewed(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_timeout_s=0.05) as h:
+        _revert_setup(h, "@@ -1,2 +1 @@\n-new\n-added\n+old\n+sneaked in")
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    assert "review-gitlab-mrs" in h.inbound[0].content
+
+
+@pytest.mark.asyncio
 async def test_revert_mixed_with_new_commits_is_reviewed(tmp_path: Path) -> None:
     async with Harness(tmp_path, review_timeout_s=0.05) as h:
-        h.gitlab.mr["title"] = 'Revert "feat: thing"'
-        h.gitlab.commits = ["Revert \"x\"\n\nThis reverts merge request !1", "fix: new code"]
+        _revert_setup(h, "@@ -1,2 +1 @@\n-new\n-added\n+old")
+        h.gitlab.commits.append("fix: new code")
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     assert "review-gitlab-mrs" in h.inbound[0].content
 

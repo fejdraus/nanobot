@@ -1818,9 +1818,11 @@ refused. Publishing is also refused if the MR's head moved since the review.
 A bare `публикуй` or `отмена` without a reply applies to the only waiting draft;
 with several waiting, the channel lists them instead.
 
-**Reverts.** A merge request whose every commit is a revert (git's «This reverts
-commit …» or GitLab's «This reverts merge request !N» trailer) is not reviewed;
-the channel only says so in Telegram. `проверь !N` asks for a review of any MR.
+**Reverts.** A merge request whose every commit names what it reverts (git's
+«This reverts commit …» or GitLab's «This reverts merge request !N» trailer) and
+whose changes are the exact inverse of that, line for line per file, is not
+reviewed; the channel only says so in Telegram. A diff GitLab cut short, or any
+extra change, gets a normal review. `проверь !N` asks for a review of any MR.
 
 **Talking to the reviewer.** Any other message from the approver goes to the
 agent. It continues the Claude session of the review it concerns — the one

@@ -81,6 +81,7 @@ from nanobot.channels.gitlab_review.proposals import (
     render_notice,
     written_in_english,
 )
+from nanobot.channels.gitlab_review.reverts import is_exact_revert, label, reverted_refs
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
@@ -100,9 +101,6 @@ ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
 _REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
-_REVERTED_RE = re.compile(
-    r"^This reverts (?:merge request (?P<mr>![0-9]+)|commit (?P<sha>[0-9a-f]{40}))", re.MULTILINE
-)
 CONTINUE_WINDOW = timedelta(hours=12)
 DREAM_CURSOR_KEY = "people_dream_cursor"
 DREAM_MR_LIMIT = 30
@@ -689,25 +687,35 @@ class GitLabReviewChannel(BaseChannel):
         )
 
     async def _reverted_by(self, iid: int) -> list[str]:
-        """What the MR reverts, when every commit in it is a revert; otherwise nothing.
+        """What the MR reverts, when it provably does nothing else; otherwise nothing.
 
-        Git and GitLab's Revert button both write «This reverts …» into the
-        commit message. A title can be edited, the trailer cannot be faked by
-        accident, and an MR that mixes a revert with new commits is reviewed.
+        See :mod:`reverts`: every commit must name what it reverts, and the
+        MR's changes must be the exact inverse of it. Anything unverifiable is
+        reviewed as usual.
         """
         assert self._gitlab is not None
         try:
             commits = await self._gitlab.get_commits(iid)
-        except GitLabApiError as exc:
-            self.logger.warning("MR !{}: commits unavailable, reviewing as usual: {}", iid, exc)
-            return []
-        reverted: list[str] = []
-        for commit in commits:
-            match = _REVERTED_RE.search(str(commit.get("message") or ""))
-            if match is None:
+            refs = reverted_refs(str(commit.get("message") or "") for commit in commits)
+            if not refs:
                 return []
-            reverted.append(match.group("mr") or match.group("sha")[:8])
-        return list(dict.fromkeys(reverted))
+            originals: list[list[dict[str, Any]]] = []
+            for kind, value in refs:
+                if kind == "mr":
+                    originals.append(await self._gitlab.get_changes(int(value)))
+                    continue
+                parents = (await self._gitlab.get_commit(value)).get("parent_ids")
+                if not isinstance(parents, list) or not parents:
+                    return []
+                originals.append(await self._gitlab.compare(str(cast("list[object]", parents)[0]), value))
+            current = await self._gitlab.get_changes(iid)
+        except GitLabApiError as exc:
+            self.logger.warning("MR !{}: revert not verifiable, reviewing as usual: {}", iid, exc)
+            return []
+        if not is_exact_revert(current, originals):
+            self.logger.info("MR !{}: names a revert but changes more than that, reviewing", iid)
+            return []
+        return [label(ref) for ref in refs]
 
     async def _task_line(self, info: _MergeRequestInfo) -> str:
         """«Задача: KEY — name» with a link per task the MR names, or nothing."""
