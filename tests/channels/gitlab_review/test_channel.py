@@ -303,7 +303,7 @@ async def test_opened_mr_runs_one_review_and_drafts_go_to_telegram(tmp_path: Pat
         assert h.inbound[0].chat_id == "gitlab-review:42"
         assert not h.inbound[0].content.startswith("/")
         assert "review-gitlab-mrs" in h.inbound[0].content
-        assert "Режим черновика" in h.inbound[0].content
+        assert "Draft mode" in h.inbound[0].content
 
         await h.answer(42, [{"type": "note", "body": "замечание"}])
 
@@ -542,7 +542,7 @@ async def test_own_mr_is_reviewed_when_enabled(tmp_path: Path) -> None:
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     prompt = h.inbound[0].content
     assert "review-gitlab-mrs" in prompt
-    assert "самого ревьюера" in prompt
+    assert "reviewer's own merge request" in prompt
 
 
 @pytest.mark.asyncio
@@ -588,7 +588,7 @@ async def test_lesson_failure_does_not_block_the_review(tmp_path: Path) -> None:
         h.gitlab.fail_changes = True
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     assert "review-gitlab-mrs" in h.inbound[0].content
-    assert "Уроки из памяти" not in h.inbound[0].content
+    assert "Lessons from the review memory" not in h.inbound[0].content
 
 
 @pytest.mark.asyncio
@@ -750,7 +750,7 @@ async def test_question_about_an_earlier_review_brings_its_archive_entry(tmp_pat
         await h.review(43, [{"type": "note", "body": "новое"}])
         turn = await h.say(2, "что было в ревью по AMCRM-16127?", reply_to=1000 + len(h.telegram.sent))
         await h.reply_as_agent("gitlab-review:43", "Там был флаг.")
-    assert "Из архива" in turn.content
+    assert "From the archive" in turn.content
     assert "старое замечание про флаг" in turn.content
     assert "опубликовано" in turn.content
     entries = sorted((tmp_path / "archive").glob("*.md"))
@@ -811,7 +811,7 @@ async def test_review_files_notes_about_the_author_and_uses_them_next_time(tmp_p
     people = tmp_path / "people"
     async with Harness(tmp_path, people_dir=str(people)) as h:
         first = await h.review(42, [{"type": "note", "body": "a"}])
-        assert "Писать можно только о: author" in first.content
+        assert "You may write only about: author" in first.content
         before = len(h.inbound)
         task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
         await _until(lambda: len(h.inbound) > before)
@@ -829,7 +829,7 @@ async def test_review_files_notes_about_the_author_and_uses_them_next_time(tmp_p
     assert not (people / "stranger.md").exists()
     assert "Запомнил о разработчиках:\n- author: не сбрасывает флаги" in h.telegram.text()
     assert "### author" in third.content and "не сбрасывает флаги" in third.content
-    assert "Ревьюировано его MR: 1" in third.content
+    assert "MRs of theirs reviewed: 1" in third.content
     assert "```gitlab-review-people" not in h.telegram.text()
 
 

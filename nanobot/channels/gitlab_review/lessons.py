@@ -102,14 +102,14 @@ def render_lessons(matched: list[MatchedLesson], budget_chars: int) -> str:
     if not matched:
         return ""
     parts = [
-        "Уроки из памяти ревью, относящиеся к изменённому коду (подобраны по файлам и диффу MR). "
-        "Учти их при ревью; полные заметки лежат в памяти под теми же именами."
+        "Lessons from the review memory that concern the changed code (picked by the MR's files "
+        "and diff). Apply them in the review; the full notes are in memory under the same names."
     ]
     used = len(parts[0])
     pointers: list[str] = []
     for item in matched:
         block = (
-            f"\n### {item.lesson.name}\nПочему: {'; '.join(item.reasons[:3])}\n"
+            f"\n### {item.lesson.name}\nWhy: {'; '.join(item.reasons[:3])}\n"
             f"{item.lesson.body}"
         )
         if used + len(block) <= budget_chars:
@@ -118,7 +118,7 @@ def render_lessons(matched: list[MatchedLesson], budget_chars: int) -> str:
         else:
             pointers.append(f"- {item.lesson.name} — {item.lesson.description}")
     if pointers:
-        parts.append("\nЕщё подходят (прочитай нужные сам):\n" + "\n".join(pointers))
+        parts.append("\nAlso relevant (read the ones you need):\n" + "\n".join(pointers))
     return "\n".join(parts)
 
 

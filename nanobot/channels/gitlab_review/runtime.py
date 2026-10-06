@@ -297,7 +297,7 @@ class GitLabReviewChannel(BaseChannel):
         )
         self.logger.info("people: {} notes filed", written)
         if pending.review_id is not None:
-            self._state.add_event(pending.review_id, "система", summary)
+            self._state.add_event(pending.review_id, "system", summary)
         message_ids = await self._tell_safe_ids(summary)
         if pending.review_id is not None:
             self._state.record_review_messages(pending.review_id, message_ids)
@@ -356,10 +356,10 @@ class GitLabReviewChannel(BaseChannel):
             self._state.record_draft_messages(iid, version, message_ids)
         if pending.review_id is not None:
             self._state.record_review_messages(pending.review_id, message_ids)
-            self._state.add_event(pending.review_id, "ревьюер", "\n\n".join(chunks))
+            self._state.add_event(pending.review_id, "reviewer", "\n\n".join(chunks))
             self._state.set_review_status(
                 pending.review_id,
-                f"черновик {iid}/{version} ждёт решения" if draft.actions else "публиковать нечего",
+                f"draft {iid}/{version} awaiting a decision" if draft.actions else "nothing to publish",
             )
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -607,7 +607,7 @@ class GitLabReviewChannel(BaseChannel):
             self.config.review_chat_id(info.iid), prompt, pending, session=record.session_id
         )
         if not finished:
-            self._state.set_review_status(record.id, "остановлено по таймауту")
+            self._state.set_review_status(record.id, "stopped on timeout")
             await self._tell(
                 render_notice(
                     info.iid, info.title, "Ревью не завершилось за отведённое время и остановлено."
@@ -760,7 +760,7 @@ class GitLabReviewChannel(BaseChannel):
         """Publish or cancel a draft, and file the decision in the archive."""
         review = self._state.latest_review(command.iid)
         if review is not None and text:
-            self._state.add_event(review.id, "вы", text)
+            self._state.add_event(review.id, "human", text)
         if not command.publish and command.version is not None:
             stored = self._state.load_draft(command.iid)
             if stored is not None and stored.version != command.version:
@@ -776,7 +776,7 @@ class GitLabReviewChannel(BaseChannel):
             self._state.delete_draft(command.iid)
             message_ids = await self._tell([f"!{command.iid}: черновик отменён, ничего не опубликовано."])
             if review is not None:
-                self._state.set_review_status(review.id, "черновик отменён")
+                self._state.set_review_status(review.id, "draft cancelled")
                 self._state.record_review_messages(review.id, message_ids)
             return
         await self.publish(command)
@@ -818,7 +818,7 @@ class GitLabReviewChannel(BaseChannel):
                 session_id=str(uuid.uuid4()),
                 head_sha="",
             )
-        self._state.add_event(target.id, "вы", request.text)
+        self._state.add_event(target.id, "human", request.text)
         named: list[str] = [target.author] if target.author else []
         authors = self._profiled([*named, *mentioned_usernames(request.text)])
         prompt = chat_prompt(
@@ -875,9 +875,9 @@ class GitLabReviewChannel(BaseChannel):
         )
 
     def _describe_review(self, review: ReviewRecord) -> str:
-        parts = [f"MR !{review.iid} «{review.title}»", f"начато {review.started_at}", review.status]
+        parts = [f"MR !{review.iid} «{review.title}»", f"started {review.started_at}", review.status]
         if review.task_keys:
-            parts.append("задачи " + ", ".join(review.task_keys))
+            parts.append("tasks " + ", ".join(review.task_keys))
         if review.web_url:
             parts.append(review.web_url)
         return "; ".join(parts)
@@ -888,7 +888,7 @@ class GitLabReviewChannel(BaseChannel):
         stored = self._state.load_draft(review.iid)
         if stored is None:
             return ""
-        lines = [f"Черновик {review.iid}/{stored.version}:"]
+        lines = [f"Draft {review.iid}/{stored.version}:"]
         for number, action in enumerate(stored.actions, start=1):
             lines.append(f"{number}. [{action.label()}] {action.body}".rstrip())
         return "\n".join(lines)
@@ -925,7 +925,7 @@ class GitLabReviewChannel(BaseChannel):
         message_ids = await self._tell(render_chat(pending.iid, parsed.text))
         if pending.review_id is not None:
             self._state.record_review_messages(pending.review_id, message_ids)
-            self._state.add_event(pending.review_id, "ревьюер", parsed.text)
+            self._state.add_event(pending.review_id, "reviewer", parsed.text)
         if problem:
             await self._tell([problem])
             parsed = ChatAnswer(parsed.text, None, parsed.decision)
@@ -944,7 +944,7 @@ class GitLabReviewChannel(BaseChannel):
             elif self._state.load_draft(pending.iid) is not None:
                 self._state.delete_draft(pending.iid)
                 if pending.review_id is not None:
-                    self._state.set_review_status(pending.review_id, "черновик снят")
+                    self._state.set_review_status(pending.review_id, "draft withdrawn")
                 await self._tell([f"!{pending.iid}: черновик снят, публиковать нечего."])
 
         decision = parsed.decision
@@ -1018,9 +1018,9 @@ class GitLabReviewChannel(BaseChannel):
         summary = f"!{command.iid}:\n" + "\n".join(report)
         review = self._state.latest_review(command.iid)
         if review is not None:
-            self._state.add_event(review.id, "система", summary)
+            self._state.add_event(review.id, "system", summary)
             self._state.add_published(review.id, published)
-            self._state.set_review_status(review.id, f"опубликовано (черновик {current})")
+            self._state.set_review_status(review.id, f"published (draft {current})")
         message_ids = await self._tell([summary])
         if review is not None:
             self._state.record_review_messages(review.id, message_ids)

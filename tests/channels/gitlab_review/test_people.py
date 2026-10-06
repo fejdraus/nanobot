@@ -56,8 +56,8 @@ def test_profile_is_dated_tied_to_the_mr_and_rendered_newest_first_within_budget
     assert text.startswith("---\nname: dev_ivan\n")
     assert "- 2026-10-06 !6318: новое наблюдение" in text
 
-    rendered = store.render(["ivan"], 10_000, {"ivan": "Ревьюировано его MR: 2"})
-    assert "### ivan\nРевьюировано его MR: 2" in rendered
+    rendered = store.render(["ivan"], 10_000, {"ivan": "MRs of theirs reviewed: 2"})
+    assert "### ivan\nMRs of theirs reviewed: 2" in rendered
     assert "старое наблюдение" in rendered and "новое наблюдение" in rendered
     tight = store.render(["ivan"], 80)
     assert "новое наблюдение" in tight and "старое наблюдение" not in tight

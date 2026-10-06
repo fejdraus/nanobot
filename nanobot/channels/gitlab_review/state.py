@@ -276,7 +276,7 @@ class GitLabReviewStateStore:
                 "head_sha, started_at, status, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     iid, title, web_url, " ".join(task_keys), kind, session_id, head_sha,
-                    datetime.now().isoformat(timespec="seconds"), "в работе", author,
+                    datetime.now().isoformat(timespec="seconds"), "in progress", author,
                 ),
             )
             review_id = int(cursor.lastrowid or 0)
@@ -338,7 +338,7 @@ class GitLabReviewStateStore:
             ).fetchone()
         if not reviewed:
             return ""
-        return f"Ревьюировано его MR: {reviewed}, опубликовано замечаний: {published}."
+        return f"MRs of theirs reviewed: {reviewed}, comments published: {published}."
 
     def latest_active_review(self, since: datetime) -> ReviewRecord | None:
         """The review or conversation with the most recent message after *since*."""
@@ -403,21 +403,21 @@ class GitLabReviewStateStore:
 
     def render_review(self, record: ReviewRecord) -> str:
         """The archive entry of one review as Markdown."""
-        mr = f"MR !{record.iid}" if record.iid is not None else "Разговор без MR"
+        mr = f"MR !{record.iid}" if record.iid is not None else "Conversation without an MR"
         lines = [f"# {mr} {record.title}".rstrip()]
         if record.web_url:
             lines.append(record.web_url)
         lines.append("")
         if record.task_keys:
-            lines.append(f"- Задачи: {', '.join(record.task_keys)}")
+            lines.append(f"- Tasks: {', '.join(record.task_keys)}")
         if record.author:
-            lines.append(f"- Автор MR: {record.author}")
+            lines.append(f"- MR author: {record.author}")
         lines += [
-            f"- Вид: {record.kind}",
-            f"- Начато: {record.started_at}",
-            f"- Статус: {record.status}",
-            f"- Коммит: {record.head_sha or '—'}",
-            f"- Сессия Claude: {record.session_id}",
+            f"- Kind: {record.kind}",
+            f"- Started: {record.started_at}",
+            f"- Status: {record.status}",
+            f"- Commit: {record.head_sha or '—'}",
+            f"- Claude session: {record.session_id}",
         ]
         for event in self.events(record.id):
             lines += ["", f"## {event.at} — {event.who}", "", event.text]

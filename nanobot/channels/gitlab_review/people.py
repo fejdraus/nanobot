@@ -147,8 +147,8 @@ class PeopleStore:
         if not sections:
             return ""
         return (
-            "Профили участников — как с ними лучше обсуждать. Учитывай подачу, но строгость "
-            "ревью одинакова для всех.\n\n" + "\n\n".join(sections)
+            "Profiles of the people involved — how best to discuss with them. Adapt the delivery, "
+            "but review everyone equally strictly.\n\n" + "\n\n".join(sections)
         )
 
 
