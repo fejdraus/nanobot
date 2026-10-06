@@ -81,12 +81,6 @@ ARCHIVE_LIMIT = 5
 ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
-HELP_TEXT = (
-    "Черновик: ответьте на него «публикуй», «публикуй 1,3» или «отмена»; без ответа — "
-    "если черновик один; или «публикуй !N/V». Любой другой текст — вопрос ревьюеру: ответом "
-    "на сообщение ревью — о нём, без ответа — о единственном черновике или о прошлых ревью "
-    "(назовите MR или задачу)."
-)
 
 
 class GitLabWebhookError(ValueError):
@@ -623,9 +617,6 @@ class GitLabReviewChannel(BaseChannel):
             return
         text = message.text or ""
         if not text.strip():
-            return
-        if text.lstrip().startswith("/"):
-            await self._tell([HELP_TEXT])
             return
         command = self._command_for(text, message.reply_to)
         if command is None and message.reply_to is None:

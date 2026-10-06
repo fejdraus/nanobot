@@ -797,8 +797,10 @@ async def test_question_about_a_draft_without_archive_entry_starts_one(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_slash_message_gets_help_without_the_agent(tmp_path: Path) -> None:
+async def test_slash_message_is_talked_about_like_any_other(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
-        await h.channel.handle_telegram(_tg(1, "/start"))
-    assert h.inbound == []
-    assert "Любой другой текст — вопрос ревьюеру" in h.telegram.text()
+        turn = await h.say(1, "/start")
+        await h.reply_as_agent(turn.chat_id, "Я ревьюер.")
+    assert not turn.content.startswith("/")
+    assert "> /start" in turn.content
+    assert h.telegram.sent[-1][1] == "Я ревьюер."
