@@ -23,9 +23,10 @@ Flow:
    publication or a cancellation, which the channel then performs on the draft
    the human was shown, if the branch has not moved. Every review, draft, decision and message is kept in an archive the
    agent can consult when asked about an earlier review.
-7. The agent may also note what it learned about the developers involved;
-   :mod:`people` files it per GitLab username and the profile comes back in the
-   next prompt about that person.
+7. The agent may also note what it learned about the developers involved. The
+   notes are kept as evidence; once a day each developer's profile is
+   consolidated from it and from their own messages in the reviewer's threads
+   (:mod:`people`), and the profile comes back in the next prompt about them.
 """
 
 from __future__ import annotations
@@ -56,8 +57,14 @@ from nanobot.channels.gitlab_review.people import (
     accept_notes,
     extract_people,
     mentioned_usernames,
+    parse_profile,
 )
-from nanobot.channels.gitlab_review.prompts import chat_prompt, reply_prompt, review_prompt
+from nanobot.channels.gitlab_review.prompts import (
+    chat_prompt,
+    dream_prompt,
+    reply_prompt,
+    review_prompt,
+)
 from nanobot.channels.gitlab_review.proposals import (
     ApprovalCommand,
     ChatAnswer,
@@ -91,6 +98,10 @@ ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
 CONTINUE_WINDOW = timedelta(hours=12)
+DREAM_CURSOR_KEY = "people_dream_cursor"
+DREAM_MR_LIMIT = 30
+DREAM_MESSAGES = 15
+DREAM_MESSAGE_CHARS = 500
 
 
 class GitLabWebhookError(ValueError):
@@ -119,6 +130,11 @@ class _PendingRun:
     iid: int | None = None
     user_text: str = ""
     authors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _DreamRequest:
+    """Time to consolidate the developer profiles."""
 
 
 @dataclass(frozen=True)
@@ -173,10 +189,11 @@ class GitLabReviewChannel(BaseChannel):
         self._server: _ReusableThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest] | None = None
+        self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest | _DreamRequest] | None = None
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._pending: dict[str, _PendingRun] = {}
+        self._dream_report: list[str] = []
 
     async def start(self) -> None:
         self.config.validate_runtime()
@@ -209,6 +226,8 @@ class GitLabReviewChannel(BaseChannel):
             asyncio.create_task(self._worker(), name="gitlab-review-worker"),
             asyncio.create_task(self._poll_telegram(), name="gitlab-review-telegram"),
         ]
+        if self._people is not None:
+            self._tasks.append(asyncio.create_task(self._dream_clock(), name="gitlab-review-dream"))
         self._running = True
         self.logger.info(
             "GitLab review webhook listening on {}:{}{} for {}",
@@ -267,7 +286,9 @@ class GitLabReviewChannel(BaseChannel):
             )
             return
         try:
-            if pending.kind == "chat":
+            if pending.kind == "dream":
+                await self._deliver_profile(msg.content, pending)
+            elif pending.kind == "chat":
                 await self._deliver_chat(content, pending)
             else:
                 iid = pending.iid if pending.iid is not None else self.config.iid_from_chat_id(msg.chat_id)
@@ -287,27 +308,127 @@ class GitLabReviewChannel(BaseChannel):
             self.logger.warning("people notes refused: {}", "; ".join(refused))
         if not kept:
             return
-        try:
-            written = await asyncio.to_thread(self._people.append, kept, iid=pending.iid)
-        except OSError:
-            self.logger.exception("people notes could not be written")
-            return
-        summary = "Запомнил о разработчиках:\n" + "\n".join(
-            f"- {note.username}: {note.text}" for note in kept
-        )
-        self.logger.info("people: {} notes filed", written)
+        for note in kept:
+            self._state.add_evidence(note.username, pending.iid, note.text)
+        self.logger.info("people: {} notes kept as evidence", len(kept))
         if pending.review_id is not None:
-            self._state.add_event(pending.review_id, "system", summary)
-        message_ids = await self._tell_safe_ids(summary)
-        if pending.review_id is not None:
-            self._state.record_review_messages(pending.review_id, message_ids)
+            self._state.add_event(
+                pending.review_id,
+                "system",
+                "Evidence for profiles:\n" + "\n".join(f"- {note.username}: {note.text}" for note in kept),
+            )
 
-    async def _tell_safe_ids(self, text: str) -> list[int]:
-        try:
-            return await self._tell([text])
-        except Exception:
-            self.logger.exception("Telegram notification failed")
-            return []
+    async def _dream_clock(self) -> None:
+        """Queue the profile consolidation daily at ``peopleDreamHour``, and once at first start."""
+        assert self._queue is not None
+        if self._state.get_value(DREAM_CURSOR_KEY) is None:
+            self._queue.put_nowait(_DreamRequest())
+        while True:
+            now = datetime.now()
+            due = now.replace(hour=self.config.people_dream_hour, minute=0, second=0, microsecond=0)
+            if due <= now:
+                due += timedelta(days=1)
+            await asyncio.sleep((due - now).total_seconds())
+            self._queue.put_nowait(_DreamRequest())
+
+    async def dream(self) -> None:
+        """Consolidate the profile of every developer with something new since the last time."""
+        if self._people is None:
+            return
+        assert self._loop is not None
+        now = datetime.now()
+        stored = self._state.get_value(DREAM_CURSOR_KEY)
+        history = now - timedelta(days=self.config.people_history_days)
+        since = datetime.fromisoformat(stored) if stored else history
+        messages = await self._thread_messages(history)
+        fresh = {
+            name
+            for name, items in messages.items()
+            if any(item[0] >= since.isoformat(timespec="seconds") for item in items)
+        }
+        candidates = sorted(
+            {*self._state.evidence_users(since), *fresh},
+            key=str.casefold,
+        )
+        self._dream_report = []
+        for username in candidates:
+            if not self.config.may_profile(username):
+                continue
+            evidence = [
+                f"- {day} !{iid}: {text}" if iid is not None else f"- {day}: {text}"
+                for day, iid, text in self._state.evidence_for(username, history)
+            ]
+            own = [
+                f"- {at[:10]} !{iid}: {body}"
+                for at, iid, body in messages.get(username, [])[-DREAM_MESSAGES:]
+            ]
+            if not evidence and not own:
+                continue
+            prompt = dream_prompt(
+                username,
+                profile=self._people.read(username),
+                evidence=evidence,
+                messages=own,
+                max_chars=self.config.people_profile_chars,
+            )
+            pending = _PendingRun(
+                self._loop.create_future(), "", "", "", kind="dream", user_text=username
+            )
+            finished = await self._ask_agent(
+                f"{self.config.chat_id}:dream-{username.casefold()}",
+                prompt,
+                pending,
+                session=str(uuid.uuid4()),
+            )
+            if not finished:
+                self._dream_report.append(f"{username}: не уложился во время, профиль прежний")
+        self._state.set_value(DREAM_CURSOR_KEY, now.isoformat(timespec="seconds"))
+        if self._dream_report:
+            await self._tell_safe(["Профили разработчиков, ночная сводка:\n\n" + "\n\n".join(self._dream_report)])
+
+    async def _thread_messages(self, since: datetime) -> dict[str, list[tuple[str, int, str]]]:
+        """What each developer wrote in the reviewer's threads of recently reviewed MRs."""
+        assert self._gitlab is not None
+        found: dict[str, list[tuple[str, int, str]]] = {}
+        for iid in self._state.reviewed_since(since, DREAM_MR_LIMIT):
+            try:
+                discussions = await self._gitlab.list_discussions(iid)
+            except GitLabApiError as exc:
+                self.logger.warning("MR !{}: threads unavailable for profiles: {}", iid, exc)
+                continue
+            for discussion in discussions:
+                raw_notes = discussion.get("notes")
+                notes = cast("list[dict[str, Any]]", raw_notes if isinstance(raw_notes, list) else [])
+                if not notes or not self.config.is_reviewer(_note_author(notes[0])):
+                    continue
+                for note in notes[1:]:
+                    author = _note_author(note)
+                    if not author or note.get("system") or self.config.is_reviewer(author):
+                        continue
+                    body = " ".join(str(note.get("body") or "").split())[:DREAM_MESSAGE_CHARS]
+                    found.setdefault(author, []).append((_local_time(note.get("created_at")), iid, body))
+        for items in found.values():
+            items.sort()
+        return found
+
+    async def _deliver_profile(self, answer: str, pending: _PendingRun) -> None:
+        """Write a consolidated profile once it passes the guards; note what changed."""
+        assert self._people is not None
+        username = pending.user_text
+        profile, refusal = parse_profile(answer, self.config.people_profile_chars)
+        if profile is None:
+            self.logger.warning("profile of {} refused: {}", username, refusal)
+            self._dream_report.append(f"{username}: профиль не обновлён — {refusal}")
+            return
+        before = self._people.read(username)
+        if before.strip() == profile.strip():
+            return
+        self._people.write(username, profile)
+        old = {line for line in before.splitlines() if line.startswith("- ")}
+        new = {line for line in profile.splitlines() if line.startswith("- ")}
+        changes = [f"+ {line[2:]}" for line in profile.splitlines() if line in new - old]
+        changes += [f"− {line[2:]}" for line in before.splitlines() if line in old - new]
+        self._dream_report.append(f"{username}:\n" + "\n".join(changes or ["разделы перестроены"]))
 
     def _profiled(self, usernames: list[str]) -> list[str]:
         """The people of this work who may have a profile, without repeats."""
@@ -445,14 +566,18 @@ class GitLabReviewChannel(BaseChannel):
         while True:
             item = await self._queue.get()
             try:
-                if isinstance(item, _ChatRequest):
+                if isinstance(item, _DreamRequest):
+                    await self.dream()
+                elif isinstance(item, _ChatRequest):
                     await self.converse(item)
                 else:
                     await self.process(item)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if isinstance(item, _ChatRequest):
+                if isinstance(item, _DreamRequest):
+                    self.logger.exception("profile consolidation failed")
+                elif isinstance(item, _ChatRequest):
                     self.logger.exception("conversation turn failed")
                     await self._tell_safe([f"Ответ не получен: {exc}"])
                 else:
@@ -1134,5 +1259,21 @@ class GitLabReviewChannel(BaseChannel):
         return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-__all__ = ["GitLabReviewChannel", "GitLabWebhookError"]
+def _local_time(value: object) -> str:
+    """GitLab's UTC timestamp as local time, comparable with the channel's own records."""
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone().replace(tzinfo=None)
+    return moment.isoformat(timespec="seconds")
 
+
+def _note_author(note: dict[str, Any]) -> str | None:
+    author = note.get("author")
+    username = cast("dict[str, Any]", author).get("username") if isinstance(author, dict) else None
+    return username if isinstance(username, str) else None
+
+
+__all__ = ["GitLabReviewChannel", "GitLabWebhookError"]

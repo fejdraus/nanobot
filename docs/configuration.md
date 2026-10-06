@@ -1840,21 +1840,30 @@ else the agent searches the archive directory, so add it to `allowedTools`
 (`Read(<runtime>/gitlab_review/archive/**)`).
 
 **Developer profiles.** With `lessonsDir` set (or `peopleDir` explicitly), the
-agent may end a review, a thread reply or a conversation with a
-`gitlab-review-people` block of observations about the developers involved:
-recurring mistakes and habits in their code, the modules they know, how they
-take a remark and what helps them understand one. The channel files them in
-`<lessonsDir>/people/<username>.md`, one dated line per observation tied to its
-MR, and puts the profile of the MR author (and of whoever answered in a
-thread), with review counts computed from the archive, into the next prompt
-about them, within `peopleBudgetChars` (default 6000). Code-side guards: only
-the people of the work at hand (the MR author, the thread's participant, or a
-user `@mentioned` by the approver) can be written about, at most five notes
-per person per run, and notes judging character are refused. Every filed note
-is echoed to Telegram. Profiles adapt how the reviewer talks, not how strictly
-it reviews.
-Developers who did not agree to this are listed in `peopleExcluded` (GitLab
-usernames): they are never asked about, profiled or shown with statistics.
+reviewer keeps a profile per developer in `<lessonsDir>/people/<username>.md`,
+built the way nanobot's Dream builds `USER.md`, in two steps:
+
+1. *Evidence.* A review, a thread reply or a conversation may end with a
+   `gitlab-review-people` block of observations about the people involved. They
+   are stored as dated evidence tied to the MR, not shown as a profile.
+2. *Consolidation.* Daily at `peopleDreamHour` (default 4, and once at first
+   start) the agent reads, per developer with something new, the current
+   profile, the evidence of the last `peopleHistoryDays` (default 90) and the
+   developer's own messages in the reviewer's threads, and rewrites the profile
+   in three sections: `## Communication` (language, tone, how they take remarks,
+   what helps them), `## Code habits` (only patterns seen in two or more MRs) and
+   `## Strengths and areas`. Ordinary work and one-off episodes stay out. The
+   changes are reported to Telegram.
+
+The profile of the MR author (and of whoever answered in a thread), with
+review counts from the archive, goes into the next prompt about them, within
+`peopleBudgetChars` (default 6000). Code-side guards: only the people of the
+work at hand or a user `@mentioned` by the approver can be noted, at most five
+notes per person per run, notes and profiles judging character are refused,
+and a profile must keep its three sections, consist of bullets and stay within
+`peopleProfileChars` (default 3000). Profiles adapt how the reviewer talks, not
+how strictly it reviews. Developers who did not agree are listed in
+`peopleExcluded` (GitLab usernames): they are never noted, profiled or shown.
 
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:

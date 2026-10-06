@@ -59,6 +59,9 @@ class GitLabReviewConfig(Base):
     people_dir: str = ""
     people_budget_chars: int = Field(default=6000, ge=0)
     people_excluded: list[str] = Field(default_factory=list)
+    people_profile_chars: int = Field(default=3000, ge=500)
+    people_dream_hour: int = Field(default=4, ge=0, le=23)
+    people_history_days: int = Field(default=90, ge=7)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

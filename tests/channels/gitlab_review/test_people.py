@@ -1,4 +1,3 @@
-from datetime import date
 from pathlib import Path
 
 from nanobot.channels.gitlab_review.people import (
@@ -8,6 +7,7 @@ from nanobot.channels.gitlab_review.people import (
     accept_notes,
     extract_people,
     mentioned_usernames,
+    parse_profile,
 )
 
 
@@ -39,8 +39,8 @@ def test_only_participants_and_no_character_labels_are_accepted() -> None:
         "оспаривает замечания ссылкой на документацию",
         "грубая ошибка в EntitySchemaQuery повторяется",
     ]
-    assert any("не участник" in reason for reason in refused)
-    assert any("оценка характера" in reason for reason in refused)
+    assert any("not a participant" in reason for reason in refused)
+    assert any("judgement of character" in reason for reason in refused)
 
 
 def test_notes_per_person_are_capped() -> None:
@@ -48,25 +48,38 @@ def test_notes_per_person_are_capped() -> None:
     assert len(kept) == 5 and len(refused) == 2
 
 
-def test_profile_is_dated_tied_to_the_mr_and_rendered_newest_first_within_budget(tmp_path: Path) -> None:
+def _profile_block(*lines: str) -> str:
+    return "```gitlab-review-profile\n" + "\n".join(lines) + "\n```"
+
+
+def test_profile_must_keep_its_sections_bullets_and_size() -> None:
+    good = _profile_block("## Communication", "- Пишет по-украински (!1)", "- ...", "## Code habits", "## Strengths and areas")
+    profile, reason = parse_profile("Вот:\n" + good, 3000)
+    assert profile == "## Communication\n- Пишет по-украински (!1)\n## Code habits\n## Strengths and areas"
+    assert reason == ""
+    assert parse_profile("нет блока", 3000)[0] is None
+    assert parse_profile(_profile_block("## Communication", "- x"), 3000)[0] is None
+    assert parse_profile(_profile_block("## Communication", "просто текст", "## Code habits", "## Strengths and areas"), 3000)[0] is None
+    assert parse_profile(_profile_block("## Communication", "- небрежный (!1)", "## Code habits", "## Strengths and areas"), 3000)[0] is None
+    assert parse_profile(good, 60)[1].endswith("more than 60")
+
+
+def test_profile_is_stored_without_its_front_matter_in_prompts(tmp_path: Path) -> None:
     store = PeopleStore(tmp_path / "people")
-    store.append([PersonNote("Ivan", "старое наблюдение")], iid=1, today=date(2026, 1, 1))
-    store.append([PersonNote("ivan", "новое наблюдение")], iid=6318, today=date(2026, 10, 6))
+    store.write("Ivan", "## Communication\n- коротко (!1)\n## Code habits\n- забывает descriptor.json (!1, !2)\n## Strengths and areas")
     text = (tmp_path / "people" / "ivan.md").read_text(encoding="utf-8")
     assert text.startswith("---\nname: dev_ivan\n")
-    assert "- 2026-10-06 !6318: новое наблюдение" in text
-
+    assert store.read("ivan").startswith("## Communication\n- коротко (!1)")
     rendered = store.render(["ivan"], 10_000, {"ivan": "MRs of theirs reviewed: 2"})
-    assert "### ivan\nMRs of theirs reviewed: 2" in rendered
-    assert "старое наблюдение" in rendered and "новое наблюдение" in rendered
-    tight = store.render(["ivan"], 80)
-    assert "новое наблюдение" in tight and "старое наблюдение" not in tight
+    assert "### ivan\nMRs of theirs reviewed: 2\n## Communication" in rendered
+    tight = store.render(["ivan"], 60)
+    assert "коротко" in tight and "descriptor" not in tight
 
 
 def test_unsafe_username_is_never_a_file(tmp_path: Path) -> None:
     store = PeopleStore(tmp_path)
     assert store.path_for("../etc/passwd") is None
-    assert store.append([PersonNote("../x", "y")], iid=1) == 0
+    assert store.write("../x", "y") is False
 
 
 def test_unknown_people_render_nothing(tmp_path: Path) -> None:

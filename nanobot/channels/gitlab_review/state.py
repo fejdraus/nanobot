@@ -132,6 +132,12 @@ class GitLabReviewStateStore:
                     message_id INTEGER PRIMARY KEY,
                     review_id INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS person_evidence (
+                    username TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    mr_iid INTEGER,
+                    text TEXT NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(review_drafts)")}
@@ -321,6 +327,42 @@ class GitLabReviewStateStore:
                 (*params, limit),
             ).fetchall()
         return [_record(row) for row in rows]
+
+    def add_evidence(self, username: str, iid: int | None, text: str) -> None:
+        """Keep one observation about a developer until the daily consolidation weighs it."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO person_evidence (username, at, mr_iid, text) VALUES (?, ?, ?, ?)",
+                (username, datetime.now().isoformat(timespec="seconds"), iid, text),
+            )
+
+    def evidence_users(self, since: datetime) -> list[str]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT username FROM person_evidence WHERE at >= ?",
+                (since.isoformat(timespec="seconds"),),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def evidence_for(self, username: str, since: datetime) -> list[tuple[str, int | None, str]]:
+        """``(date, iid, text)`` of the observations about *username* since *since*, oldest first."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT at, mr_iid, text FROM person_evidence WHERE username = ? COLLATE NOCASE "
+                "AND at >= ? ORDER BY rowid",
+                (username, since.isoformat(timespec="seconds")),
+            ).fetchall()
+        return [(str(at)[:10], int(iid) if iid is not None else None, str(text)) for at, iid, text in rows]
+
+    def reviewed_since(self, since: datetime, limit: int) -> list[int]:
+        """MRs reviewed or discussed since *since*, newest first."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mr_iid, MAX(started_at) AS last FROM reviews WHERE mr_iid IS NOT NULL "
+                "AND started_at >= ? GROUP BY mr_iid ORDER BY last DESC LIMIT ?",
+                (since.isoformat(timespec="seconds"), limit),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
 
     def add_published(self, review_id: int, count: int) -> None:
         with self._lock, self._connect() as conn:

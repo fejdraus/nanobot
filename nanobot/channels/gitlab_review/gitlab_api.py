@@ -61,6 +61,27 @@ class GitLabApi:
             f"/projects/{self._project}/merge_requests/{iid}/discussions/{quote(discussion_id, safe='')}"
         )
 
+    async def list_discussions(self, iid: int, max_pages: int = 5) -> list[dict[str, Any]]:
+        discussions: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            response = await self._client.get(
+                f"/projects/{self._project}/merge_requests/{iid}/discussions",
+                params={"per_page": 100, "page": page},
+            )
+            if response.status_code >= 400:
+                raise GitLabApiError(
+                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
+                )
+            batch: object = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            discussions.extend(
+                cast("dict[str, Any]", item) for item in cast("list[object]", batch) if isinstance(item, dict)
+            )
+            if len(cast("list[object]", batch)) < 100:
+                break
+        return discussions
+
     async def get_changes(self, iid: int, max_pages: int = 10) -> list[dict[str, Any]]:
         """Changed files of a merge request with their diffs, page by page."""
         changes: list[dict[str, Any]] = []

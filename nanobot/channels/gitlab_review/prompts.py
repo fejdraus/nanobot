@@ -11,7 +11,7 @@ an unknown slash command and answer it without running the model.
 """
 from __future__ import annotations
 
-from nanobot.channels.gitlab_review.people import PEOPLE_FENCE
+from nanobot.channels.gitlab_review.people import PEOPLE_FENCE, PROFILE_FENCE, PROFILE_SECTIONS
 from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, DECISION_FENCE
 
 _LANGUAGE = (
@@ -60,15 +60,16 @@ def people_rules(usernames: list[str]) -> str:
     if not names:
         return ""
     return (
-        "If in this work you noticed something about a developer that will help you discuss with "
-        f"them later, add one more block at the end:\n\n```{PEOPLE_FENCE}\n"
+        "If in this work you noticed something about a developer that may show a habit or how they "
+        f"communicate, add one more block at the end:\n\n```{PEOPLE_FENCE}\n"
         '{"people": [{"username": "<GitLab username>", "notes": ["one-sentence observation"]}]}\n```\n\n'
-        f"You may write only about: {', '.join(names)}. Record facts from this work: recurring "
-        "mistakes and habits in their code, strengths and the modules they know, how they take a "
-        "remark and what helps them understand it (a code example, a link to the rule, brief or "
-        "detailed). Do not record judgements of character, labels, anything personal outside work, "
-        "or guesses. Do not repeat what the profile already says. Write the notes in Russian. If "
-        "there is nothing to record, omit the block."
+        f"You may write only about: {', '.join(names)}. These notes are evidence, not the profile: a "
+        "daily consolidation decides what becomes their profile. Good evidence: the language and tone "
+        "they write in, how they take a remark (argue with facts, agree and fix, answer with a "
+        "screenshot, defer), what helped them understand it, a kind of mistake you have seen from them "
+        "before. Skip ordinary work (fixed the remarks, answered quickly), the specific mistakes "
+        "already in your comments, judgements of character, anything personal outside work, and "
+        "guesses. Write the notes in Russian. If there is nothing to record, omit the block."
     )
 
 
@@ -186,3 +187,47 @@ def chat_prompt(
             rules + " If the human asks you to remember something about a developer, record it the same way."
         )
     return "\n\n".join(parts)
+
+
+def dream_prompt(
+    username: str,
+    *,
+    profile: str,
+    evidence: list[str],
+    messages: list[str],
+    max_chars: int,
+) -> str:
+    """Consolidate what is known about one developer into their profile, like nanobot's Dream."""
+    sections = "\n".join(f"{heading}\n- ..." for heading in PROFILE_SECTIONS)
+    parts = [
+        f"Consolidate what the reviewer knows about the developer {username} into their profile. "
+        "The profile is read before every review of their merge requests and every discussion "
+        "with them, to adapt how the reviewer talks with them — never how strictly it reviews.",
+        f"Current profile:\n{profile or '(none yet)'}",
+        "Evidence noted during reviews (date, MR, observation), oldest first:\n"
+        + ("\n".join(evidence) if evidence else "(none)"),
+        "Their own recent messages in the reviewer's threads (date, MR, verbatim), oldest first:\n"
+        + ("\n".join(messages) if messages else "(none)"),
+        f"""Rules:
+- Communication: the language they write in, length and tone, how they respond to remarks \
+(argue with facts, agree and fix, answer with screenshots, defer to someone), what helps them \
+understand a remark. Take this from their own messages first.
+- Code habits: only patterns seen in at least two different MRs. A single slip is not a habit.
+- Strengths and areas: modules and technologies they clearly know.
+- One atomic fact per line, ending with the MRs it rests on, e.g. «(!6280, !6319)». Newer evidence \
+that contradicts an older fact replaces it; drop what no longer holds.
+- Leave out ordinary work, one-off episodes, anything personal outside work, judgements of \
+character and guesses. A section with nothing reliable stays empty.
+- Write the facts in Russian. Keep the whole profile under {max_chars} characters.
+- Read the MRs or threads in GitLab if you need more context.
+
+Output the complete new profile, sections exactly as below, in one block:
+
+```{PROFILE_FENCE}
+{sections}
+```
+
+If nothing changes, output the current profile unchanged.""",
+    ]
+    return "\n\n".join(parts)
+

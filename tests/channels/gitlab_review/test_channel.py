@@ -3,6 +3,7 @@ import json
 import socket
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,9 @@ class FakeGitLab:
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
         return {"id": discussion_id, "notes": self.discussions.get(discussion_id, [])}
+
+    async def list_discussions(self, iid: int) -> list[dict[str, Any]]:
+        return [{"id": key, "notes": notes} for key, notes in self.discussions.items()]
 
     async def _write(self, kind: str, data: Any) -> dict[str, Any]:
         if self.fail_writes:
@@ -806,8 +810,13 @@ def _people(body: str) -> str:
     return f"\n\n```gitlab-review-people\n{body}\n```"
 
 
+def _profile(*lines: str) -> str:
+    body = "\n".join(lines)
+    return f"Готово.\n\n```gitlab-review-profile\n{body}\n```"
+
+
 @pytest.mark.asyncio
-async def test_review_files_notes_about_the_author_and_uses_them_next_time(tmp_path: Path) -> None:
+async def test_notes_after_a_review_are_evidence_not_a_profile(tmp_path: Path) -> None:
     people = tmp_path / "people"
     async with Harness(tmp_path, people_dir=str(people)) as h:
         first = await h.review(42, [{"type": "note", "body": "a"}])
@@ -818,19 +827,79 @@ async def test_review_files_notes_about_the_author_and_uses_them_next_time(tmp_p
         await h.reply_as_agent(
             "gitlab-review:42",
             _answer("S", [])
-            + _people('{"people": [{"username": "author", "notes": ["не сбрасывает флаги"]},'
+            + _people('{"people": [{"username": "author", "notes": ["отвечает скрином"]},'
                       ' {"username": "stranger", "notes": ["что-то"]}]}'),
         )
         await task
-        await h.channel.handle_telegram(_tg(1, "отмена !42"))
-        third = await h.review(42, [])
-    profile = (people / "author.md").read_text(encoding="utf-8")
-    assert "!42: не сбрасывает флаги" in profile
-    assert not (people / "stranger.md").exists()
-    assert "Запомнил о разработчиках:\n- author: не сбрасывает флаги" in h.telegram.text()
-    assert "### author" in third.content and "не сбрасывает флаги" in third.content
-    assert "MRs of theirs reviewed: 1" in third.content
+        evidence = h.channel._state.evidence_for("author", datetime.now() - timedelta(days=1))
+        stranger = h.channel._state.evidence_users(datetime.now() - timedelta(days=1))
+    assert [(iid, text) for _, iid, text in evidence] == [(42, "отвечает скрином")]
+    assert stranger == ["author"]
+    assert not (people / "author.md").exists()
+    assert "отвечает скрином" not in h.telegram.text()
     assert "```gitlab-review-people" not in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_daily_consolidation_builds_the_profile_from_evidence_and_own_words(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    async with Harness(tmp_path, people_dir=str(people)) as h:
+        await h.review(42, [{"type": "note", "body": "a"}])
+        h.channel._state.add_evidence("author", 42, "отвечает скрином переписки")
+        h.gitlab.discussions["d1"] = [
+            _note("a.tyra", "вопрос"),
+            dict(_note("author", "Відповідальний аналітик дав обгрунтовну відповідь"), created_at="2026-10-02T07:30:29Z"),
+        ]
+        h.gitlab.discussions["d2"] = [_note("author", "чужой тред"), _note("other", "не наш")]
+        task = asyncio.create_task(h.channel.dream())
+        await _until(lambda: "gitlab-review:dream-author" in h.channel._pending)
+        prompt = h.inbound[-1].content
+        assert "отвечает скрином переписки" in prompt
+        assert "!42: Відповідальний аналітик дав обгрунтовну відповідь" in prompt
+        assert "не наш" not in prompt
+        await h.reply_as_agent(
+            "gitlab-review:dream-author",
+            _profile(
+                "## Communication",
+                "- Пишет по-украински, коротко; на вопрос отвечает скрином переписки (!42)",
+                "## Code habits",
+                "## Strengths and areas",
+            ),
+        )
+        await task
+    profile = (people / "author.md").read_text(encoding="utf-8")
+    assert "## Communication\n- Пишет по-украински" in profile
+    assert "+ Пишет по-украински" in h.telegram.text()
+    assert "ночная сводка" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_profile_that_breaks_the_rules_is_not_written(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    async with Harness(tmp_path, people_dir=str(people)) as h:
+        await h.review(42, [])
+        h.channel._state.add_evidence("author", 42, "x")
+        task = asyncio.create_task(h.channel.dream())
+        await h.reply_as_agent("gitlab-review:dream-author", _profile("## Communication", "- ленивый (!42)"))
+        await task
+    assert not (people / "author.md").exists()
+    assert "профиль не обновлён" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_profile_goes_into_the_next_review(tmp_path: Path) -> None:
+    people = tmp_path / "people"
+    people.mkdir()
+    (people / "author.md").write_text(
+        "---\nname: dev_author\n---\n\n# author\n\n## Communication\n- Пишет по-украински (!1)\n"
+        "## Code habits\n## Strengths and areas\n",
+        encoding="utf-8",
+    )
+    async with Harness(tmp_path, people_dir=str(people)) as h:
+        review = await h.review(42, [])
+    assert "### author" in review.content
+    assert "## Communication\n- Пишет по-украински (!1)" in review.content
+    assert "name: dev_author" not in review.content
 
 
 @pytest.mark.asyncio
@@ -844,7 +913,8 @@ async def test_human_can_ask_to_remember_a_mentioned_developer(tmp_path: Path) -
             "gitlab-review:42",
             "Запомнил." + _people('{"people": [{"username": "i.petrov", "notes": ["просит пример кода"]}]}'),
         )
-    assert "!42: просит пример кода" in (people / "i.petrov.md").read_text(encoding="utf-8")
+        evidence = h.channel._state.evidence_for("i.petrov", datetime.now() - timedelta(days=1))
+    assert [text for _, _, text in evidence] == ["просит пример кода"]
 
 
 @pytest.mark.asyncio
@@ -858,7 +928,7 @@ async def test_without_a_people_directory_nothing_is_asked_or_filed(tmp_path: Pa
 async def test_excluded_developer_is_never_profiled(tmp_path: Path) -> None:
     people = tmp_path / "people"
     people.mkdir()
-    (people / "author.md").write_text("# author\n- 2026-01-01 !1: старое\n", encoding="utf-8")
+    (people / "author.md").write_text("# author\n## Communication\n- старое\n", encoding="utf-8")
     async with Harness(tmp_path, people_dir=str(people), people_excluded=["Author"]) as h:
         review = await h.review(42, [])
         assert "gitlab-review-people" not in review.content
@@ -871,8 +941,12 @@ async def test_excluded_developer_is_never_profiled(tmp_path: Path) -> None:
             _answer("S", []) + _people('{"people": [{"username": "author", "notes": ["новое"]}]}'),
         )
         await task
-    assert "новое" not in (people / "author.md").read_text(encoding="utf-8")
-    assert "Запомнил" not in h.telegram.text()
+        h.channel._state.add_evidence("author", 42, "подложено")
+        inbound = len(h.inbound)
+        await h.channel.dream()
+        evidence = h.channel._state.evidence_for("author", datetime.now() - timedelta(days=1))
+    assert [text for _, _, text in evidence] == ["подложено"]
+    assert len(h.inbound) == inbound
 
 
 @pytest.mark.asyncio

@@ -1,16 +1,20 @@
 """What the reviewer learns about the developers it talks to.
 
-After a review, a thread reply or a conversation the agent may end its answer
-with a block of observations about the people involved: recurring mistakes and
-habits in their code, the modules they know, how they take a remark and what
-helps them understand one. The channel files them, one Markdown profile per
-GitLab username, and puts the profile of the MR author (and of whoever answered
-in a thread) into the next prompt that concerns them.
+It works like nanobot's Dream, in two steps:
 
-The guards live here, not in the prompt: only the people of the work at hand
-can be written about, every observation is dated and tied to its MR, and
-judgements of character are refused outright. A profile adapts how the
-reviewer talks, never how strictly it reviews.
+1. Evidence. After a review, a thread reply or a conversation the agent may end
+   its answer with a block of observations about the people involved. They are
+   kept as dated evidence tied to the MR, never shown as a profile.
+2. Consolidation. Once a day the agent reads, per developer, the current
+   profile, the new evidence and the developer's own recent messages in review
+   threads, and rewrites the profile: how they communicate, habits seen in more
+   than one MR, what they know well. Ordinary work and one-off episodes stay out.
+
+The profile of the MR author (and of whoever answered in a thread) goes into
+the next prompt that concerns them. The guards live here, not in the prompt:
+only the people of the work at hand can be written about, developers who did
+not agree are never profiled, judgements of character are refused, and a
+consolidated profile must keep its sections and its size.
 """
 from __future__ import annotations
 
@@ -18,18 +22,23 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from typing import cast
 
 from loguru import logger
 
 PEOPLE_FENCE = "gitlab-review-people"
+PROFILE_FENCE = "gitlab-review-profile"
+PROFILE_SECTIONS = ("## Communication", "## Code habits", "## Strengths and areas")
 MAX_NOTES_PER_PERSON = 5
 MAX_NOTE_CHARS = 300
 
 _FENCE_RE = re.compile(
     r"```" + re.escape(PEOPLE_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
+    re.DOTALL,
+)
+_PROFILE_RE = re.compile(
+    r"```" + re.escape(PROFILE_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
     re.DOTALL,
 )
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -74,17 +83,38 @@ def accept_notes(
     for note in notes:
         key = note.username.casefold()
         if key not in permitted:
-            refused.append(f"{note.username}: не участник этой работы")
+            refused.append(f"{note.username}: not a participant of this work")
             continue
         if _LABEL_RE.search(note.text):
-            refused.append(f"{note.username}: оценка характера, а не наблюдение")
+            refused.append(f"{note.username}: a judgement of character, not an observation")
             continue
         if per_person.get(key, 0) >= MAX_NOTES_PER_PERSON:
-            refused.append(f"{note.username}: больше {MAX_NOTES_PER_PERSON} наблюдений за раз")
+            refused.append(f"{note.username}: more than {MAX_NOTES_PER_PERSON} notes at once")
             continue
         per_person[key] = per_person.get(key, 0) + 1
         kept.append(note)
     return kept, refused
+
+
+def parse_profile(answer: str, max_chars: int) -> tuple[str | None, str]:
+    """The consolidated profile in *answer*, or ``None`` with the reason it was refused."""
+    matches = list(_PROFILE_RE.finditer(answer or ""))
+    if not matches:
+        return None, "no profile block"
+    body = matches[-1].group("body").strip()
+    lines = [line.rstrip() for line in body.splitlines() if line.strip() and line.strip() != "- ..."]
+    headings = [line for line in lines if line.startswith("## ")]
+    if tuple(headings) != PROFILE_SECTIONS:
+        return None, f"sections must be exactly {', '.join(PROFILE_SECTIONS)}"
+    stray = [line for line in lines if not line.startswith(("## ", "- "))]
+    if stray:
+        return None, f"not a heading or a bullet: {stray[0][:80]}"
+    if _LABEL_RE.search(body):
+        return None, "a judgement of character"
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        return None, f"{len(text)} characters, more than {max_chars}"
+    return text, ""
 
 
 class PeopleStore:
@@ -98,43 +128,36 @@ class PeopleStore:
             return None
         return self.directory / f"{username.casefold()}.md"
 
-    def append(self, notes: Iterable[PersonNote], *, iid: int | None, today: date | None = None) -> int:
-        """File *notes*, each dated and tied to the MR; return how many were written."""
-        day = (today or date.today()).isoformat()
-        source = f" !{iid}" if iid is not None else ""
-        grouped: dict[str, list[str]] = {}
-        for note in notes:
-            grouped.setdefault(note.username, []).append(note.text)
-        written = 0
-        for username, texts in grouped.items():
-            path = self.path_for(username)
-            if path is None:
-                continue
-            self.directory.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                current = path.read_text(encoding="utf-8").rstrip("\n")
-            else:
-                current = _new_profile(username)
-            lines = [f"- {day}{source}: {text}" for text in texts]
-            path.write_text(current + "\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-            written += len(lines)
-        return written
+    def read(self, username: str) -> str:
+        """The profile body without its front matter, or ``""``."""
+        path = self.path_for(username)
+        if path is None or not path.exists():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("people: cannot read {}: {}", path.name, exc)
+            return ""
+        return _body(text)
+
+    def write(self, username: str, profile: str) -> bool:
+        """Replace the profile of *username*; ``False`` for a name that cannot be a file."""
+        path = self.path_for(username)
+        if path is None:
+            return False
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path.write_text(_front_matter(username) + profile.strip() + "\n", encoding="utf-8", newline="\n")
+        return True
 
     def render(self, usernames: Iterable[str], budget: int, stats: dict[str, str] | None = None) -> str:
-        """The profiles of *usernames* for a prompt, newest observations kept within *budget*."""
+        """The profiles of *usernames* for a prompt, each within its share of *budget*."""
         sections: list[str] = []
         names = list(dict.fromkeys(name for name in usernames if name))
         if not names or budget <= 0:
             return ""
         share = budget // len(names)
         for username in names:
-            path = self.path_for(username)
-            body = ""
-            if path is not None and path.exists():
-                try:
-                    body = _observations(path.read_text(encoding="utf-8"))
-                except OSError as exc:
-                    logger.warning("people: cannot read {}: {}", path.name, exc)
+            body = self.read(username)
             line = (stats or {}).get(username, "")
             if not body and not line:
                 continue
@@ -142,7 +165,7 @@ class PeopleStore:
             if line:
                 text += f"{line}\n"
             if body:
-                text += _tail(body, max(share - len(text), 0))
+                text += _head(body, max(share - len(text), 0))
             sections.append(text.rstrip())
         if not sections:
             return ""
@@ -176,25 +199,30 @@ def _parse_block(body: str) -> list[PersonNote]:
     return notes
 
 
-def _new_profile(username: str) -> str:
+def _front_matter(username: str) -> str:
     return (
         f"---\nname: dev_{username.casefold()}\n"
-        f'description: "Разработчик {username}: как с ним обсуждать ревью, что типично в его коде"\n'
-        f"---\n\n# {username}\n"
+        f'description: "Developer {username}: how to discuss reviews with them, what is typical of their code"\n'
+        f"---\n\n# {username}\n\n"
     )
 
 
-def _observations(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if line.startswith("- "))
+def _body(text: str) -> str:
+    """Drop the front matter and the title line of a profile file."""
+    lines = text.splitlines()
+    if lines and lines[0] == "---":
+        end = next((index for index, line in enumerate(lines[1:], 1) if line == "---"), 0)
+        lines = lines[end + 1 :]
+    return "\n".join(line for line in lines if not line.startswith("# ")).strip()
 
 
-def _tail(lines: str, budget: int) -> str:
-    """The newest lines of *lines* that fit *budget*: observations are appended in order."""
+def _head(text: str, budget: int) -> str:
+    """The first lines of *text* that fit *budget*: sections come in a fixed order."""
     kept: list[str] = []
     used = 0
-    for line in reversed(lines.splitlines()):
+    for line in text.splitlines():
         if used + len(line) + 1 > budget:
             break
         kept.append(line)
         used += len(line) + 1
-    return "\n".join(reversed(kept))
+    return "\n".join(kept)
