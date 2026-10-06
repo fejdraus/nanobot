@@ -426,9 +426,13 @@ class GitLabReviewChannel(BaseChannel):
         self._people.write(username, profile)
         old = {line for line in before.splitlines() if line.startswith("- ")}
         new = {line for line in profile.splitlines() if line.startswith("- ")}
-        changes = [f"+ {line[2:]}" for line in profile.splitlines() if line in new - old]
-        changes += [f"− {line[2:]}" for line in before.splitlines() if line in old - new]
-        self._dream_report.append(f"{username}:\n" + "\n".join(changes or ["разделы перестроены"]))
+        added = [f"+ {line[2:]}" for line in profile.splitlines() if line in new - old]
+        removed = [f"− {line[2:]}" for line in before.splitlines() if line in old - new]
+        if not added and not removed:
+            return
+        self._dream_report.append(
+            f"{username}: +{len(added)} −{len(removed)}\n" + "\n".join([*added, *removed])
+        )
 
     def _profiled(self, usernames: list[str]) -> list[str]:
         """The people of this work who may have a profile, without repeats."""

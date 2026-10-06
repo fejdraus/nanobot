@@ -11,7 +11,12 @@ an unknown slash command and answer it without running the model.
 """
 from __future__ import annotations
 
-from nanobot.channels.gitlab_review.people import PEOPLE_FENCE, PROFILE_FENCE, PROFILE_SECTIONS
+from nanobot.channels.gitlab_review.people import (
+    MAX_FACT_CHARS,
+    PEOPLE_FENCE,
+    PROFILE_FENCE,
+    PROFILE_SECTIONS,
+)
 from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, DECISION_FENCE
 
 _LANGUAGE = (
@@ -214,8 +219,10 @@ def dream_prompt(
 understand a remark. Take this from their own messages first.
 - Code habits: only patterns seen in at least two different MRs. A single slip is not a habit.
 - Strengths and areas: modules and technologies they clearly know.
-- One atomic fact per line, ending with the MRs it rests on, e.g. «(!6280, !6319)». Newer evidence \
-that contradicts an older fact replaces it; drop what no longer holds.
+- One atomic fact per line: one short sentence, at most {MAX_FACT_CHARS} characters including the MRs \
+it rests on at the end, e.g. «(!6280, !6319)». Newer evidence that contradicts an older fact replaces \
+it; drop what no longer holds.
+- Carry every fact that still holds over word for word: do not rephrase it, only add to its MRs.
 - Leave out ordinary work, one-off episodes, anything personal outside work, judgements of \
 character and guesses. A section with nothing reliable stays empty.
 - Write the facts in Russian. Keep the whole profile under {max_chars} characters.

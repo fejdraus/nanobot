@@ -62,6 +62,8 @@ def test_profile_must_keep_its_sections_bullets_and_size() -> None:
     assert parse_profile(_profile_block("## Communication", "просто текст", "## Code habits", "## Strengths and areas"), 3000)[0] is None
     assert parse_profile(_profile_block("## Communication", "- небрежный (!1)", "## Code habits", "## Strengths and areas"), 3000)[0] is None
     assert parse_profile(good, 60)[1].endswith("more than 60")
+    wordy = _profile_block("## Communication", "- " + "очень " * 30 + "(!1)", "## Code habits", "## Strengths and areas")
+    assert "longer than 150" in parse_profile(wordy, 3000)[1]
 
 
 def test_profile_is_stored_without_its_front_matter_in_prompts(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ PROFILE_FENCE = "gitlab-review-profile"
 PROFILE_SECTIONS = ("## Communication", "## Code habits", "## Strengths and areas")
 MAX_NOTES_PER_PERSON = 5
 MAX_NOTE_CHARS = 300
+MAX_FACT_CHARS = 150
 
 _FENCE_RE = re.compile(
     r"```" + re.escape(PEOPLE_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
@@ -109,6 +110,9 @@ def parse_profile(answer: str, max_chars: int) -> tuple[str | None, str]:
     stray = [line for line in lines if not line.startswith(("## ", "- "))]
     if stray:
         return None, f"not a heading or a bullet: {stray[0][:80]}"
+    long = [line for line in lines if line.startswith("- ") and len(line) - 2 > MAX_FACT_CHARS]
+    if long:
+        return None, f"a fact longer than {MAX_FACT_CHARS} characters: {long[0][2:60]}…"
     if _LABEL_RE.search(body):
         return None, "a judgement of character"
     text = "\n".join(lines)

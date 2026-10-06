@@ -869,7 +869,7 @@ async def test_daily_consolidation_builds_the_profile_from_evidence_and_own_word
         await task
     profile = (people / "author.md").read_text(encoding="utf-8")
     assert "## Communication\n- Пишет по-украински" in profile
-    assert "+ Пишет по-украински" in h.telegram.text()
+    assert "author: +1 −0\n+ Пишет по-украински" in h.telegram.text()
     assert "ночная сводка" in h.telegram.text()
 
 
