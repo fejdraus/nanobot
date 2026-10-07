@@ -173,6 +173,11 @@ class _MergeRequestInfo:
     draft: bool
     diff_refs: dict[str, Any] = field(default_factory=dict)
     description: str = ""
+    state: str = "opened"
+
+    @property
+    def state_label(self) -> str:
+        return {"merged": "смёржен", "closed": "закрыт", "locked": "заблокирован"}.get(self.state, self.state)
 
 
 class GitLabReviewChannel(BaseChannel):
@@ -1272,6 +1277,9 @@ class GitLabReviewChannel(BaseChannel):
             if action.type == "approve" and self.config.is_reviewer(info.author):
                 report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
                 continue
+            if action.type == "approve" and not info.open:
+                report.append(f"{number}. {action.label()}: пропущено — MR уже {info.state_label}")
+                continue
             try:
                 await self._publish_action(info, action)
             except GitLabApiError as exc:
@@ -1347,6 +1355,7 @@ class GitLabReviewChannel(BaseChannel):
             draft=is_draft(mr),
             diff_refs=cast("dict[str, Any]", refs) if isinstance(refs, dict) else {},
             description=str(mr.get("description") or ""),
+            state=str(mr.get("state") or ""),
         )
 
     async def _tell(self, chunks: list[str]) -> list[int]:

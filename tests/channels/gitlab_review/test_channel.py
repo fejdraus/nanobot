@@ -1177,3 +1177,13 @@ async def test_human_can_ask_to_reconnect_the_vpn(tmp_path: Path) -> None:
     assert "Kerio VPN: переподключаю (по вашей просьбе)." in h.telegram.text()
     assert h.inbound == []
 
+
+@pytest.mark.asyncio
+async def test_approval_of_a_merged_mr_is_skipped_but_comments_go_out(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "general"}, {"type": "approve"}])
+        h.gitlab.mr["state"] = "merged"
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert h.gitlab.writes == [("note", "general")]
+    assert "2. аппрув MR: пропущено — MR уже смёржен" in h.telegram.text()
+
