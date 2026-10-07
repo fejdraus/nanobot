@@ -1871,6 +1871,13 @@ and a profile must keep its three sections, consist of bullets and stay within
 how strictly it reviews. Developers who did not agree are listed in
 `peopleExcluded` (GitLab usernames): they are never noted, profiled or shown.
 
+**Jira behind a VPN.** `vpnControl` (`host:port`) points at a VPN container's
+control port speaking one line each way: `status` → `ok` / `needs_code` /
+`down`, `code <digits>` → `ok` / `error: …`. The channel polls it every
+`vpnCheckIntervalS` (default 60), asks in Telegram for the authenticator code
+when needed, at most every `vpnReminderIntervalS` (default 3600), and passes a
+bare six-digit reply on to the container.
+
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:
 

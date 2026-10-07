@@ -1111,3 +1111,49 @@ async def test_requested_review_runs_even_for_a_revert(tmp_path: Path) -> None:
         assert "review-gitlab-mrs" in h.inbound[0].content
         assert "!42: запускаю ревью." in h.telegram.text()
         await h.reply_as_agent("gitlab-review:42", _answer("Ревёрт точный.", []))
+
+
+async def _vpn_control(answers: dict[str, str]) -> tuple[asyncio.AbstractServer, str, list[str]]:
+    seen: list[str] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        line = (await reader.readline()).decode().strip()
+        seen.append(line)
+        writer.write((answers.get(line.split()[0], "error: ?") + "\n").encode())
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, f"127.0.0.1:{server.sockets[0].getsockname()[1]}", seen
+
+
+@pytest.mark.asyncio
+async def test_vpn_waiting_for_a_code_asks_once_and_takes_the_reply(tmp_path: Path) -> None:
+    server, endpoint, seen = await _vpn_control({"status": "needs_code", "code": "ok"})
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=0.02) as h:
+            await _until(lambda: "ждёт код подтверждения" in h.telegram.text())
+            await asyncio.sleep(0.1)
+            assert h.telegram.text().count("ждёт код подтверждения") == 1
+            await h.channel.handle_telegram(_tg(1, "123456"))
+    assert "code 123456" in seen
+    assert "код принят, Jira доступна" in h.telegram.text()
+    assert h.inbound == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_vpn_code_asks_for_another(tmp_path: Path) -> None:
+    server, endpoint, _ = await _vpn_control({"status": "ok", "code": "error: Kerio did not accept the code"})
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=10) as h:
+            await h.channel.handle_telegram(_tg(1, "654321"))
+    assert "код не принят (Kerio did not accept the code). Пришлите новый." in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_six_digits_are_a_question_without_a_vpn(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        turn = await h.say(1, "123456")
+        await h.reply_as_agent(turn.chat_id, "Это не MR.")
+    assert "> 123456" in turn.content
+

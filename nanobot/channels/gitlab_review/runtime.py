@@ -23,6 +23,9 @@ Flow:
    publication or a cancellation, which the channel then performs on the draft
    the human was shown, if the branch has not moved. Every review, draft, decision and message is kept in an archive the
    agent can consult when asked about an earlier review.
+8. With ``vpnControl`` set, the channel watches the VPN container that gives
+   access to Jira (:mod:`vpn`): it asks in Telegram for the authenticator code
+   when the VPN waits for one and passes on the six digits sent back.
 7. The agent may also note what it learned about the developers involved. The
    notes are kept as evidence; once a day each developer's profile is
    consolidated from it and from their own messages in the reviewer's threads
@@ -93,6 +96,7 @@ from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewR
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
 from nanobot.channels.gitlab_review.triage import triage_thread
+from nanobot.channels.gitlab_review.vpn import verification_code, vpn_request
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.events import ResponseSourceEvent
 from nanobot.providers.claude_cli_provider import SESSION_METADATA_KEY
@@ -207,6 +211,7 @@ class GitLabReviewChannel(BaseChannel):
         self._tasks: list[asyncio.Task[None]] = []
         self._pending: dict[str, _PendingRun] = {}
         self._dream_report: list[str] = []
+        self._vpn_reminded: float | None = None
 
     async def start(self) -> None:
         self.config.validate_runtime()
@@ -241,6 +246,8 @@ class GitLabReviewChannel(BaseChannel):
         ]
         if self._people is not None:
             self._tasks.append(asyncio.create_task(self._dream_clock(), name="gitlab-review-dream"))
+        if self.config.vpn_control:
+            self._tasks.append(asyncio.create_task(self._watch_vpn(), name="gitlab-review-vpn"))
         self._running = True
         self.logger.info(
             "GitLab review webhook listening on {}:{}{} for {}",
@@ -346,6 +353,36 @@ class GitLabReviewChannel(BaseChannel):
                 "system",
                 "Evidence for profiles:\n" + "\n".join(f"- {note.username}: {note.text}" for note in kept),
             )
+
+    async def _watch_vpn(self) -> None:
+        """Ask for the authenticator code whenever the Jira VPN waits for one."""
+        assert self._loop is not None
+        while True:
+            status = await vpn_request(self.config.vpn_control, "status")
+            now = self._loop.time()
+            due = self._vpn_reminded is None or now - self._vpn_reminded >= self.config.vpn_reminder_interval_s
+            if status == "ok":
+                self._vpn_reminded = None
+            elif due:
+                self._vpn_reminded = now
+                if status == "needs_code":
+                    await self._tell_safe([
+                        "Kerio VPN ждёт код подтверждения — без него Jira недоступна. "
+                        "Пришлите 6 цифр из приложения-аутентификатора."
+                    ])
+                else:
+                    await self._tell_safe(["Kerio VPN не подключён — Jira недоступна."])
+            await asyncio.sleep(self.config.vpn_check_interval_s)
+
+    async def _submit_vpn_code(self, code: str) -> None:
+        answer = await vpn_request(self.config.vpn_control, f"code {code}")
+        if answer == "ok":
+            self._vpn_reminded = None
+            await self._tell(["Kerio VPN: код принят, Jira доступна."])
+        elif answer == "down":
+            await self._tell(["Kerio VPN не отвечает — код не передан."])
+        else:
+            await self._tell([f"Kerio VPN: код не принят ({answer.removeprefix('error: ')}). Пришлите новый."])
 
     async def _dream_clock(self) -> None:
         """Queue the profile consolidation daily at ``peopleDreamHour``, and once at first start."""
@@ -902,6 +939,10 @@ class GitLabReviewChannel(BaseChannel):
             return
         text = message.text or ""
         if not text.strip():
+            return
+        code = verification_code(text) if self.config.vpn_control else None
+        if code is not None:
+            await self._submit_vpn_code(code)
             return
         requested = _REVIEW_REQUEST_RE.match(text)
         if requested is not None:
