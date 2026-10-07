@@ -41,3 +41,12 @@ def test_only_a_bare_six_digit_message_is_a_code() -> None:
     assert verification_code("12345") is None
     assert verification_code("публикуй 123456") is None
     assert verification_code("!6320") is None
+
+
+def test_reconnect_request_is_recognised_in_both_languages() -> None:
+    from nanobot.channels.gitlab_review.vpn import asks_reconnect
+
+    assert asks_reconnect("переподключи vpn")
+    assert asks_reconnect(" Reconnect VPN ")
+    assert not asks_reconnect("переподключи vpn и проверь !6320")
+

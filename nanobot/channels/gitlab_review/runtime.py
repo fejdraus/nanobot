@@ -96,7 +96,7 @@ from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewR
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
 from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
 from nanobot.channels.gitlab_review.triage import triage_thread
-from nanobot.channels.gitlab_review.vpn import verification_code, vpn_request
+from nanobot.channels.gitlab_review.vpn import asks_reconnect, verification_code, vpn_request
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.events import ResponseSourceEvent
 from nanobot.providers.claude_cli_provider import SESSION_METADATA_KEY
@@ -212,6 +212,7 @@ class GitLabReviewChannel(BaseChannel):
         self._pending: dict[str, _PendingRun] = {}
         self._dream_report: list[str] = []
         self._vpn_reminded: float | None = None
+        self._vpn_down_since: float | None = None
 
     async def start(self) -> None:
         self.config.validate_runtime()
@@ -360,6 +361,13 @@ class GitLabReviewChannel(BaseChannel):
         while True:
             status = await vpn_request(self.config.vpn_control, "status")
             now = self._loop.time()
+            if status == "down":
+                self._vpn_down_since = self._vpn_down_since or now
+                if now - self._vpn_down_since >= self.config.vpn_reconnect_after_s:
+                    self._vpn_down_since = now
+                    await self._reconnect_vpn("сам: VPN не работает уже несколько минут")
+            else:
+                self._vpn_down_since = None
             due = self._vpn_reminded is None or now - self._vpn_reminded >= self.config.vpn_reminder_interval_s
             if status == "ok":
                 self._vpn_reminded = None
@@ -373,6 +381,13 @@ class GitLabReviewChannel(BaseChannel):
                 else:
                     await self._tell_safe(["Kerio VPN не подключён — Jira недоступна."])
             await asyncio.sleep(self.config.vpn_check_interval_s)
+
+    async def _reconnect_vpn(self, why: str) -> None:
+        answer = await vpn_request(self.config.vpn_control, "reconnect")
+        if answer == "ok":
+            await self._tell_safe([f"Kerio VPN: переподключаю ({why})."])
+        else:
+            await self._tell_safe([f"Kerio VPN не отвечает, переподключить не удалось ({why})."])
 
     async def _submit_vpn_code(self, code: str) -> None:
         answer = await vpn_request(self.config.vpn_control, f"code {code}")
@@ -943,6 +958,9 @@ class GitLabReviewChannel(BaseChannel):
         code = verification_code(text) if self.config.vpn_control else None
         if code is not None:
             await self._submit_vpn_code(code)
+            return
+        if self.config.vpn_control and asks_reconnect(text):
+            await self._reconnect_vpn("по вашей просьбе")
             return
         requested = _REVIEW_REQUEST_RE.match(text)
         if requested is not None:

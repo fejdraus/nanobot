@@ -1157,3 +1157,23 @@ async def test_six_digits_are_a_question_without_a_vpn(tmp_path: Path) -> None:
         await h.reply_as_agent(turn.chat_id, "Это не MR.")
     assert "> 123456" in turn.content
 
+
+@pytest.mark.asyncio
+async def test_vpn_down_for_a_while_is_reconnected_on_its_own(tmp_path: Path) -> None:
+    server, endpoint, seen = await _vpn_control({"status": "down", "reconnect": "ok"})
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=0.02, vpn_reconnect_after_s=0.05) as h:
+            await _until(lambda: "reconnect" in seen)
+    assert "Kerio VPN: переподключаю (сам: VPN не работает уже несколько минут)." in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_human_can_ask_to_reconnect_the_vpn(tmp_path: Path) -> None:
+    server, endpoint, seen = await _vpn_control({"status": "ok", "reconnect": "ok"})
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=10) as h:
+            await h.channel.handle_telegram(_tg(1, "Переподключи VPN"))
+    assert "reconnect" in seen
+    assert "Kerio VPN: переподключаю (по вашей просьбе)." in h.telegram.text()
+    assert h.inbound == []
+

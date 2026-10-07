@@ -1876,7 +1876,9 @@ control port speaking one line each way: `status` → `ok` / `needs_code` /
 `down`, `code <digits>` → `ok` / `error: …`. The channel polls it every
 `vpnCheckIntervalS` (default 60), asks in Telegram for the authenticator code
 when needed, at most every `vpnReminderIntervalS` (default 3600), and passes a
-bare six-digit reply on to the container.
+bare six-digit reply on to the container. A VPN reported `down` for
+`vpnReconnectAfterS` (default 300) is sent `reconnect`; «переподключи vpn» does
+the same on request.
 
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:

@@ -65,6 +65,7 @@ class GitLabReviewConfig(Base):
     vpn_control: str = ""
     vpn_check_interval_s: float = Field(default=60.0, gt=0)
     vpn_reminder_interval_s: float = Field(default=3600.0, gt=0)
+    vpn_reconnect_after_s: float = Field(default=300.0, gt=0)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

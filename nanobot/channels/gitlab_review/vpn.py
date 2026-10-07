@@ -7,7 +7,9 @@ container's control port, says in Telegram when a code is needed, and passes
 on the six digits the approver sends back.
 
 The control protocol is one line each way: ``status`` answers ``ok``,
-``needs_code`` or ``down``; ``code <digits>`` answers ``ok`` or ``error: …``.
+``needs_code`` or ``down``; ``code <digits>`` answers ``ok`` or ``error: …``;
+``reconnect`` restarts the tunnel. A VPN that stays down is reconnected by the
+channel on its own; the approver can ask for it too.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import asyncio
 import re
 
 CODE_RE = re.compile(r"^\s*(\d{6})\s*$")
+RECONNECT_RE = re.compile(r"^\s*(?:переподключи|перезапусти|reconnect|restart)\s+(?:vpn|впн)\s*$", re.IGNORECASE)
 
 
 async def vpn_request(endpoint: str, line: str, timeout_s: float = 45.0) -> str:
@@ -33,6 +36,10 @@ async def vpn_request(endpoint: str, line: str, timeout_s: float = 45.0) -> str:
     finally:
         writer.close()
     return answer.decode(errors="replace").strip() or "down"
+
+
+def asks_reconnect(text: str) -> bool:
+    return RECONNECT_RE.match(text or "") is not None
 
 
 def verification_code(text: str) -> str | None:

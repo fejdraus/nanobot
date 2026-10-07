@@ -32,6 +32,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "vpnControl": field(),
         "vpnCheckIntervalS": field("float", default=60.0),
         "vpnReminderIntervalS": field("float", default=3600.0),
+        "vpnReconnectAfterS": field("float", default=300.0),
         "telegramBotToken": field("secret"),
         "telegramChatId": field(),
         "telegramUserIds": field("list"),
