@@ -67,6 +67,7 @@ class FakeGitLab:
         self.discussions: dict[str, list[dict[str, Any]]] = {}
         self.writes: list[tuple[str, Any]] = []
         self.fail_writes = False
+        self.reject_lines = False
         self.commits: list[str] = ["feat: thing"]
         self.changes_by_iid: dict[int, list[dict[str, Any]]] = {}
         self.raw_by_iid: dict[int, str] = {}
@@ -113,6 +114,10 @@ class FakeGitLab:
         return {}
 
     async def create_discussion(self, iid: int, body: str, position: dict[str, Any]) -> dict[str, Any]:
+        if self.reject_lines:
+            raise GitLabApiError(
+                'GitLab 400: {"message":"400 Bad request - Note {:line_code=>[\\"can\'t be blank\\"]}"}', 400
+            )
         return await self._write("discussion", (body, position))
 
     async def create_note(self, iid: int, body: str) -> dict[str, Any]:
@@ -1186,4 +1191,28 @@ async def test_approval_of_a_merged_mr_is_skipped_but_comments_go_out(tmp_path: 
         await h.channel.handle_telegram(_tg(1, "публикуй !42"))
     assert h.gitlab.writes == [("note", "general")]
     assert "2. аппрув MR: пропущено — MR уже смёржен" in h.telegram.text()
+
+
+
+
+@pytest.mark.asyncio
+async def test_comment_on_a_line_gitlab_cannot_show_goes_out_as_a_general_note(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "discussion", "path": "bundle.js", "line": 275478, "body": "замечание"}])
+        h.gitlab.reject_lines = True
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert h.gitlab.writes == [("note", "`bundle.js:275478`\n\nзамечание")]
+    assert "опубликовано общим комментарием" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_failed_items_stay_in_a_new_draft_to_retry(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "one"}])
+        h.gitlab.fail_writes = True
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+        assert "повторить: «публикуй !42/2»" in h.telegram.text()
+        h.gitlab.fail_writes = False
+        await h.channel.handle_telegram(_tg(2, "публикуй !42/2"))
+    assert h.gitlab.writes == [("note", "one")]
 

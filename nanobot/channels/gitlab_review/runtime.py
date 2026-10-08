@@ -1273,6 +1273,7 @@ class GitLabReviewChannel(BaseChannel):
 
         report: list[str] = []
         published = 0
+        failed: list[ProposedAction] = []
         for number, action in selected:
             if action.type == "approve" and self.config.is_reviewer(info.author):
                 report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
@@ -1281,13 +1282,21 @@ class GitLabReviewChannel(BaseChannel):
                 report.append(f"{number}. {action.label()}: пропущено — MR уже {info.state_label}")
                 continue
             try:
-                await self._publish_action(info, action)
+                outcome = await self._publish_action(info, action)
             except GitLabApiError as exc:
+                failed.append(action)
                 report.append(f"{number}. {action.label()}: ошибка — {exc}")
             else:
                 published += 1
-                report.append(f"{number}. {action.label()}: опубликовано")
+                report.append(f"{number}. {action.label()}: {outcome}")
         self._state.delete_draft(command.iid)
+        if failed:
+            version = self._state.next_draft_version(command.iid)
+            self._state.save_draft(command.iid, reviewed_sha, tuple(failed), version)
+            report.append(
+                f"Неопубликованное осталось в черновике {command.iid}/{version} — "
+                f"повторить: «публикуй !{command.iid}/{version}»."
+            )
         if len(selected) < len(actions):
             report.append("Остальные пункты черновика сняты.")
         summary = f"!{command.iid}:\n" + "\n".join(report)
@@ -1313,7 +1322,8 @@ class GitLabReviewChannel(BaseChannel):
         wanted = set(items)
         return [(number, action) for number, action in numbered if number in wanted]
 
-    async def _publish_action(self, info: _MergeRequestInfo, action: ProposedAction) -> None:
+    async def _publish_action(self, info: _MergeRequestInfo, action: ProposedAction) -> str:
+        """Post one approved action; return how it went out."""
         assert self._gitlab is not None
         if action.type == "discussion":
             refs = info.diff_refs
@@ -1328,7 +1338,14 @@ class GitLabReviewChannel(BaseChannel):
                 position["new_line"] = action.line
             if action.old_line is not None:
                 position["old_line"] = action.old_line
-            await self._gitlab.create_discussion(info.iid, action.body, position)
+            try:
+                await self._gitlab.create_discussion(info.iid, action.body, position)
+            except GitLabApiError as exc:
+                if exc.status != 400 or "line_code" not in str(exc):
+                    raise
+                line = action.line if action.line is not None else action.old_line
+                await self._gitlab.create_note(info.iid, f"`{action.path}:{line}`\n\n{action.body}")
+                return "опубликовано общим комментарием — GitLab не показывает эту строку в диффе"
         elif action.type == "reply":
             assert action.discussion_id
             await self._gitlab.reply(info.iid, action.discussion_id, action.body)
@@ -1336,6 +1353,7 @@ class GitLabReviewChannel(BaseChannel):
             await self._gitlab.approve(info.iid, info.head_sha)
         else:
             await self._gitlab.create_note(info.iid, action.body)
+        return "опубликовано"
 
     async def _merge_request(self, iid: int) -> _MergeRequestInfo:
         assert self._gitlab is not None
