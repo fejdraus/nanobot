@@ -64,6 +64,9 @@ class GitLabReviewConfig(Base):
     people_history_days: int = Field(default=90, ge=7)
     catch_up_days: int = Field(default=3, ge=0)
     attachments_dir: str = ""
+    jev_api_key: str = ""
+    jev_keep_min: float = Field(default=0.3, ge=0, le=1)
+    jev_add_min: float = Field(default=0.75, ge=0, le=1)
     vpn_control: str = ""
     vpn_check_interval_s: float = Field(default=60.0, gt=0)
     vpn_reminder_interval_s: float = Field(default=3600.0, gt=0)

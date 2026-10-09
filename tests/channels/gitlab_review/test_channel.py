@@ -1313,3 +1313,58 @@ async def test_without_an_attachments_folder_nothing_is_said(tmp_path: Path) -> 
         review = await h.review(42, [])
     assert "Attachments (screenshots" not in review.content
 
+
+class FakeJev:
+    def __init__(self, scores: dict[str, float] | None) -> None:
+        self.scores = scores
+        self.asked: list[str] = []
+
+    async def score(self, state: str, notes: list[tuple[str, str]]) -> dict[str, float] | None:
+        self.asked.append(state)
+        return self.scores
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _write_mixed_notes(directory: Path) -> None:
+    directory.mkdir()
+    for name, front, body in (
+        ("lead.md", 'applies_to: ["Pkg/AMLead/**"]', "Урок про лиды."),
+        ("broad.md", 'applies_to: ["Pkg/**"]', "Общее правило."),
+        ("untagged.md", "", "Урок без тегов."),
+    ):
+        (directory / name).write_text(
+            f'---\nname: {name}\ndescription: "{body}"\n{front}\n---\n\n{body}\n', encoding="utf-8"
+        )
+
+
+def _harness_with_jev(tmp_path: Path, scores: dict[str, float] | None) -> tuple[Harness, FakeJev]:
+    _write_mixed_notes(tmp_path / "memory")
+    h = Harness(tmp_path, lessons_dir=str(tmp_path / "memory"), review_timeout_s=0.05)
+    jev = FakeJev(scores)
+    h.channel._relevance = jev  # type: ignore[assignment]
+    return h, jev
+
+
+@pytest.mark.asyncio
+async def test_jev_drops_irrelevant_tagged_lessons_and_adds_relevant_untagged(tmp_path: Path) -> None:
+    h, jev = _harness_with_jev(tmp_path, {"lead.md": 0.6, "broad.md": 0.1, "untagged.md": 0.9})
+    async with h:
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    prompt = h.inbound[0].content
+    assert "Урок про лиды." in prompt and "Урок без тегов." in prompt
+    assert "Общее правило." not in prompt
+    assert prompt.index("Урок без тегов.") < prompt.index("Урок про лиды.")
+    assert "Merge request !42: feat: thing" in jev.asked[0]
+
+
+@pytest.mark.asyncio
+async def test_lessons_fall_back_to_tags_when_jev_fails(tmp_path: Path) -> None:
+    h, _ = _harness_with_jev(tmp_path, None)
+    async with h:
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    prompt = h.inbound[0].content
+    assert "Урок про лиды." in prompt and "Общее правило." in prompt
+    assert "Урок без тегов." not in prompt
+

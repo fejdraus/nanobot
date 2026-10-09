@@ -1824,6 +1824,13 @@ whose changes are the exact inverse of that, line for line per file, is not
 reviewed; the channel only says so in Telegram. A diff GitLab cut short, or any
 extra change, gets a normal review. `проверь !N` asks for a review of any MR.
 
+**Lessons weighed by Jev.** With `jevApiKey` (TypeSafe) set, the lessons picked by
+tags are sent to Jev together with the MR (title, description, changed files,
+a diff excerpt). Tagged lessons it scores below `jevKeepMin` (default 0.3) are
+dropped, notes without matching tags that it scores at least `jevAddMin`
+(default 0.75) are added, and the result is ordered by score. If Jev cannot be
+reached, the tag-based choice is used as before.
+
 **Attachments.** `attachmentsDir` names a folder the agent may read (add
 `Read(<dir>/**)` to the provider's `allowedTools`). The prompts then tell it to
 download task and MR screenshots into `<dir>/<MR number>/`, open them, and say

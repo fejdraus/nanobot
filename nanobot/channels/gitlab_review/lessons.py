@@ -45,8 +45,8 @@ class MatchedLesson:
     reasons: tuple[str, ...]
 
 
-def load_lessons(directory: Path) -> list[Lesson]:
-    """Read every tagged note in *directory*; notes without tags are skipped."""
+def load_lessons(directory: Path, *, tagged_only: bool = True) -> list[Lesson]:
+    """Read the notes in *directory*: by default only tagged ones, else every note with a description."""
     lessons: list[Lesson] = []
     for path in sorted(directory.glob("*.md")):
         if path.name in INDEX_FILES or path.name.startswith(INDEX_PREFIX):
@@ -57,7 +57,9 @@ def load_lessons(directory: Path) -> list[Lesson]:
             logger.warning("lessons: cannot read {}: {}", path.name, exc)
             continue
         lesson = parse_lesson(path.name, text)
-        if lesson is not None and (lesson.applies_to or lesson.keywords):
+        if lesson is None:
+            continue
+        if lesson.applies_to or lesson.keywords or (not tagged_only and lesson.description):
             lessons.append(lesson)
     return lessons
 

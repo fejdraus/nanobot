@@ -57,7 +57,13 @@ from nanobot.channels.base import BaseChannel
 from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate, is_draft, parse_event
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApi, GitLabApiError
-from nanobot.channels.gitlab_review.lessons import load_lessons, render_lessons, select_lessons
+from nanobot.channels.gitlab_review.lessons import (
+    Lesson,
+    MatchedLesson,
+    load_lessons,
+    render_lessons,
+    select_lessons,
+)
 from nanobot.channels.gitlab_review.people import (
     PeopleStore,
     PersonNote,
@@ -88,6 +94,7 @@ from nanobot.channels.gitlab_review.proposals import (
     render_notice,
     written_in_english,
 )
+from nanobot.channels.gitlab_review.relevance import JevScorer
 from nanobot.channels.gitlab_review.reverts import (
     Net,
     is_exact_revert,
@@ -208,6 +215,7 @@ class GitLabReviewChannel(BaseChannel):
         gitlab_api: GitLabApi | None = None,
         telegram_api: TelegramApi | None = None,
         task_lookup: TaskLookup | None = None,
+        relevance: JevScorer | None = None,
     ) -> None:
         if isinstance(config, dict):
             config = GitLabReviewConfig.model_validate(config)
@@ -219,6 +227,7 @@ class GitLabReviewChannel(BaseChannel):
         self._gitlab = gitlab_api
         self._telegram = telegram_api
         self._task_lookup = task_lookup
+        self._relevance = relevance
         people_path = self.config.people_path()
         self._people = PeopleStore(Path(people_path).expanduser()) if people_path else None
         self._server: _ReusableThreadingHTTPServer | None = None
@@ -248,6 +257,8 @@ class GitLabReviewChannel(BaseChannel):
                 clickup_team_id=self.config.clickup_team_id,
                 jira_url=self.config.jira_url,
             )
+        if self._relevance is None and self.config.jev_api_key:
+            self._relevance = JevScorer(self.config.jev_api_key)
         try:
             self._server = _ReusableThreadingHTTPServer(
                 (self.config.host, self.config.port), self._make_handler()
@@ -303,7 +314,7 @@ class GitLabReviewChannel(BaseChannel):
         self._loop = None
 
     async def _close_clients(self) -> None:
-        for client in (self._gitlab, self._telegram, self._task_lookup):
+        for client in (self._gitlab, self._telegram, self._task_lookup, self._relevance):
             if client is not None:
                 await client.aclose()
 
@@ -748,7 +759,7 @@ class GitLabReviewChannel(BaseChannel):
             prompt = review_prompt(
                 info.iid,
                 own=own,
-                lessons=await self._lessons_for(info.iid),
+                lessons=await self._lessons_for(info),
                 people=self._people_for(authors),
                 authors=authors,
                 attachments_dir=self.config.attachments_dir,
@@ -778,7 +789,7 @@ class GitLabReviewChannel(BaseChannel):
                 candidate.discussion_id,
                 decision.note_author,
                 decision.note_body,
-                lessons=await self._lessons_for(info.iid),
+                lessons=await self._lessons_for(info),
                 people=self._people_for(authors),
                 authors=authors,
                 attachments_dir=self.config.attachments_dir,
@@ -847,15 +858,17 @@ class GitLabReviewChannel(BaseChannel):
                 lines.append(f"Задача: {key}")
         return "\n".join(lines)
 
-    async def _lessons_for(self, iid: int) -> str:
+    async def _lessons_for(self, info: _MergeRequestInfo) -> str:
         """Lessons matching this MR's changes; never blocks a review on failure."""
+        iid = info.iid
         directory = self.config.lessons_dir.strip()
         if not directory or self.config.lessons_budget_chars <= 0:
             return ""
         assert self._gitlab is not None
         try:
-            lessons = await asyncio.to_thread(load_lessons, Path(directory).expanduser())
-            if not lessons:
+            notes = await asyncio.to_thread(load_lessons, Path(directory).expanduser(), tagged_only=False)
+            lessons = [note for note in notes if note.applies_to or note.keywords]
+            if not notes:
                 return ""
             changes = await self._gitlab.get_changes(iid)
             paths = {
@@ -870,6 +883,8 @@ class GitLabReviewChannel(BaseChannel):
                 if line[:1] in "+-" and not line.startswith(("+++", "---"))
             )
             matched = select_lessons(lessons, paths, diff_text)
+            if self._relevance is not None:
+                matched = await self._weigh_lessons(info, notes, matched, sorted(p for p in paths if p), diff_text)
         except Exception:
             self.logger.exception("MR !{}: lesson selection failed, reviewing without it", iid)
             return ""
@@ -877,6 +892,37 @@ class GitLabReviewChannel(BaseChannel):
             "MR !{}: {} of {} tagged lessons match", iid, len(matched), len(lessons)
         )
         return render_lessons(matched, self.config.lessons_budget_chars)
+
+    async def _weigh_lessons(
+        self,
+        info: _MergeRequestInfo,
+        notes: list[Lesson],
+        matched: list[MatchedLesson],
+        paths: list[str],
+        diff_text: str,
+    ) -> list[MatchedLesson]:
+        """Keep the tagged lessons Jev finds relevant and add untagged ones it rates highly."""
+        assert self._relevance is not None
+        state = (
+            f"Merge request !{info.iid}: {info.title}\n\nDescription:\n{info.description[:1500]}\n\n"
+            f"Changed files ({len(paths)}):\n" + "\n".join(paths[:60])
+            + f"\n\nChanged lines (excerpt):\n{diff_text[:4000]}"
+        )
+        scores = await self._relevance.score(state, [(note.name, note.description) for note in notes])
+        if scores is None:
+            return matched
+        tagged = {item.lesson.name for item in matched}
+        kept = [item for item in matched if scores.get(item.lesson.name, 0.0) >= self.config.jev_keep_min]
+        added = [
+            MatchedLesson(note, (f"Jev {scores[note.name]:.2f}",))
+            for note in notes
+            if note.name not in tagged and scores.get(note.name, 0.0) >= self.config.jev_add_min
+        ]
+        chosen = sorted([*kept, *added], key=lambda item: -scores.get(item.lesson.name, 0.0))
+        self.logger.info(
+            "MR !{}: Jev kept {} of {} tagged lessons and added {}", info.iid, len(kept), len(matched), len(added)
+        )
+        return chosen
 
     async def _run_agent(
         self,
