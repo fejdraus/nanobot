@@ -23,6 +23,10 @@ Flow:
    publication or a cancellation, which the channel then performs on the draft
    the human was shown, if the branch has not moved. Every review, draft, decision and message is kept in an archive the
    agent can consult when asked about an earlier review.
+9. After a restart, and on «проверь новые», open MRs updated within
+   ``catchUpDays`` that have no finished review of their current commit are
+   queued, so webhooks lost while the reviewer was down, or reviews cut short
+   by a restart, are not lost for good.
 8. With ``vpnControl`` set, the channel watches the VPN container that gives
    access to Jira (:mod:`vpn`): it asks in Telegram for the authenticator code
    when the VPN waits for one and passes on the six digits sent back.
@@ -111,6 +115,7 @@ ARCHIVE_LIMIT = 5
 ARCHIVE_ENTRY_CHARS = 6000
 TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
+_CATCH_UP_RE = re.compile(r"^\s*(?:проверь|проверить|check)\s+(?:новые|все|new)(?:\s+(?:mr|мр|ревью))?\s*$", re.IGNORECASE)
 _REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
 CONTINUE_WINDOW = timedelta(hours=12)
 _TIED_TO_CODE = frozenset({"discussion", "approve"})
@@ -148,6 +153,13 @@ class _PendingRun:
     authors: tuple[str, ...] = ()
     session: str = ""
     retried: bool = False
+
+
+@dataclass(frozen=True)
+class _CatchUpRequest:
+    """Look for open MRs whose current commit has not been reviewed."""
+
+    asked: bool = False
 
 
 @dataclass(frozen=True)
@@ -212,7 +224,7 @@ class GitLabReviewChannel(BaseChannel):
         self._server: _ReusableThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest | _DreamRequest] | None = None
+        self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest | _DreamRequest | _CatchUpRequest] | None = None
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._pending: dict[str, _PendingRun] = {}
@@ -255,6 +267,8 @@ class GitLabReviewChannel(BaseChannel):
             self._tasks.append(asyncio.create_task(self._dream_clock(), name="gitlab-review-dream"))
         if self.config.vpn_control:
             self._tasks.append(asyncio.create_task(self._watch_vpn(), name="gitlab-review-vpn"))
+        if self.config.catch_up_days > 0:
+            self._queue.put_nowait(_CatchUpRequest())
         self._running = True
         self.logger.info(
             "GitLab review webhook listening on {}:{}{} for {}",
@@ -360,6 +374,31 @@ class GitLabReviewChannel(BaseChannel):
                 "system",
                 "Evidence for profiles:\n" + "\n".join(f"- {note.username}: {note.text}" for note in kept),
             )
+
+    async def catch_up(self, *, asked: bool = False) -> None:
+        """Queue reviews for open MRs whose current commit has no finished review."""
+        assert self._gitlab is not None and self._queue is not None
+        days = self.config.catch_up_days or 3
+        since = (datetime.now().astimezone() - timedelta(days=days)).isoformat(timespec="seconds")
+        found: list[str] = []
+        for mr in await self._gitlab.list_open_merge_requests(since):
+            iid, sha = mr.get("iid"), str(mr.get("sha") or "")
+            if not isinstance(iid, int) or not sha or is_draft(mr):
+                continue
+            author = mr.get("author")
+            username = cast("dict[str, Any]", author).get("username") if isinstance(author, dict) else None
+            own = self.config.is_reviewer(username if isinstance(username, str) else None)
+            if own and not self.config.review_own_merge_requests:
+                continue
+            if self._state.reviewed_head(iid, sha):
+                continue
+            self._queue.put_nowait(ReviewCandidate(kind="merge_request", iid=iid))
+            found.append(f"!{iid} {str(mr.get('title') or '')[:70]}".rstrip())
+        if found:
+            lead = "Нашёл MR без ревью текущей версии" if asked else "После перезапуска нашёл MR без ревью"
+            await self._tell_safe([f"{lead} (за {days} дн.), ставлю в очередь:\n" + "\n".join(found)])
+        elif asked:
+            await self._tell_safe([f"Открытых MR без ревью за последние {days} дн. нет."])
 
     async def _watch_vpn(self) -> None:
         """Ask for the authenticator code whenever the Jira VPN waits for one."""
@@ -657,7 +696,9 @@ class GitLabReviewChannel(BaseChannel):
         while True:
             item = await self._queue.get()
             try:
-                if isinstance(item, _DreamRequest):
+                if isinstance(item, _CatchUpRequest):
+                    await self.catch_up(asked=item.asked)
+                elif isinstance(item, _DreamRequest):
                     await self.dream()
                 elif isinstance(item, _ChatRequest):
                     await self.converse(item)
@@ -666,7 +707,11 @@ class GitLabReviewChannel(BaseChannel):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if isinstance(item, _DreamRequest):
+                if isinstance(item, _CatchUpRequest):
+                    self.logger.exception("catch-up failed")
+                    if item.asked:
+                        await self._tell_safe([f"Проверка новых MR не удалась: {exc}"])
+                elif isinstance(item, _DreamRequest):
                     self.logger.exception("profile consolidation failed")
                 elif isinstance(item, _ChatRequest):
                     self.logger.exception("conversation turn failed")
@@ -684,6 +729,9 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         if candidate.kind == "merge_request" and not candidate.requested:
+            if self._state.reviewed_head(info.iid, info.head_sha):
+                self.logger.info("MR !{}: commit {} already reviewed", info.iid, info.head_sha[:10])
+                return
             reverted = await self._reverted_by(info.iid)
             if reverted:
                 await self._tell([
@@ -967,6 +1015,12 @@ class GitLabReviewChannel(BaseChannel):
             return
         if self.config.vpn_control and asks_reconnect(text):
             await self._reconnect_vpn("по вашей просьбе")
+            return
+        if _CATCH_UP_RE.match(text):
+            assert self._queue is not None
+            if self._pending:
+                await self._tell(["Проверю новые MR после текущей работы."])
+            self._queue.put_nowait(_CatchUpRequest(asked=True))
             return
         requested = _REVIEW_REQUEST_RE.match(text)
         if requested is not None:

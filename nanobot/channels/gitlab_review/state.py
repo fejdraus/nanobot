@@ -336,6 +336,21 @@ class GitLabReviewStateStore:
                 (username, datetime.now().isoformat(timespec="seconds"), iid, text),
             )
 
+    def reviewed_head(self, iid: int, head_sha: str) -> bool:
+        """Whether the reviewer finished looking at this MR at this commit.
+
+        A full review counts, and so does a check of a reply in one of its
+        threads: both end with the MR judged at that commit. An interrupted run
+        does not.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM reviews WHERE mr_iid = ? AND head_sha = ? AND kind IN ('review', 'thread') "
+                "AND status != 'in progress' LIMIT 1",
+                (iid, head_sha),
+            ).fetchone()
+        return row is not None
+
     def evidence_users(self, since: datetime) -> list[str]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(

@@ -69,6 +69,7 @@ class FakeGitLab:
         self.fail_writes = False
         self.reject_lines = False
         self.commits: list[str] = ["feat: thing"]
+        self.open_mrs: list[dict[str, Any]] = []
         self.changes_by_iid: dict[int, list[dict[str, Any]]] = {}
         self.raw_by_iid: dict[int, str] = {}
         self.changes_by_sha: dict[str, list[dict[str, Any]]] = {}
@@ -100,6 +101,9 @@ class FakeGitLab:
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
         return {"id": discussion_id, "notes": self.discussions.get(discussion_id, [])}
+
+    async def list_open_merge_requests(self, updated_after: str) -> list[dict[str, Any]]:
+        return self.open_mrs
 
     async def get_commits(self, iid: int) -> list[dict[str, Any]]:
         return [{"message": message} for message in self.commits]
@@ -404,6 +408,7 @@ async def test_hourly_limit_stops_runs(tmp_path: Path) -> None:
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
         await h.answer(42, [])
     async with Harness(tmp_path, max_runs_per_mr_per_hour=1) as h2:
+        h2.gitlab.mr["sha"] = "f" * 40
         await h2.channel.process(ReviewCandidate(kind="merge_request", iid=42))
         assert h2.inbound == []
         assert "Лимит" in h2.telegram.text()
@@ -693,6 +698,7 @@ async def test_draft_names_the_task(tmp_path: Path) -> None:
 async def test_each_review_starts_its_own_claude_session(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
         first = await h.review(42, [{"type": "note", "body": "a"}])
+        h.gitlab.mr["sha"] = "f" * 40
         second = await h.review(42, [{"type": "note", "body": "b"}])
     sessions = [message.metadata["claude_cli"] for message in (first, second)]
     assert sessions[0]["session_id"] != sessions[1]["session_id"]
@@ -843,6 +849,7 @@ async def test_notes_after_a_review_are_evidence_not_a_profile(tmp_path: Path) -
         first = await h.review(42, [{"type": "note", "body": "a"}])
         assert "You may write only about: author" in first.content
         before = len(h.inbound)
+        h.gitlab.mr["sha"] = "f" * 40
         task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
         await _until(lambda: len(h.inbound) > before)
         await h.reply_as_agent(
@@ -955,6 +962,7 @@ async def test_excluded_developer_is_never_profiled(tmp_path: Path) -> None:
         assert "gitlab-review-people" not in review.content
         assert "старое" not in review.content
         before = len(h.inbound)
+        h.gitlab.mr["sha"] = "f" * 40
         task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="merge_request", iid=42)))
         await _until(lambda: len(h.inbound) > before)
         await h.reply_as_agent(
@@ -1233,4 +1241,57 @@ async def test_new_commits_do_not_hold_back_a_thread_reply(tmp_path: Path) -> No
     assert h.gitlab.writes == [("reply", ("d1", "Потому что так короче"))]
     assert "2. инлайн a.cs:3: пропущено — ветка изменилась после ревью" in h.telegram.text()
     assert "3. аппрув MR: пропущено — ветка изменилась после ревью" in h.telegram.text()
+
+
+def _open_mr(iid: int, sha: str, **extra: Any) -> dict[str, Any]:
+    return {"iid": iid, "sha": sha, "title": f"feat {iid}", "author": {"username": "author"}, "draft": False, **extra}
+
+
+@pytest.mark.asyncio
+async def test_catch_up_queues_only_mrs_without_a_finished_review(tmp_path: Path) -> None:
+    async with Harness(tmp_path, catch_up_days=0, review_timeout_s=0.05) as h:
+        await h.review(42, [])
+        h.gitlab.open_mrs = [
+            _open_mr(42, SHA),
+            _open_mr(43, "c" * 40),
+            _open_mr(44, "d" * 40, draft=True),
+            _open_mr(45, "e" * 40, author={"username": "a.tyra"}),
+        ]
+        h.gitlab.mr["sha"] = "c" * 40
+        before = len(h.inbound)
+        await h.channel.handle_telegram(_tg(1, "проверь новые"))
+        await _until(lambda: len(h.inbound) > before)
+    assert "Нашёл MR без ревью текущей версии (за 3 дн.), ставлю в очередь:\n!43 feat 43" in h.telegram.text()
+    assert "!42 feat 42" not in h.telegram.text() and "!44" not in h.telegram.text() and "!45" not in h.telegram.text()
+    assert "Run the review-gitlab-mrs skill for merge request !43" in h.inbound[before].content
+
+
+@pytest.mark.asyncio
+async def test_interrupted_review_is_caught_up(tmp_path: Path) -> None:
+    async with Harness(tmp_path, catch_up_days=0) as h:
+        h.channel._state.start_review(
+            iid=42, title="t", web_url="", task_keys=[], kind="review", session_id="s", head_sha=SHA,
+        )
+        assert not h.channel._state.reviewed_head(42, SHA)
+        h.gitlab.open_mrs = [_open_mr(42, SHA)]
+        await h.channel.catch_up(asked=True)
+    assert "!42 feat 42" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_nothing_new_is_said_only_when_asked(tmp_path: Path) -> None:
+    async with Harness(tmp_path, catch_up_days=0) as h:
+        await h.channel.catch_up()
+        assert h.telegram.sent == []
+        await h.channel.catch_up(asked=True)
+    assert "Открытых MR без ревью за последние 3 дн. нет." in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_the_same_commit_is_not_reviewed_twice_from_webhooks(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.review(42, [])
+        before = len(h.inbound)
+        await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+    assert len(h.inbound) == before
 

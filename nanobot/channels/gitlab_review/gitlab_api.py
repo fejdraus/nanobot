@@ -61,6 +61,34 @@ class GitLabApi:
             f"/projects/{self._project}/merge_requests/{iid}/discussions/{quote(discussion_id, safe='')}"
         )
 
+    async def list_open_merge_requests(self, updated_after: str, max_pages: int = 3) -> list[dict[str, Any]]:
+        """Open merge requests updated after *updated_after* (ISO 8601), newest first."""
+        found: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            response = await self._client.get(
+                f"/projects/{self._project}/merge_requests",
+                params={
+                    "state": "opened",
+                    "updated_after": updated_after,
+                    "order_by": "updated_at",
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            if response.status_code >= 400:
+                raise GitLabApiError(
+                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
+                )
+            batch: object = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            found.extend(
+                cast("dict[str, Any]", item) for item in cast("list[object]", batch) if isinstance(item, dict)
+            )
+            if len(cast("list[object]", batch)) < 100:
+                break
+        return found
+
     async def get_commits(self, iid: int) -> list[dict[str, Any]]:
         response = await self._client.get(
             f"/projects/{self._project}/merge_requests/{iid}/commits", params={"per_page": 100}
