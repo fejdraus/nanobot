@@ -1,7 +1,8 @@
 """Pick the reviewer's lessons that concern the files a merge request changes.
 
-A lesson is a memory note whose front matter may carry two tags, both inline
-JSON lists so that plain YAML readers keep working:
+A lesson is a memory note whose front matter may carry two tags, as YAML lists
+(inline ``["…"]`` or one ``- item`` per line, at the top level or nested under
+``metadata:``, as Claude Code writes them):
 
 - ``applies_to``: path globs relative to the repository root (``**`` crosses
   directories, ``*`` does not), matched against the changed file paths;
@@ -20,11 +21,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+import yaml
 from loguru import logger
 
 INDEX_FILES = frozenset({"MEMORY.md"})
 INDEX_PREFIX = "topic_"
-_FIELD_RE = re.compile(r"^(applies_to|keywords|description):\s*(.*)$", re.MULTILINE)
+_FIELD_RE = re.compile(r"^(applies_to|keywords|description):\s*(\S.*)$", re.MULTILINE)
+_TAG_KEYS = frozenset({"applies_to", "keywords", "description"})
 
 
 @dataclass(frozen=True)
@@ -66,14 +69,41 @@ def parse_lesson(name: str, text: str) -> Lesson | None:
     if end < 0:
         return None
     head, body = text[3:end], text[end + 4:].strip()
-    fields = {match.group(1): match.group(2).strip() for match in _FIELD_RE.finditer(head)}
+    fields = _front_matter(head)
+    description = fields.get("description")
     return Lesson(
         name=name,
-        description=fields.get("description", "").strip().strip('"'),
+        description=description.strip() if isinstance(description, str) else "",
         applies_to=_string_list(fields.get("applies_to")),
         keywords=tuple(k for k in _string_list(fields.get("keywords")) if len(k) >= 4),
         body=body,
     )
+
+
+def _front_matter(head: str) -> dict[str, object]:
+    """The tag fields of a front matter, wherever in it they are nested.
+
+    A front matter that is not valid YAML still yields the fields written on
+    one line each, so a stray colon in a description does not lose the tags.
+    """
+    try:
+        data: object = yaml.safe_load(head)
+    except yaml.YAMLError:
+        data = None
+    found: dict[str, object] = {}
+    stack: list[object] = [data]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        for key, value in cast("dict[object, object]", current).items():
+            if key in _TAG_KEYS and key not in found:
+                found[str(key)] = value
+            elif isinstance(value, dict):
+                stack.append(cast("object", value))
+    for match in _FIELD_RE.finditer(head):
+        found.setdefault(match.group(1), match.group(2).strip())
+    return found
 
 
 def select_lessons(
@@ -146,13 +176,13 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out), re.IGNORECASE)
 
 
-def _string_list(raw: str | None) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    try:
-        value: object = json.loads(raw)
-    except json.JSONDecodeError:
-        return ()
+def _string_list(raw: object) -> tuple[str, ...]:
+    value: object = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return ()
     if not isinstance(value, list):
         return ()
     items = cast("list[object]", value)

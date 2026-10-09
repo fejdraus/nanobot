@@ -68,3 +68,27 @@ def test_render_respects_budget_and_points_to_the_rest() -> None:
     assert "x" * 500 not in text
     assert "big.md — описание" in text
     assert render_lessons([], 1000) == ""
+
+
+def test_tags_written_as_nested_yaml_lists_are_read() -> None:
+    from nanobot.channels.gitlab_review.lessons import parse_lesson
+
+    text = (
+        "---\nname: feedback_x\ndescription: \"Пересчёт: сверить формулу\"\nmetadata:\n"
+        "  node_type: memory\n  applies_to:\n    - Pkg/BanzaAMFreedom/Schemas/Contacts_FormPage_handlers/**\n"
+        "  keywords:\n    - calculateDriverLicPeriod\n    - r.silent\n  type: feedback\n---\n\nТело."
+    )
+    lesson = parse_lesson("feedback_x.md", text)
+    assert lesson is not None
+    assert lesson.applies_to == ("Pkg/BanzaAMFreedom/Schemas/Contacts_FormPage_handlers/**",)
+    assert lesson.keywords == ("calculateDriverLicPeriod", "r.silent")
+    assert lesson.description == "Пересчёт: сверить формулу"
+
+
+def test_tags_survive_a_front_matter_that_is_not_valid_yaml() -> None:
+    from nanobot.channels.gitlab_review.lessons import parse_lesson
+
+    text = '---\nname: x\ndescription: a: b: c\napplies_to: ["**/*.cs"]\nkeywords: []\n---\nТело.'
+    lesson = parse_lesson("x.md", text)
+    assert lesson is not None and lesson.applies_to == ("**/*.cs",)
+

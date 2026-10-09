@@ -1216,3 +1216,21 @@ async def test_failed_items_stay_in_a_new_draft_to_retry(tmp_path: Path) -> None
         await h.channel.handle_telegram(_tg(2, "публикуй !42/2"))
     assert h.gitlab.writes == [("note", "one")]
 
+
+@pytest.mark.asyncio
+async def test_new_commits_do_not_hold_back_a_thread_reply(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(
+            42,
+            [
+                {"type": "reply", "discussion_id": "d1", "body": "Потому что так короче"},
+                {"type": "discussion", "path": "a.cs", "line": 3, "body": "inline"},
+                {"type": "approve"},
+            ],
+        )
+        h.gitlab.mr["sha"] = "b" * 40
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert h.gitlab.writes == [("reply", ("d1", "Потому что так короче"))]
+    assert "2. инлайн a.cs:3: пропущено — ветка изменилась после ревью" in h.telegram.text()
+    assert "3. аппрув MR: пропущено — ветка изменилась после ревью" in h.telegram.text()
+

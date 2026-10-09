@@ -113,6 +113,7 @@ TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
 _REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
 CONTINUE_WINDOW = timedelta(hours=12)
+_TIED_TO_CODE = frozenset({"discussion", "approve"})
 DREAM_CURSOR_KEY = "people_dream_cursor"
 DREAM_MR_LIMIT = 30
 DREAM_MESSAGES = 15
@@ -1262,13 +1263,21 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         info = await self._merge_request(command.iid)
-        if info.head_sha != reviewed_sha:
+        moved = info.head_sha != reviewed_sha
+        review = self._state.latest_review(command.iid)
+        if moved and all(action.type in _TIED_TO_CODE for _, action in selected):
             self._state.delete_draft(command.iid)
-            await self._tell([
+            notice = (
                 f"!{command.iid}: ветка изменилась после ревью "
                 f"({reviewed_sha[:10]} → {info.head_sha[:10]}). "
                 "Черновик снят, ничего не опубликовано."
-            ])
+            )
+            if review is not None:
+                self._state.add_event(review.id, "system", notice)
+                self._state.set_review_status(review.id, "draft withdrawn: branch moved")
+            message_ids = await self._tell([notice])
+            if review is not None:
+                self._state.record_review_messages(review.id, message_ids)
             return
 
         report: list[str] = []
@@ -1280,6 +1289,9 @@ class GitLabReviewChannel(BaseChannel):
                 continue
             if action.type == "approve" and not info.open:
                 report.append(f"{number}. {action.label()}: пропущено — MR уже {info.state_label}")
+                continue
+            if moved and action.type in _TIED_TO_CODE:
+                report.append(f"{number}. {action.label()}: пропущено — ветка изменилась после ревью")
                 continue
             try:
                 outcome = await self._publish_action(info, action)
@@ -1300,7 +1312,6 @@ class GitLabReviewChannel(BaseChannel):
         if len(selected) < len(actions):
             report.append("Остальные пункты черновика сняты.")
         summary = f"!{command.iid}:\n" + "\n".join(report)
-        review = self._state.latest_review(command.iid)
         if review is not None:
             self._state.add_event(review.id, "system", summary)
             self._state.add_published(review.id, published)
