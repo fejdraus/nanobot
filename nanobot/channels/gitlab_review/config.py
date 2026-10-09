@@ -63,6 +63,7 @@ class GitLabReviewConfig(Base):
     people_dream_hour: int = Field(default=4, ge=0, le=23)
     people_history_days: int = Field(default=90, ge=7)
     catch_up_days: int = Field(default=3, ge=0)
+    attachments_dir: str = ""
     vpn_control: str = ""
     vpn_check_interval_s: float = Field(default=60.0, gt=0)
     vpn_reminder_interval_s: float = Field(default=3600.0, gt=0)

@@ -30,6 +30,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "peopleDreamHour": field("int", default=4),
         "peopleHistoryDays": field("int", default=90),
         "catchUpDays": field("int", default=3),
+        "attachmentsDir": field(),
         "vpnControl": field(),
         "vpnCheckIntervalS": field("float", default=60.0),
         "vpnReminderIntervalS": field("float", default=3600.0),

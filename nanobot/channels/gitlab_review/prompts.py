@@ -66,6 +66,19 @@ _OWN_MR = (
 )
 
 
+def attachment_rules(directory: str, iid: int | None) -> str:
+    """Where to put task and MR attachments so they can be opened, or nothing."""
+    if not directory:
+        return ""
+    folder = f"{directory.rstrip('/')}/{iid if iid is not None else '<MR number>'}"
+    return (
+        f"Attachments (screenshots and files in the task or the MR): download them into {folder} "
+        "and open them with Read before relying on what the task says they show. If one cannot be "
+        "downloaded or opened, say so plainly. Never open any other file in its place, and name a "
+        "cause only if you checked it."
+    )
+
+
 def people_rules(usernames: list[str]) -> str:
     """How to record observations about the developers of this work, or nothing."""
     names = [name for name in usernames if name]
@@ -86,16 +99,22 @@ def people_rules(usernames: list[str]) -> str:
 
 
 def review_prompt(
-    iid: int, *, own: bool = False, lessons: str = "", people: str = "", authors: list[str] | None = None
+    iid: int,
+    *,
+    own: bool = False,
+    lessons: str = "",
+    people: str = "",
+    authors: list[str] | None = None,
+    attachments_dir: str = "",
 ) -> str:
     own_note = f"{_OWN_MR}\n\n" if own else ""
     lessons_note = f"{lessons}\n\n" if lessons else ""
     people_note = f"{people}\n\n" if people else ""
-    rules = people_rules(authors or [])
+    extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
     return (
         f"Run the review-gitlab-mrs skill for merge request !{iid}.\n\n"
         f"Merge request !{iid} was opened. Review it.\n\n{own_note}{lessons_note}{people_note}"
-        f"{_DRAFT_RULES}" + (f"\n\n{rules}" if rules else "")
+        f"{_DRAFT_RULES}" + "".join(f"\n\n{rule}" for rule in extra)
     )
 
 
@@ -108,9 +127,10 @@ def reply_prompt(
     lessons: str = "",
     people: str = "",
     authors: list[str] | None = None,
+    attachments_dir: str = "",
 ) -> str:
     quoted = "\n".join(f"> {line}" for line in (note_body or "").splitlines()) or "> (empty)"
-    rules = people_rules(authors or [])
+    extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
     return (
         f"Run the review-gitlab-mrs skill for merge request !{iid}.\n\n"
         f"In thread {discussion_id} of merge request !{iid}, started by the reviewer, "
@@ -119,7 +139,7 @@ def reply_prompt(
         "decide whether the thread needs a reply and whether an approval can be proposed (step 8). "
         f"Do not touch other threads.\n\n{lessons + chr(10) * 2 if lessons else ''}"
         f"{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
-        + (f"\n\n{rules}" if rules else "")
+        + "".join(f"\n\n{rule}" for rule in extra)
     )
 
 
@@ -164,6 +184,8 @@ def chat_prompt(
     archive_dir: str = "",
     people: str = "",
     authors: list[str] | None = None,
+    attachments_dir: str = "",
+    iid: int | None = None,
 ) -> str:
     """One message of the approver's conversation with the reviewer.
 
@@ -193,6 +215,9 @@ def chat_prompt(
     quoted = "\n".join(f"> {line}" for line in (text or "").splitlines()) or "> (empty)"
     parts.append(f"The human's message:\n{quoted}")
     parts.append(_CHAT_RULES)
+    attachments = attachment_rules(attachments_dir, iid)
+    if attachments:
+        parts.append(attachments)
     rules = people_rules(authors or [])
     if rules:
         parts.append(

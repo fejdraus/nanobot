@@ -1295,3 +1295,21 @@ async def test_the_same_commit_is_not_reviewed_twice_from_webhooks(tmp_path: Pat
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
     assert len(h.inbound) == before
 
+
+@pytest.mark.asyncio
+async def test_attachments_go_to_a_readable_folder_per_mr(tmp_path: Path) -> None:
+    async with Harness(tmp_path, attachments_dir="/home/u/review-attachments/") as h:
+        review = await h.review(42, [])
+        turn = await h.say(1, "посмотри скриншот в задаче")
+        await h.reply_as_agent(turn.chat_id, "Посмотрел.")
+    for prompt in (review.content, turn.content):
+        assert "download them into /home/u/review-attachments/42" in prompt
+        assert "Never open any other file in its place" in prompt
+
+
+@pytest.mark.asyncio
+async def test_without_an_attachments_folder_nothing_is_said(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        review = await h.review(42, [])
+    assert "Attachments (screenshots" not in review.content
+

@@ -1824,6 +1824,11 @@ whose changes are the exact inverse of that, line for line per file, is not
 reviewed; the channel only says so in Telegram. A diff GitLab cut short, or any
 extra change, gets a normal review. `проверь !N` asks for a review of any MR.
 
+**Attachments.** `attachmentsDir` names a folder the agent may read (add
+`Read(<dir>/**)` to the provider's `allowedTools`). The prompts then tell it to
+download task and MR screenshots into `<dir>/<MR number>/`, open them, and say
+plainly when one cannot be opened instead of reading any other file.
+
 **Catching up.** GitLab does not retry ordinary webhooks, and a restart drops
 the in-memory queue. So at start, and on «проверь новые», the channel lists
 open MRs updated within `catchUpDays` (default 3; 0 turns the start-up pass

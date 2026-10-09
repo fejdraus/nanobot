@@ -751,6 +751,7 @@ class GitLabReviewChannel(BaseChannel):
                 lessons=await self._lessons_for(info.iid),
                 people=self._people_for(authors),
                 authors=authors,
+                attachments_dir=self.config.attachments_dir,
             )
         else:
             assert self._gitlab is not None and candidate.discussion_id
@@ -780,6 +781,7 @@ class GitLabReviewChannel(BaseChannel):
                 lessons=await self._lessons_for(info.iid),
                 people=self._people_for(authors),
                 authors=authors,
+                attachments_dir=self.config.attachments_dir,
             )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):
@@ -1159,6 +1161,8 @@ class GitLabReviewChannel(BaseChannel):
             archive_dir=str(self._state.archive_dir),
             people=self._people_for(authors),
             authors=authors,
+            attachments_dir=self.config.attachments_dir,
+            iid=target.iid,
         )
         pending = _PendingRun(
             self._loop.create_future(),
