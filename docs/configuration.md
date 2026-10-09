@@ -1824,6 +1824,13 @@ whose changes are the exact inverse of that, line for line per file, is not
 reviewed; the channel only says so in Telegram. A diff GitLab cut short, or any
 extra change, gets a normal review. `проверь !N` asks for a review of any MR.
 
+**Catching up.** GitLab does not retry ordinary webhooks, and a restart drops
+the in-memory queue. So at start, and on «проверь новые», the channel lists
+open MRs updated within `catchUpDays` (default 3; 0 turns the start-up pass
+off) and queues those whose current commit has no finished review or thread
+check in the archive. A run cut short by a restart stays "in progress" and is
+caught up the same way; one commit is never reviewed twice from webhooks.
+
 **Talking to the reviewer.** Any other message from the approver goes to the
 agent. It continues the Claude session of the review it concerns — the one
 whose message you replied to, or the only waiting draft — so the agent keeps
