@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic_settings import SettingsError
 
 from nanobot.config.errors import ConfigIssue, ConfigLoadError, validation_issues
+from nanobot.config.home import get_home_path
 from nanobot.config.schema import (
     Config,
     _resolve_tool_config_refs,  # pyright: ignore[reportPrivateUsage]
@@ -38,17 +39,16 @@ def get_config_path() -> Path:
     Priority:
     1. Explicitly set path via set_config_path()
     2. NANOBOT_HOME environment variable
-    3. Default ~/.nanobot/config.json
+    3. The --home instance directory, else ~/.nanobot/config.json
     """
     if _current_config_path:
         return _current_config_path
 
-    # Support NANOBOT_HOME for multi-instance deployments
     nanobot_home = os.environ.get("NANOBOT_HOME")
     if nanobot_home:
         return Path(nanobot_home).expanduser() / "config.json"
 
-    return Path.home() / ".nanobot" / "config.json"
+    return get_home_path() / "config.json"
 
 
 def load_config(config_path: Path | None = None) -> Config:

@@ -628,6 +628,8 @@ class AgentLoop:
         from nanobot.agent.tools.context import ToolContext
         from nanobot.agent.tools.loader import ToolLoader
 
+        runtime_control = AgentRuntimeControl(self)
+        self.register_runtime_context_provider(runtime_control.workspace_context)
         ctx = ToolContext(
             config=self.tools_config,
             workspace=str(self.workspace),
@@ -640,7 +642,7 @@ class AgentLoop:
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
-            runtime_control=AgentRuntimeControl(self),
+            runtime_control=runtime_control,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -749,6 +751,7 @@ class AgentLoop:
             sender_id=ctx.msg.sender_id,
             turn_id=ctx.delivery.route.turn_id or ctx.turn_id,
             workspace=scope.project_path,
+            workspace_scope=scope,
             log_content=ctx.session.policy.log_content and not ctx.ephemeral,
             persist_session=ctx.session.policy.persist and not ctx.ephemeral,
             can_receive_background_results=self._running,
@@ -1095,6 +1098,8 @@ class AgentLoop:
                         sender_id=pending_msg.sender_id,
                         turn_id=request_ctx.turn_id,
                         workspace=scope.project_path,
+                        # Injected input continues the active run's tool policy.
+                        workspace_scope=effective_scope,
                         log_content=request_ctx.log_content,
                     )
                     blocks = await self._resolve_runtime_context_for_request(
@@ -1207,6 +1212,7 @@ class AgentLoop:
             )
         request_ctx = dataclasses.replace(
             request_ctx,
+            workspace_scope=effective_scope,
             log_content=(
                 request_ctx.log_content and not ephemeral
                 and (session is None or session.policy.log_content)
@@ -2050,7 +2056,7 @@ class AgentLoop:
         if result is not None:
             ctx.outbound = result
             # Shortcut commands skip BUILD and SAVE, so we must persist the
-            # turn here so WebUI history hydration after _turn_end sees the
+            # turn here so WebUI history hydration after turn_end sees the
             # message.  Mark messages with _command so get_history can filter
             # them out of LLM context.  /new is excluded because it
             # intentionally clears the session.
