@@ -1176,8 +1176,23 @@ async def test_vpn_down_for_a_while_is_reconnected_on_its_own(tmp_path: Path) ->
     server, endpoint, seen = await _vpn_control({"status": "down", "reconnect": "ok"})
     async with server:
         async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=0.02, vpn_reconnect_after_s=0.05) as h:
-            await _until(lambda: "reconnect" in seen)
-    assert "Kerio VPN: переподключаю (сам: VPN не работает уже несколько минут)." in h.telegram.text()
+            await _until(lambda: seen.count("reconnect") >= 3)
+    assert h.telegram.text().count("Kerio VPN не подключён") == 1
+    assert "Переподключаю сам" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_vpn_waiting_for_a_code_is_not_repeated_until_it_works_again(tmp_path: Path) -> None:
+    answers = {"status": "needs_code"}
+    server, endpoint, seen = await _vpn_control(answers)
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=0.01) as h:
+            await _until(lambda: seen.count("status") >= 5)
+            assert h.telegram.text().count("ждёт код подтверждения") == 1
+            answers["status"] = "ok"
+            await _until(lambda: seen.count("status") >= 8)
+            answers["status"] = "needs_code"
+            await _until(lambda: h.telegram.text().count("ждёт код подтверждения") == 2)
 
 
 @pytest.mark.asyncio

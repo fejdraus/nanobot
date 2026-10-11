@@ -238,7 +238,7 @@ class GitLabReviewChannel(BaseChannel):
         self._tasks: list[asyncio.Task[None]] = []
         self._pending: dict[str, _PendingRun] = {}
         self._dream_report: list[str] = []
-        self._vpn_reminded: float | None = None
+        self._vpn_reported: set[str] = set()
         self._vpn_down_since: float | None = None
 
     async def start(self) -> None:
@@ -412,30 +412,34 @@ class GitLabReviewChannel(BaseChannel):
             await self._tell_safe([f"Открытых MR без ревью за последние {days} дн. нет."])
 
     async def _watch_vpn(self) -> None:
-        """Ask for the authenticator code whenever the Jira VPN waits for one."""
+        """Say once per outage that the Jira VPN waits for a code or is down; reconnect a dead one quietly."""
         assert self._loop is not None
         while True:
             status = await vpn_request(self.config.vpn_control, "status")
             now = self._loop.time()
-            if status == "down":
+            if status == "ok":
+                self._vpn_reported.clear()
+                self._vpn_down_since = None
+            elif status == "needs_code":
+                self._vpn_down_since = None
+                if status not in self._vpn_reported:
+                    self._vpn_reported.add(status)
+                    await self._tell_safe([
+                        "Kerio VPN ждёт код подтверждения — без него Jira недоступна. "
+                        "Пришлите 6 цифр из приложения-аутентификатора. Больше напоминать не буду."
+                    ])
+            else:
                 self._vpn_down_since = self._vpn_down_since or now
                 if now - self._vpn_down_since >= self.config.vpn_reconnect_after_s:
                     self._vpn_down_since = now
-                    await self._reconnect_vpn("сам: VPN не работает уже несколько минут")
-            else:
-                self._vpn_down_since = None
-            due = self._vpn_reminded is None or now - self._vpn_reminded >= self.config.vpn_reminder_interval_s
-            if status == "ok":
-                self._vpn_reminded = None
-            elif due:
-                self._vpn_reminded = now
-                if status == "needs_code":
-                    await self._tell_safe([
-                        "Kerio VPN ждёт код подтверждения — без него Jira недоступна. "
-                        "Пришлите 6 цифр из приложения-аутентификатора."
-                    ])
-                else:
-                    await self._tell_safe(["Kerio VPN не подключён — Jira недоступна."])
+                    reconnected = await vpn_request(self.config.vpn_control, "reconnect") == "ok"
+                    if "down" not in self._vpn_reported:
+                        self._vpn_reported.add("down")
+                        await self._tell_safe([
+                            "Kerio VPN не подключён — Jira недоступна. "
+                            + ("Переподключаю сам и дальше буду пробовать молча."
+                               if reconnected else "Переподключить не удалось: контейнер VPN не отвечает.")
+                        ])
             await asyncio.sleep(self.config.vpn_check_interval_s)
 
     async def _reconnect_vpn(self, why: str) -> None:
@@ -448,7 +452,6 @@ class GitLabReviewChannel(BaseChannel):
     async def _submit_vpn_code(self, code: str) -> None:
         answer = await vpn_request(self.config.vpn_control, f"code {code}")
         if answer == "ok":
-            self._vpn_reminded = None
             await self._tell(["Kerio VPN: код принят, Jira доступна."])
         elif answer == "down":
             await self._tell(["Kerio VPN не отвечает — код не передан."])

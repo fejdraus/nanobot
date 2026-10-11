@@ -1893,11 +1893,12 @@ how strictly it reviews. Developers who did not agree are listed in
 **Jira behind a VPN.** `vpnControl` (`host:port`) points at a VPN container's
 control port speaking one line each way: `status` → `ok` / `needs_code` /
 `down`, `code <digits>` → `ok` / `error: …`. The channel polls it every
-`vpnCheckIntervalS` (default 60), asks in Telegram for the authenticator code
-when needed, at most every `vpnReminderIntervalS` (default 3600), and passes a
-bare six-digit reply on to the container. A VPN reported `down` for
-`vpnReconnectAfterS` (default 300) is sent `reconnect`; «переподключи vpn» does
-the same on request.
+`vpnCheckIntervalS` (default 60) and says once per outage in Telegram that the
+VPN waits for the authenticator code or is down; it does not repeat itself
+until the VPN has been `ok` again. A bare six-digit reply is passed on to the
+container. A VPN reported `down` for `vpnReconnectAfterS` (default 300) is sent
+`reconnect` quietly, again every `vpnReconnectAfterS` while it stays down;
+«переподключи vpn» does the same on request.
 
 **Lessons by changed code.** A memory note can carry two front-matter tags, both
 inline JSON lists:
