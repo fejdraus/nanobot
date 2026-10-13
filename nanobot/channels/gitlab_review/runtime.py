@@ -64,6 +64,7 @@ from nanobot.channels.gitlab_review.lessons import (
     render_lessons,
     select_lessons,
 )
+from nanobot.channels.gitlab_review.mcp_client import McpServer
 from nanobot.channels.gitlab_review.people import (
     PeopleStore,
     PersonNote,
@@ -246,17 +247,12 @@ class GitLabReviewChannel(BaseChannel):
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
         if self._gitlab is None:
-            self._gitlab = GitLabApi(
-                self.config.gitlab_url, self.config.gitlab_token, self.config.project_path
-            )
+            self._gitlab = GitLabApi(McpServer("gitlab", self.config.gitlab_mcp_command), self.config.project_path)
         if self._telegram is None:
             self._telegram = TelegramApi(self.config.telegram_bot_token)
         if self._task_lookup is None:
-            self._task_lookup = TaskLookup(
-                clickup_token=self.config.clickup_token,
-                clickup_team_id=self.config.clickup_team_id,
-                jira_url=self.config.jira_url,
-            )
+            clickup = McpServer("clickup", self.config.clickup_mcp_command) if self.config.clickup_mcp_command else None
+            self._task_lookup = TaskLookup(clickup=clickup, jira_url=self.config.jira_url)
         if self._relevance is None and self.config.jev_api_key:
             self._relevance = JevScorer(self.config.jev_api_key)
         try:

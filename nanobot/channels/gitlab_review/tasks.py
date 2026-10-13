@@ -3,23 +3,23 @@
 Keys are taken from the MR's title and description, not from the source
 branch: a branch can carry commits of several tasks, while the title and the
 description name the tasks the MR is for. ClickUp is
-asked first by custom task id; a key ClickUp does not know is treated as a task
-that stayed in Jira and gets a Jira link without a name. Any failure leaves the
-task out rather than holding up a review.
+asked first by custom task id, through the ClickUp MCP server (the channel holds
+no ClickUp token); a key ClickUp does not know is treated as a task that stayed
+in Jira and gets a Jira link without a name. Any failure leaves the task out
+rather than holding up a review.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, cast
 
-import httpx
 from loguru import logger
 
-from nanobot.channels.gitlab_review.gitlab_api import USER_AGENT
+from nanobot.channels.gitlab_review.mcp_client import McpToolError, ToolCaller
 
 DEFAULT_KEY_PATTERN = r"[A-Z][A-Z0-9]+-\d+"
-CLICKUP_API = "https://api.clickup.com/api/v2"
+_HEADING_RE = re.compile(r"^# [^:\n]+: (.+)$", re.MULTILINE)
+_URL_RE = re.compile(r"^- URL: (\S+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -45,24 +45,14 @@ def find_task_keys(pattern: str, *texts: str) -> list[str]:
 
 
 class TaskLookup:
-    def __init__(
-        self,
-        *,
-        clickup_token: str,
-        clickup_team_id: str,
-        jira_url: str,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        self._token = clickup_token.strip()
-        self._team = clickup_team_id.strip()
+    def __init__(self, *, clickup: ToolCaller | None, jira_url: str) -> None:
+        self._clickup = clickup
         self._jira = jira_url.strip().rstrip("/")
-        self._client = client or httpx.AsyncClient(timeout=20.0, headers={"User-Agent": USER_AGENT})
-        self._owns_client = client is None
         self._cache: dict[str, TaskInfo] = {}
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        if self._clickup is not None:
+            await self._clickup.aclose()
 
     async def lookup(self, key: str) -> TaskInfo:
         cached = self._cache.get(key)
@@ -73,25 +63,18 @@ class TaskLookup:
         return info
 
     async def _from_clickup(self, key: str) -> TaskInfo | None:
-        if not self._token or not self._team:
+        if self._clickup is None:
             return None
         try:
-            response = await self._client.get(
-                f"{CLICKUP_API}/task/{key}",
-                params={"custom_task_ids": "true", "team_id": self._team},
-                headers={"Authorization": self._token},
-            )
-            data: object = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("ClickUp lookup of {} failed: {}", key, exc)
+            text = await self._clickup.call("clickup_get_task", {"taskId": key})
+        except McpToolError as exc:
+            logger.info("ClickUp has no task {}: {}", key, str(exc)[:200])
             return None
-        if response.status_code >= 400 or not isinstance(data, dict):
+        heading, url = _HEADING_RE.search(text), _URL_RE.search(text)
+        if heading is None or not heading.group(1).strip():
+            logger.warning("ClickUp answer for {} has no task name", key)
             return None
-        task = cast("dict[str, Any]", data)
-        name, url = task.get("name"), task.get("url")
-        if not isinstance(name, str) or not name.strip():
-            return None
-        return TaskInfo(key, name.strip(), url if isinstance(url, str) else "")
+        return TaskInfo(key, heading.group(1).strip(), url.group(1) if url else "")
 
     def _jira_link(self, key: str) -> str:
         return f"{self._jira}/browse/{key}" if self._jira else ""

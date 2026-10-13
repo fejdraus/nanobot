@@ -27,15 +27,20 @@ class GitLabReviewConfig(Base):
     ``applies_to``/``keywords`` that match the merge request are put into the
     prompt by code (see :mod:`lessons`).
 
+    The channel holds no GitLab or ClickUp credentials. It starts the MCP
+    servers named by ``gitlabMcpCommand`` and ``clickupMcpCommand`` (command
+    and arguments) and reaches both services only through them; the servers
+    read their tokens from their own ``.env``.
+
     Every message names the tracker tasks of the MR (keys from its title and
-    description): name and link from ClickUp when ``clickupToken`` and
-    ``clickupTeamId`` are set, otherwise a link under ``jiraUrl``.
+    description): name and link from ClickUp when ``clickupMcpCommand`` is set,
+    otherwise a link under ``jiraUrl``.
 
     The reviewer never publishes on its own. Drafts go to one Telegram chat;
-    only an approval sent from that chat makes the channel post to GitLab, with
-    ``gitlabToken``. The comments appear under that token's account, a real
-    person, so every guard that keeps the bot quiet lives in code here rather
-    than in the prompt.
+    only an approval sent from that chat makes the channel post to GitLab. The
+    comments appear under the GitLab MCP server's account, a real person, so
+    every guard that keeps the bot quiet lives in code here rather than in the
+    prompt.
     """
 
     enabled: bool = False
@@ -46,13 +51,11 @@ class GitLabReviewConfig(Base):
     project_path: str = "astana-group/astana-motors"
     chat_id: str = DEFAULT_CHAT_ID
 
-    gitlab_url: str = ""
-    gitlab_token: str = ""
+    gitlab_mcp_command: list[str] = Field(default_factory=list)
     reviewer_usernames: list[str] = Field(default_factory=list)
     review_own_merge_requests: bool = False
     lessons_dir: str = ""
-    clickup_token: str = ""
-    clickup_team_id: str = ""
+    clickup_mcp_command: list[str] = Field(default_factory=list)
     jira_url: str = ""
     task_key_pattern: str = r"[A-Z][A-Z0-9]+-\d+"
     lessons_budget_chars: int = Field(default=40000, ge=0)
@@ -95,15 +98,9 @@ class GitLabReviewConfig(Base):
             raise ValueError("projectPath must look like 'group/project'")
         return path
 
-    @field_validator("gitlab_url")
-    @classmethod
-    def validate_gitlab_url(cls, value: str) -> str:
-        url = value.strip().rstrip("/")
-        if url and not url.startswith(("https://", "http://")):
-            raise ValueError("gitlabUrl must start with https:// or http://")
-        return url
-
-    @field_validator("reviewer_usernames", "telegram_user_ids", "people_excluded")
+    @field_validator(
+        "reviewer_usernames", "telegram_user_ids", "people_excluded", "gitlab_mcp_command", "clickup_mcp_command"
+    )
     @classmethod
     def normalize_names(cls, value: list[str]) -> list[str]:
         return [str(name).strip() for name in value if str(name).strip()]
@@ -124,12 +121,12 @@ class GitLabReviewConfig(Base):
         """
         required = {
             "webhookSecretToken": self.webhook_secret_token,
-            "gitlabUrl": self.gitlab_url,
-            "gitlabToken": self.gitlab_token,
             "telegramBotToken": self.telegram_bot_token,
             "telegramChatId": self.telegram_chat_id,
         }
         missing = [name for name, value in required.items() if not str(value).strip()]
+        if not self.gitlab_mcp_command:
+            missing.append("gitlabMcpCommand")
         if not self.reviewer_usernames:
             missing.append("reviewerUsernames")
         if self.telegram_chat_id.strip().startswith("-") and not self.telegram_user_ids:

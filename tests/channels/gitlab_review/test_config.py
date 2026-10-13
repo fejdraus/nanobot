@@ -8,8 +8,7 @@ from nanobot.channels.gitlab_review.validation import validate
 FULL: dict[str, Any] = {
     "enabled": True,
     "webhookSecretToken": "tok",
-    "gitlabUrl": "https://gitlab.example.com/",
-    "gitlabToken": "glpat",
+    "gitlabMcpCommand": ["bun", "/srv/gitlab-mcp/dist/server.js"],
     "reviewerUsernames": ["a.tyra"],
     "telegramBotToken": "123:abc",
     "telegramChatId": "49816954",
@@ -22,12 +21,12 @@ def test_config_accepts_camel_case_keys() -> None:
     assert config.webhook_secret_token == "tok"
     assert config.reviewer_usernames == ["a.tyra"]
     assert config.webhook_path == "/hook"
-    assert config.gitlab_url == "https://gitlab.example.com"
+    assert config.gitlab_mcp_command == ["bun", "/srv/gitlab-mcp/dist/server.js"]
 
 
 @pytest.mark.parametrize(
     "missing",
-    ["webhookSecretToken", "gitlabUrl", "gitlabToken", "telegramBotToken", "telegramChatId"],
+    ["webhookSecretToken", "gitlabMcpCommand", "telegramBotToken", "telegramChatId"],
 )
 def test_enabled_requires_every_setting(missing: str) -> None:
     values = {**FULL}
@@ -54,11 +53,6 @@ def test_malformed_webhook_path_is_rejected(path: str) -> None:
         GitLabReviewConfig.model_validate({**FULL, "webhookPath": path})
 
 
-def test_gitlab_url_must_be_http() -> None:
-    with pytest.raises(ValueError):
-        GitLabReviewConfig.model_validate({**FULL, "gitlabUrl": "gitlab.example.com"})
-
-
 def test_reviewer_match_is_case_insensitive() -> None:
     config = GitLabReviewConfig.model_validate(FULL)
 
@@ -77,14 +71,5 @@ def test_chat_id_round_trip() -> None:
 def test_validation_reports_missing_settings() -> None:
     result = validate({"webhookSecretToken": "tok"}, None)  # type: ignore[arg-type]
 
-    assert "gitlabToken" in str(result)
+    assert "gitlabMcpCommand" in str(result)
 
-
-def test_gitlab_client_sends_its_own_user_agent() -> None:
-    """The default python-httpx agent is blocked by Cloudflare in front of GitLab."""
-    from nanobot.channels.gitlab_review.gitlab_api import USER_AGENT, GitLabApi
-
-    api = GitLabApi("https://gitlab.example.com", "glpat", "group/project")
-    headers = api._client.headers  # pyright: ignore[reportPrivateUsage]
-    assert headers["User-Agent"] == USER_AGENT
-    assert "python-httpx" not in headers["User-Agent"]

@@ -1713,9 +1713,11 @@ Telegram `richMessages` defaults to `false`. Enable it only to opt in to Bot API
 ### GitLab Review (`gitlab_review`)
 
 Drafts merge-request reviews from GitLab webhooks and publishes them only after
-a human approves them in Telegram. Comments are posted with `gitlabToken`, so
-they appear under that account — a real person — and every guard below runs in
-code, not in the prompt.
+a human approves them in Telegram. The channel holds no GitLab or ClickUp
+credentials: it starts their MCP servers and reaches both services only through
+them, and the servers read their tokens from their own `.env`. Comments appear
+under the GitLab MCP server's account — a real person — so every guard below
+runs in code, not in the prompt.
 
 ```json
 {
@@ -1725,8 +1727,8 @@ code, not in the prompt.
       "webhookSecretToken": "${GITLAB_WEBHOOK_TOKEN}",
       "port": 3980,
       "projectPath": "astana-group/astana-motors",
-      "gitlabUrl": "https://gitlab.example.com",
-      "gitlabToken": "${GITLAB_TOKEN}",
+      "gitlabMcpCommand": ["bun", "/home/me/mcp/gitlab-mcp-server/dist/server.js"],
+      "clickupMcpCommand": ["bun", "/home/me/mcp/clickup-mcp/dist/server.js"],
       "reviewerUsernames": ["a.tyra"],
       "telegramBotToken": "${REVIEW_TELEGRAM_BOT_TOKEN}",
       "telegramChatId": "49816954"
@@ -1738,12 +1740,12 @@ code, not in the prompt.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `webhookSecretToken` | — | **Required.** Must match the webhook's *Secret token* in GitLab. |
-| `gitlabUrl`, `gitlabToken` | — | **Required.** Used to read MRs and threads and to publish approved actions. |
+| `gitlabMcpCommand` | — | **Required.** Command and arguments that start the GitLab MCP server over stdio. Reads go through its `gitlab_api_get` tool, approved actions through its write tools. |
 | `reviewerUsernames` | — | **Required.** The reviewer's GitLab usernames. Their notes never wake the bot, which prevents a reply loop. |
 | `reviewOwnMergeRequests` | `false` | Also review merge requests the reviewer authored. An approval of such an MR is never drafted nor published. |
 | `lessonsDir` | `""` | The reviewer's memory directory. Notes there tagged with `applies_to` / `keywords` that match the MR's changes are put into the prompt. Empty disables it. |
 | `lessonsBudgetChars` | `40000` | How much lesson text goes into one prompt; further matches are listed by name only. |
-| `clickupToken`, `clickupTeamId` | `""` | ClickUp API token and workspace id. Every draft and notice names the MR's tasks (keys from its title and description, not the branch — a branch can hold commits of several tasks) with their ClickUp names and links. |
+| `clickupMcpCommand` | `[]` | Command and arguments that start the ClickUp MCP server. Every draft and notice names the MR's tasks (keys from its title and description, not the branch — a branch can hold commits of several tasks) with their ClickUp names and links, read with its `clickup_get_task` tool. |
 | `jiraUrl` | `""` | Base URL for tasks ClickUp does not know (e.g. keys from before a migration): they get a `<jiraUrl>/browse/<KEY>` link without a name. |
 | `taskKeyPattern` | `[A-Z][A-Z0-9]+-\d+` | Regular expression that finds the task key. |
 | `telegramBotToken`, `telegramChatId` | — | **Required.** Drafts go to this one chat; approvals are accepted only from it. In a private chat only its owner can approve. |

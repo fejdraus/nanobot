@@ -1,19 +1,21 @@
-"""Minimal GitLab REST client for the review channel.
+"""GitLab for the review channel, reached only through the GitLab MCP server.
 
 Reads what triage needs (merge request, thread history, author) and performs
-only the writes a human approved in Telegram.
+only the writes a human approved in Telegram. The channel never sees a GitLab
+token: the MCP server holds it.
 
-Requests carry their own ``User-Agent``: a Cloudflare rule in front of the
-GitLab instance blocks the default ``python-httpx`` agent with 403.
+Reads go through ``gitlab_api_get``, which hands back GitLab's own response
+shape; writes use the server's dedicated write tools.
 """
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, cast
-from urllib.parse import quote
 
-import httpx
+from nanobot.channels.gitlab_review.mcp_client import McpToolError, ToolCaller
 
-USER_AGENT = "nanobot-gitlab-review"
+_STATUS_RE = re.compile(r"GitLab (\d{3})\b")
 
 
 class GitLabApiError(RuntimeError):
@@ -23,190 +25,105 @@ class GitLabApiError(RuntimeError):
 
 
 class GitLabApi:
-    def __init__(
-        self,
-        base_url: str,
-        token: str,
-        project_path: str,
-        *,
-        client: httpx.AsyncClient | None = None,
-        timeout_s: float = 30.0,
-    ) -> None:
-        self._project = quote(project_path, safe="")
-        self._client = client or httpx.AsyncClient(
-            base_url=f"{base_url.rstrip('/')}/api/v4",
-            headers={
-                "PRIVATE-TOKEN": token,
-                "Accept": "application/json",
-                "User-Agent": USER_AGENT,
-            },
-            timeout=timeout_s,
-        )
-        self._owns_client = client is None
+    def __init__(self, mcp: ToolCaller, project_path: str) -> None:
+        self._mcp = mcp
+        self._project = project_path
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._mcp.aclose()
 
     async def get_merge_request(self, iid: int) -> dict[str, Any]:
-        return await self._get_object(f"/projects/{self._project}/merge_requests/{iid}")
+        return self._as_object(await self._read(f"/project/merge_requests/{iid}"))
 
     async def get_username(self, user_id: int) -> str | None:
-        user = await self._get_object(f"/users/{user_id}")
+        user = self._as_object(await self._read(f"/users/{user_id}"))
         username = user.get("username")
         return username if isinstance(username, str) else None
 
     async def get_discussion(self, iid: int, discussion_id: str) -> dict[str, Any]:
-        return await self._get_object(
-            f"/projects/{self._project}/merge_requests/{iid}/discussions/{quote(discussion_id, safe='')}"
-        )
+        return self._as_object(await self._read(f"/project/merge_requests/{iid}/discussions/{discussion_id}"))
 
     async def list_open_merge_requests(self, updated_after: str, max_pages: int = 3) -> list[dict[str, Any]]:
         """Open merge requests updated after *updated_after* (ISO 8601), newest first."""
-        found: list[dict[str, Any]] = []
-        for page in range(1, max_pages + 1):
-            response = await self._client.get(
-                f"/projects/{self._project}/merge_requests",
-                params={
-                    "state": "opened",
-                    "updated_after": updated_after,
-                    "order_by": "updated_at",
-                    "per_page": 100,
-                    "page": page,
-                },
-            )
-            if response.status_code >= 400:
-                raise GitLabApiError(
-                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-                )
-            batch: object = response.json()
-            if not isinstance(batch, list) or not batch:
-                break
-            found.extend(
-                cast("dict[str, Any]", item) for item in cast("list[object]", batch) if isinstance(item, dict)
-            )
-            if len(cast("list[object]", batch)) < 100:
-                break
-        return found
+        return await self._pages(
+            "/project/merge_requests",
+            {"state": "opened", "updated_after": updated_after, "order_by": "updated_at"},
+            max_pages,
+        )
 
     async def get_commits(self, iid: int) -> list[dict[str, Any]]:
-        response = await self._client.get(
-            f"/projects/{self._project}/merge_requests/{iid}/commits", params={"per_page": 100}
-        )
-        if response.status_code >= 400:
-            raise GitLabApiError(
-                f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-            )
-        data: object = response.json()
-        if not isinstance(data, list):
-            raise GitLabApiError("GitLab returned a non-list response")
-        return [cast("dict[str, Any]", item) for item in cast("list[object]", data) if isinstance(item, dict)]
+        return self._as_list(await self._read(f"/project/merge_requests/{iid}/commits", {"per_page": 100}))
 
     async def list_discussions(self, iid: int, max_pages: int = 5) -> list[dict[str, Any]]:
-        discussions: list[dict[str, Any]] = []
-        for page in range(1, max_pages + 1):
-            response = await self._client.get(
-                f"/projects/{self._project}/merge_requests/{iid}/discussions",
-                params={"per_page": 100, "page": page},
-            )
-            if response.status_code >= 400:
-                raise GitLabApiError(
-                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-                )
-            batch: object = response.json()
-            if not isinstance(batch, list) or not batch:
-                break
-            discussions.extend(
-                cast("dict[str, Any]", item) for item in cast("list[object]", batch) if isinstance(item, dict)
-            )
-            if len(cast("list[object]", batch)) < 100:
-                break
-        return discussions
+        return await self._pages(f"/project/merge_requests/{iid}/discussions", {}, max_pages)
 
     async def get_raw_diff(self, iid: int) -> str:
         """The full unified diff of a merge request, large files included."""
-        response = await self._client.get(f"/projects/{self._project}/merge_requests/{iid}/raw_diffs")
-        if response.status_code >= 400:
-            raise GitLabApiError(
-                f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-            )
-        return response.text
+        return await self._call("gitlab_api_get", {
+            "project": self._project, "path": f"/project/merge_requests/{iid}/raw_diffs",
+        })
 
     async def get_commit(self, sha: str) -> dict[str, Any]:
-        return await self._get_object(f"/projects/{self._project}/repository/commits/{quote(sha, safe='')}")
+        return self._as_object(await self._read(f"/project/repository/commits/{sha}"))
 
     async def compare(self, base: str, head: str) -> list[dict[str, Any]]:
         """Changed files between two commits, with their diffs."""
-        response = await self._client.get(
-            f"/projects/{self._project}/repository/compare", params={"from": base, "to": head}
-        )
-        data = self._object(response)
+        data = self._as_object(await self._read("/project/repository/compare", {"from": base, "to": head}))
         diffs = data.get("diffs")
         return [cast("dict[str, Any]", item) for item in cast("list[object]", diffs) if isinstance(item, dict)] \
             if isinstance(diffs, list) else []
 
     async def get_changes(self, iid: int, max_pages: int = 10) -> list[dict[str, Any]]:
         """Changed files of a merge request with their diffs, page by page."""
-        changes: list[dict[str, Any]] = []
+        return await self._pages(f"/project/merge_requests/{iid}/diffs", {}, max_pages)
+
+    async def create_discussion(self, iid: int, body: str, position: dict[str, Any]) -> None:
+        arguments = {"project": self._project, "iid": iid, "body": body}
+        arguments.update({key: value for key, value in position.items() if value is not None})
+        await self._call("gitlab_create_mr_discussion", arguments)
+
+    async def create_note(self, iid: int, body: str) -> None:
+        await self._call("gitlab_create_mr_note", {"project": self._project, "iid": iid, "body": body})
+
+    async def reply(self, iid: int, discussion_id: str, body: str) -> None:
+        await self._call("gitlab_reply_to_mr_discussion", {
+            "project": self._project, "iid": iid, "discussion_id": discussion_id, "body": body,
+        })
+
+    async def approve(self, iid: int, sha: str) -> None:
+        await self._call("gitlab_approve_mr", {"project": self._project, "iid": iid, "sha": sha})
+
+    async def _pages(self, path: str, params: dict[str, Any], max_pages: int) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
         for page in range(1, max_pages + 1):
-            response = await self._client.get(
-                f"/projects/{self._project}/merge_requests/{iid}/diffs",
-                params={"per_page": 100, "page": page},
-            )
-            if response.status_code >= 400:
-                raise GitLabApiError(
-                    f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-                )
-            data: object = response.json()
-            if not isinstance(data, list):
-                raise GitLabApiError("GitLab returned a non-list diff response")
-            items = [cast("dict[str, Any]", item) for item in cast("list[object]", data)
-                     if isinstance(item, dict)]
-            changes.extend(items)
-            if len(items) < 100:
+            batch = self._as_list(await self._read(path, {**params, "per_page": 100, "page": page}))
+            found.extend(batch)
+            if len(batch) < 100:
                 break
-        return changes
+        return found
 
-    async def create_discussion(
-        self, iid: int, body: str, position: dict[str, Any]
-    ) -> dict[str, Any]:
-        return await self._post(
-            f"/projects/{self._project}/merge_requests/{iid}/discussions",
-            {"body": body, "position": {**position, "position_type": "text"}},
-        )
+    async def _read(self, path: str, params: dict[str, Any] | None = None) -> object:
+        text = await self._call("gitlab_api_get", {"project": self._project, "path": path, "params": params or {}})
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise GitLabApiError(f"GitLab returned non-JSON for {path}: {text[:200]}") from exc
 
-    async def create_note(self, iid: int, body: str) -> dict[str, Any]:
-        return await self._post(
-            f"/projects/{self._project}/merge_requests/{iid}/notes", {"body": body}
-        )
-
-    async def reply(self, iid: int, discussion_id: str, body: str) -> dict[str, Any]:
-        return await self._post(
-            f"/projects/{self._project}/merge_requests/{iid}/discussions/"
-            f"{quote(discussion_id, safe='')}/notes",
-            {"body": body},
-        )
-
-    async def approve(self, iid: int, sha: str) -> dict[str, Any]:
-        return await self._post(
-            f"/projects/{self._project}/merge_requests/{iid}/approve", {"sha": sha}
-        )
-
-    async def _get_object(self, path: str) -> dict[str, Any]:
-        response = await self._client.get(path)
-        return self._object(response)
-
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = await self._client.post(path, json=payload)
-        return self._object(response)
+    async def _call(self, tool: str, arguments: dict[str, Any]) -> str:
+        try:
+            return await self._mcp.call(tool, arguments)
+        except McpToolError as exc:
+            match = _STATUS_RE.search(str(exc))
+            raise GitLabApiError(str(exc)[:500], int(match.group(1)) if match else None) from exc
 
     @staticmethod
-    def _object(response: httpx.Response) -> dict[str, Any]:
-        if response.status_code >= 400:
-            raise GitLabApiError(
-                f"GitLab {response.status_code}: {response.text[:300]}", response.status_code
-            )
-        data: object = response.json()
+    def _as_object(data: object) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise GitLabApiError("GitLab returned a non-object response")
         return cast("dict[str, Any]", data)
+
+    @staticmethod
+    def _as_list(data: object) -> list[dict[str, Any]]:
+        if not isinstance(data, list):
+            raise GitLabApiError("GitLab returned a non-list response")
+        return [cast("dict[str, Any]", item) for item in cast("list[object]", data) if isinstance(item, dict)]
