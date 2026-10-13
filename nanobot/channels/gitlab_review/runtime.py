@@ -889,7 +889,7 @@ class GitLabReviewChannel(BaseChannel):
             answered = await self._all_threads_answered(info)
             if answered == []:
                 return
-            if answered is not None:
+            if answered is not None and len(answered) > 1:
                 prompt = recheck_prompt(
                     info.iid,
                     answered,
