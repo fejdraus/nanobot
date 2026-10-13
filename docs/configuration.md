@@ -1789,7 +1789,9 @@ several drafts can wait in the chat and be answered in any order. Full commands 
 
 The version may be omitted until a newer draft of the same MR replaces the one
 you were reading; after that a command without it, or with an old one, is
-refused. Publishing is also refused if the MR's head moved since the review.
+refused. Publishing is also refused if the MR's head moved since the review, and nothing
+is published into an MR that is no longer open: the draft is withdrawn. Merging or closing
+an MR withdraws its waiting draft at once, with a notice in Telegram.
 A bare `публикуй` or `отмена` without a reply applies to the only waiting draft;
 with several waiting, the channel lists them instead.
 

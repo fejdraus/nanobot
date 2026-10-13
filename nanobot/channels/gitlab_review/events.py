@@ -15,9 +15,10 @@ MERGE_REQUEST_EVENT = "Merge Request Hook"
 NOTE_EVENT = "Note Hook"
 
 _REVIEW_ACTIONS = frozenset({"open", "reopen"})
+_CLOSING_ACTIONS = frozenset({"merge", "close"})
 _DRAFT_TITLE_PREFIXES = ("draft:", "[draft]", "(draft)", "wip:")
 
-CandidateKind = Literal["merge_request", "note"]
+CandidateKind = Literal["merge_request", "note", "closed"]
 
 
 @dataclass(frozen=True)
@@ -73,12 +74,14 @@ def _parse_merge_request(payload: dict[str, Any]) -> ReviewCandidate | None:
     attributes = _mapping(payload.get("object_attributes"))
     if attributes is None:
         return None
+    iid = _positive_int(attributes.get("iid"))
+    if iid is None:
+        return None
+    if attributes.get("action") in _CLOSING_ACTIONS:
+        return ReviewCandidate(kind="closed", iid=iid)
     if attributes.get("action") not in _REVIEW_ACTIONS:
         return None
     if is_draft(attributes):
-        return None
-    iid = _positive_int(attributes.get("iid"))
-    if iid is None:
         return None
     return ReviewCandidate(
         kind="merge_request",

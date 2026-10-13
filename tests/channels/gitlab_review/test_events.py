@@ -50,9 +50,17 @@ def test_opened_merge_request_is_a_candidate(action: str) -> None:
     assert candidate.debounce_key == "42:mr"
 
 
-@pytest.mark.parametrize("action", ["update", "close", "merge", "approved"])
+@pytest.mark.parametrize("action", ["update", "approved"])
 def test_other_merge_request_actions_are_ignored(action: str) -> None:
     assert _parse(MERGE_REQUEST_EVENT, _mr(action)) is None
+
+
+@pytest.mark.parametrize("action", ["merge", "close"])
+def test_merged_or_closed_merge_request_is_a_closing_candidate(action: str) -> None:
+    candidate = _parse(MERGE_REQUEST_EVENT, _mr(action, draft=True))
+
+    assert candidate == ReviewCandidate(kind="closed", iid=42)
+    assert candidate.debounce_key == "42:mr"
 
 
 @pytest.mark.parametrize(

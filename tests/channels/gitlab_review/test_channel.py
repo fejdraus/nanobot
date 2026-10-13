@@ -1206,13 +1206,36 @@ async def test_human_can_ask_to_reconnect_the_vpn(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_of_a_merged_mr_is_skipped_but_comments_go_out(tmp_path: Path) -> None:
+async def test_nothing_is_published_into_a_merged_mr_even_with_the_branch_unchanged(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
-        await h.answer(42, [{"type": "note", "body": "general"}, {"type": "approve"}])
+        await h.answer(42, [{"type": "discussion", "path": "a.cs", "line": 10, "body": "inline"}, {"type": "approve"}])
         h.gitlab.mr["state"] = "merged"
         await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+        await h.channel.handle_telegram(_tg(2, "публикуй !42"))
+    assert h.gitlab.writes == []
+    assert "!42: MR уже смёржен. Черновик снят, ничего не опубликовано." in h.telegram.text()
+    assert "нет черновика" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_merge_webhook_withdraws_the_waiting_draft(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "general"}])
+        h.gitlab.mr["state"] = "merged"
+        await h.channel.process(ReviewCandidate(kind="closed", iid=42))
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert h.gitlab.writes == []
+    assert "!42: MR смёржен, черновик снят — публиковать в него нечего." in h.telegram.text()
+    assert "нет черновика" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_close_webhook_keeps_the_draft_of_a_reopened_mr(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "note", "body": "general"}])
+        await h.channel.process(ReviewCandidate(kind="closed", iid=42))
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
     assert h.gitlab.writes == [("note", "general")]
-    assert "2. аппрув MR: пропущено — MR уже смёржен" in h.telegram.text()
 
 
 

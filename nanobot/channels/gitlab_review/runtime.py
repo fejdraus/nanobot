@@ -837,6 +837,9 @@ class GitLabReviewChannel(BaseChannel):
 
     async def process(self, candidate: ReviewCandidate) -> None:
         """Apply the code guards and, if they pass, run one review."""
+        if candidate.kind == "closed":
+            await self._drop_draft_of_closed(candidate.iid)
+            return
         info = await self._merge_request(candidate.iid)
         if not info.open or info.draft:
             return
@@ -1512,21 +1515,23 @@ class GitLabReviewChannel(BaseChannel):
             return
 
         info = await self._merge_request(command.iid)
+        if not info.open:
+            await self._withdraw_draft(
+                command.iid,
+                f"!{command.iid}: MR уже {info.state_label}. Черновик снят, ничего не опубликовано.",
+                f"draft withdrawn: MR {info.state}",
+            )
+            return
         moved = info.head_sha != reviewed_sha
         review = self._state.latest_review(command.iid)
         if moved and all(action.type in _TIED_TO_CODE for _, action in selected):
-            self._state.delete_draft(command.iid)
-            notice = (
+            await self._withdraw_draft(
+                command.iid,
                 f"!{command.iid}: ветка изменилась после ревью "
                 f"({reviewed_sha[:10]} → {info.head_sha[:10]}). "
-                "Черновик снят, ничего не опубликовано."
+                "Черновик снят, ничего не опубликовано.",
+                "draft withdrawn: branch moved",
             )
-            if review is not None:
-                self._state.add_event(review.id, "system", notice)
-                self._state.set_review_status(review.id, "draft withdrawn: branch moved")
-            message_ids = await self._tell([notice])
-            if review is not None:
-                self._state.record_review_messages(review.id, message_ids)
             return
 
         report: list[str] = []
@@ -1541,9 +1546,6 @@ class GitLabReviewChannel(BaseChannel):
         for number, action in selected:
             if action.type == "approve" and self.config.is_reviewer(info.author):
                 report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
-                continue
-            if action.type == "approve" and not info.open:
-                report.append(f"{number}. {action.label()}: пропущено — MR уже {info.state_label}")
                 continue
             if moved and action.type in _TIED_TO_CODE:
                 report.append(f"{number}. {action.label()}: пропущено — ветка изменилась после ревью")
@@ -1577,6 +1579,29 @@ class GitLabReviewChannel(BaseChannel):
         message_ids = await self._tell([summary])
         if review is not None:
             self._state.record_review_messages(review.id, message_ids)
+
+    async def _withdraw_draft(self, iid: int, notice: str, status: str) -> None:
+        self._state.delete_draft(iid)
+        review = self._state.latest_review(iid)
+        if review is not None:
+            self._state.add_event(review.id, "system", notice)
+            self._state.set_review_status(review.id, status)
+        message_ids = await self._tell([notice])
+        if review is not None:
+            self._state.record_review_messages(review.id, message_ids)
+
+    async def _drop_draft_of_closed(self, iid: int) -> None:
+        """Withdraw the draft of a merge request that was merged or closed."""
+        if self._state.load_draft(iid) is None:
+            return
+        info = await self._merge_request(iid)
+        if info.open:
+            return
+        await self._withdraw_draft(
+            iid,
+            f"!{iid}: MR {info.state_label}, черновик снят — публиковать в него нечего.",
+            f"draft withdrawn: MR {info.state}",
+        )
 
     @staticmethod
     def _select(
