@@ -77,6 +77,7 @@ from nanobot.channels.gitlab_review.prompts import (
     RUSSIAN_RETRY,
     chat_prompt,
     dream_prompt,
+    recheck_prompt,
     reply_prompt,
     review_prompt,
 )
@@ -189,21 +190,31 @@ def _only_approve(draft: ReviewDraft) -> bool:
     return not draft.errors and len(draft.actions) == 1 and draft.actions[0].type == "approve"
 
 
-def _opened_by(discussion: dict[str, Any]) -> str | None:
+def _notes(discussion: dict[str, Any]) -> list[dict[str, Any]]:
     notes = discussion.get("notes")
-    if not isinstance(notes, list) or not notes or not isinstance(notes[0], dict):
-        return None
-    author = cast("dict[str, Any]", notes[0]).get("author")
+    if not isinstance(notes, list):
+        return []
+    return [cast("dict[str, Any]", note) for note in cast("list[object]", notes) if isinstance(note, dict)]
+
+
+def _author(note: dict[str, Any]) -> str | None:
+    author = note.get("author")
     username = cast("dict[str, Any]", author).get("username") if isinstance(author, dict) else None
     return username if isinstance(username, str) else None
 
 
+def _opened_by(discussion: dict[str, Any]) -> str | None:
+    notes = _notes(discussion)
+    return _author(notes[0]) if notes else None
+
+
+def _last_by(discussion: dict[str, Any]) -> str | None:
+    notes = [note for note in _notes(discussion) if not note.get("system")]
+    return _author(notes[-1]) if notes else None
+
+
 def _unresolved(discussion: dict[str, Any]) -> bool:
-    notes = discussion.get("notes")
-    if not isinstance(notes, list):
-        return False
-    entries = [cast("dict[str, Any]", note) for note in cast("list[object]", notes) if isinstance(note, dict)]
-    return any(entry.get("resolvable") and not entry.get("resolved") for entry in entries)
+    return any(note.get("resolvable") and not note.get("resolved") for note in _notes(discussion))
 
 
 @dataclass
@@ -875,16 +886,29 @@ class GitLabReviewChannel(BaseChannel):
                 await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
                 return
             authors = self._profiled([decision.note_author or "", info.author or ""])
-            prompt = reply_prompt(
-                info.iid,
-                candidate.discussion_id,
-                decision.note_author,
-                decision.note_body,
-                lessons=await self._lessons_for(info),
-                people=self._people_for(authors),
-                authors=authors,
-                attachments_dir=self.config.attachments_dir,
-            )
+            answered = await self._all_threads_answered(info)
+            if answered == []:
+                return
+            if answered is not None:
+                prompt = recheck_prompt(
+                    info.iid,
+                    answered,
+                    lessons=await self._lessons_for(info),
+                    people=self._people_for(authors),
+                    authors=authors,
+                    attachments_dir=self.config.attachments_dir,
+                )
+            else:
+                prompt = reply_prompt(
+                    info.iid,
+                    candidate.discussion_id,
+                    decision.note_author,
+                    decision.note_body,
+                    lessons=await self._lessons_for(info),
+                    people=self._people_for(authors),
+                    authors=authors,
+                    attachments_dir=self.config.attachments_dir,
+                )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):
             await self._tell(
@@ -902,6 +926,36 @@ class GitLabReviewChannel(BaseChannel):
             kind="review" if candidate.kind == "merge_request" else "thread",
             authors=authors,
         )
+
+    async def _all_threads_answered(self, info: _MergeRequestInfo) -> list[str] | None:
+        """The reviewer's answered threads when none still waits for an answer.
+
+        ``None`` while some thread of the reviewer is open with the reviewer's
+        note last: then only the replied thread is checked. ``[]`` when this
+        very state was already rechecked, so replies to several threads at
+        once lead to one recheck, not one per thread.
+        """
+        assert self._gitlab is not None
+        threads = [
+            discussion for discussion in await self._gitlab.list_discussions(info.iid)
+            if self.config.is_reviewer(_opened_by(discussion))
+        ]
+        if any(_unresolved(thread) and self.config.is_reviewer(_last_by(thread)) for thread in threads):
+            return None
+        answered = [
+            str(thread.get("id")) for thread in threads
+            if any(not self.config.is_reviewer(_author(note)) for note in _notes(thread))
+        ]
+        if not answered:
+            return None
+        seen = max((int(note.get("id") or 0) for thread in threads for note in _notes(thread)), default=0)
+        mark = f"{info.head_sha}:{seen}"
+        key = f"recheck:{info.iid}"
+        if self._state.get_value(key) == mark:
+            self.logger.info("MR !{}: answers in all threads already rechecked", info.iid)
+            return []
+        self._state.set_value(key, mark)
+        return answered
 
     async def _reverted_by(self, iid: int) -> list[str]:
         """What the MR reverts, when it provably does nothing else; otherwise nothing.

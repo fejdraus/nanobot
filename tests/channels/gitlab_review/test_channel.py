@@ -1446,3 +1446,37 @@ async def test_approval_waits_while_a_thread_of_the_reviewer_is_unresolved(tmp_p
         await h.channel.handle_telegram(_tg(1, "публикуй !42"))
     assert h.gitlab.writes == []
     assert "1. аппрув MR: пропущено — не закрыто ваших тредов: 1" in h.telegram.text()
+
+
+def _thread(*notes: dict[str, Any], resolved: bool = False) -> list[dict[str, Any]]:
+    return [dict(note, id=n, resolvable=True, resolved=resolved) for n, note in enumerate(notes, start=1)]
+
+
+async def _thread_run(h: Harness, discussion_id: str) -> InboundMessage:
+    before = len(h.inbound)
+    task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="note", iid=42, discussion_id=discussion_id)))
+    await _until(lambda: len(h.inbound) > before)
+    await h.reply_as_agent("gitlab-review:42", _answer("Проверил", [{"type": "approve"}]))
+    await task
+    return h.inbound[before]
+
+
+@pytest.mark.asyncio
+async def test_last_answered_thread_leads_to_one_recheck_of_all_and_an_approval(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        h.gitlab.discussions["d1"] = _thread(_note("a.tyra", "вопрос 1"), _note("author", "Исправил"), resolved=True)
+        h.gitlab.discussions["d2"] = _thread(_note("a.tyra", "вопрос 2"), _note("author", "Добавил"), resolved=True)
+        run = await _thread_run(h, "d2")
+        await h.channel.process(ReviewCandidate(kind="note", iid=42, discussion_id="d1"))
+    assert "Every thread the reviewer started" in run.content and "d1, d2" in run.content
+    assert h.gitlab.writes == [("approve", SHA)]
+    assert len([m for m in h.inbound if "Run the review-gitlab-mrs" in m.content]) == 1
+
+
+@pytest.mark.asyncio
+async def test_while_a_thread_still_waits_only_the_replied_one_is_checked(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.discussions["d1"] = _thread(_note("a.tyra", "вопрос 1"), _note("author", "Исправил"))
+        h.gitlab.discussions["d2"] = _thread(_note("a.tyra", "вопрос 2"))
+        run = await _thread_run(h, "d1")
+    assert "Work only with this thread" in run.content

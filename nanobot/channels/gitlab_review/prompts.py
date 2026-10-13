@@ -143,6 +143,28 @@ def reply_prompt(
     )
 
 
+def recheck_prompt(
+    iid: int,
+    discussion_ids: list[str],
+    *,
+    lessons: str = "",
+    people: str = "",
+    authors: list[str] | None = None,
+    attachments_dir: str = "",
+) -> str:
+    extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
+    return (
+        f"Run the review-gitlab-mrs skill for merge request !{iid}.\n\n"
+        f"Every thread the reviewer started in merge request !{iid} has an answer now: "
+        f"{', '.join(discussion_ids)}. Check each answer against the code and the task on the current "
+        "commit (step 9). Propose a thread reply only where an answer does not hold. If every answer "
+        "holds and you have no new remark, propose the approval (step 8); if something new comes up, "
+        "propose it as a remark and no approval.\n\n"
+        f"{lessons + chr(10) * 2 if lessons else ''}{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
+        + "".join(f"\n\n{rule}" for rule in extra)
+    )
+
+
 _CHAT_RULES = f"""\
 {_LANGUAGE}
 
