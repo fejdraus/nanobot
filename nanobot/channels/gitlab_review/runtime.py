@@ -127,6 +127,7 @@ _CATCH_UP_RE = re.compile(r"^\s*(?:проверь|проверить|check)\s+(?
 _REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
 CONTINUE_WINDOW = timedelta(hours=12)
 _TIED_TO_CODE = frozenset({"discussion", "approve"})
+_REMARKS = frozenset({"discussion", "note"})
 DREAM_CURSOR_KEY = "people_dream_cursor"
 DREAM_MR_LIMIT = 30
 DREAM_MESSAGES = 15
@@ -633,17 +634,34 @@ class GitLabReviewChannel(BaseChannel):
                 return "это ваш MR"
             if info.head_sha != pending.head_sha:
                 return f"ветка изменилась после ревью ({pending.head_sha[:10]} → {info.head_sha[:10]})"
-            if info.has_conflicts:
-                return "у MR конфликты"
-            open_threads = [
-                discussion for discussion in await self._gitlab.list_discussions(iid)
-                if _unresolved(discussion)
-            ]
-            if open_threads:
-                return f"нерешённых тредов: {len(open_threads)}"
+            blocker = await self._approval_blocker(info, ())
+            if blocker is not None:
+                return blocker
             await self._gitlab.approve(iid, info.head_sha)
         except GitLabApiError as exc:
             return f"GitLab ответил ошибкой — {exc}"
+        return None
+
+    async def _approval_blocker(
+        self, info: _MergeRequestInfo, alongside: tuple[ProposedAction, ...]
+    ) -> str | None:
+        """Why the MR must not be approved now, or ``None``.
+
+        An approval says the MR may be merged, so it never goes out beside a
+        remark of the same draft or while any thread, anyone's, is unresolved.
+        """
+        assert self._gitlab is not None
+        if info.draft:
+            return "MR в статусе Draft"
+        if info.has_conflicts:
+            return "у MR конфликты"
+        if any(action.type in _REMARKS for action in alongside):
+            return "в этом же черновике замечание, апрув — после его закрытия"
+        open_threads = [
+            discussion for discussion in await self._gitlab.list_discussions(info.iid) if _unresolved(discussion)
+        ]
+        if open_threads:
+            return f"нерешённых тредов: {len(open_threads)}"
         return None
 
     async def _report_auto_approval(self, iid: int, draft: ReviewDraft, pending: _PendingRun) -> None:
@@ -1449,6 +1467,12 @@ class GitLabReviewChannel(BaseChannel):
         report: list[str] = []
         published = 0
         failed: list[ProposedAction] = []
+        approval_blocker: str | None = None
+        if any(action.type == "approve" for _, action in selected):
+            try:
+                approval_blocker = await self._approval_blocker(info, tuple(action for _, action in selected))
+            except GitLabApiError as exc:
+                approval_blocker = f"не удалось проверить треды — {exc}"
         for number, action in selected:
             if action.type == "approve" and self.config.is_reviewer(info.author):
                 report.append(f"{number}. {action.label()}: пропущено — это ваш MR")
@@ -1458,6 +1482,9 @@ class GitLabReviewChannel(BaseChannel):
                 continue
             if moved and action.type in _TIED_TO_CODE:
                 report.append(f"{number}. {action.label()}: пропущено — ветка изменилась после ревью")
+                continue
+            if action.type == "approve" and approval_blocker is not None:
+                report.append(f"{number}. {action.label()}: пропущено — {approval_blocker}")
                 continue
             try:
                 outcome = await self._publish_action(info, action)

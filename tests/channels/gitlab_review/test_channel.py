@@ -1419,3 +1419,22 @@ async def test_a_remark_beside_the_approval_waits_for_a_human(tmp_path: Path) ->
         await h.answer(42, [{"type": "note", "body": "мелочь"}, {"type": "approve"}])
     assert h.gitlab.writes == []
     assert "публикуй" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_approval_beside_a_remark_of_the_same_draft_is_held_back(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.answer(42, [{"type": "discussion", "path": "a.cs", "line": 3, "body": "вопрос"}, {"type": "approve"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert [kind for kind, _ in h.gitlab.writes] == ["discussion"]
+    assert "2. аппрув MR: пропущено — в этом же черновике замечание" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_approval_waits_while_any_thread_is_unresolved(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.discussions["d1"] = [{"author": {"username": "qa"}, "resolvable": True, "resolved": False}]
+        await h.answer(42, [{"type": "approve"}])
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert h.gitlab.writes == []
+    assert "1. аппрув MR: пропущено — нерешённых тредов: 1" in h.telegram.text()
