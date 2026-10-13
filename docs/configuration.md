@@ -1766,6 +1766,10 @@ What starts a run (checked against live GitLab state, after the debounce):
   the note answers the reviewer: it follows a reviewer note (a series of notes by
   the same person counts as one reply) or mentions the reviewer. A note that
   answers someone else, or mentions only other people, is ignored.
+  While another thread of the reviewer still waits for an answer, only the
+  replied thread is checked. Once none waits and several threads have answers,
+  the run rechecks all of them on the current commit and may propose the
+  approval; replies to several threads at once lead to one recheck.
 - A reviewer mention in someone else's thread, or an MR author's reply right
   after a third person, is only reported to Telegram — no run.
 
