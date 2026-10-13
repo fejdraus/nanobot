@@ -26,8 +26,8 @@ class GitLabReviewConfig(Base):
     ``autoApprove`` lets the channel approve on its own when the review's only
     proposal is the approval, after checking in code that the MR is open, not
     a draft, not the reviewer's, unchanged since the review, free of conflicts
-    and without an unresolved thread of anyone's. Otherwise the draft goes to
-    Telegram as usual, with the reason.
+    and without an unresolved thread the reviewer opened. Otherwise the draft
+    goes to Telegram as usual, with the reason.
 
     ``lessonsDir`` points at the reviewer's memory notes; lessons tagged with
     ``applies_to``/``keywords`` that match the merge request are put into the

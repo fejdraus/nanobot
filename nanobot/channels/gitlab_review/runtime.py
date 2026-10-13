@@ -189,6 +189,15 @@ def _only_approve(draft: ReviewDraft) -> bool:
     return not draft.errors and len(draft.actions) == 1 and draft.actions[0].type == "approve"
 
 
+def _opened_by(discussion: dict[str, Any]) -> str | None:
+    notes = discussion.get("notes")
+    if not isinstance(notes, list) or not notes or not isinstance(notes[0], dict):
+        return None
+    author = cast("dict[str, Any]", notes[0]).get("author")
+    username = cast("dict[str, Any]", author).get("username") if isinstance(author, dict) else None
+    return username if isinstance(username, str) else None
+
+
 def _unresolved(discussion: dict[str, Any]) -> bool:
     notes = discussion.get("notes")
     if not isinstance(notes, list):
@@ -647,8 +656,9 @@ class GitLabReviewChannel(BaseChannel):
     ) -> str | None:
         """Why the MR must not be approved now, or ``None``.
 
-        An approval says the MR may be merged, so it never goes out beside a
-        remark of the same draft or while any thread, anyone's, is unresolved.
+        An approval goes out only when the reviewer has nothing left to say:
+        no remark in the same draft and no unresolved thread the reviewer
+        opened. Other people's threads are theirs to close.
         """
         assert self._gitlab is not None
         if info.draft:
@@ -658,10 +668,11 @@ class GitLabReviewChannel(BaseChannel):
         if any(action.type in _REMARKS for action in alongside):
             return "в этом же черновике замечание, апрув — после его закрытия"
         open_threads = [
-            discussion for discussion in await self._gitlab.list_discussions(info.iid) if _unresolved(discussion)
+            discussion for discussion in await self._gitlab.list_discussions(info.iid)
+            if _unresolved(discussion) and self.config.is_reviewer(_opened_by(discussion))
         ]
         if open_threads:
-            return f"нерешённых тредов: {len(open_threads)}"
+            return f"не закрыто ваших тредов: {len(open_threads)}"
         return None
 
     async def _report_auto_approval(self, iid: int, draft: ReviewDraft, pending: _PendingRun) -> None:

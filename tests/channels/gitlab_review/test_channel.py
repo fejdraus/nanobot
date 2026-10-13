@@ -1394,13 +1394,21 @@ async def test_a_clean_review_is_approved_without_asking(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_someone_elses_open_thread_keeps_the_approval_for_a_human(tmp_path: Path) -> None:
+async def test_an_open_thread_of_the_reviewer_keeps_the_approval_for_a_human(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        h.gitlab.discussions["d1"] = [{"author": {"username": "a.tyra"}, "resolvable": True, "resolved": False}]
+        await h.answer(42, [{"type": "approve"}])
+    assert h.gitlab.writes == []
+    assert "сам не аппрувлю: не закрыто ваших тредов: 1" in h.telegram.text()
+    assert h.channel._state.load_draft(42) is not None
+
+
+@pytest.mark.asyncio
+async def test_someone_elses_open_thread_does_not_hold_back_the_approval(tmp_path: Path) -> None:
     async with Harness(tmp_path, auto_approve=True) as h:
         h.gitlab.discussions["d1"] = [{"author": {"username": "qa"}, "resolvable": True, "resolved": False}]
         await h.answer(42, [{"type": "approve"}])
-    assert h.gitlab.writes == []
-    assert "сам не аппрувлю: нерешённых тредов: 1" in h.telegram.text()
-    assert h.channel._state.load_draft(42) is not None
+    assert h.gitlab.writes == [("approve", SHA)]
 
 
 @pytest.mark.asyncio
@@ -1431,10 +1439,10 @@ async def test_approval_beside_a_remark_of_the_same_draft_is_held_back(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_approval_waits_while_any_thread_is_unresolved(tmp_path: Path) -> None:
+async def test_approval_waits_while_a_thread_of_the_reviewer_is_unresolved(tmp_path: Path) -> None:
     async with Harness(tmp_path) as h:
-        h.gitlab.discussions["d1"] = [{"author": {"username": "qa"}, "resolvable": True, "resolved": False}]
+        h.gitlab.discussions["d1"] = [{"author": {"username": "a.tyra"}, "resolvable": True, "resolved": False}]
         await h.answer(42, [{"type": "approve"}])
         await h.channel.handle_telegram(_tg(1, "публикуй !42"))
     assert h.gitlab.writes == []
-    assert "1. аппрув MR: пропущено — нерешённых тредов: 1" in h.telegram.text()
+    assert "1. аппрув MR: пропущено — не закрыто ваших тредов: 1" in h.telegram.text()
