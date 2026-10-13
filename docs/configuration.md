@@ -1743,6 +1743,7 @@ runs in code, not in the prompt.
 | `gitlabMcpCommand` | — | **Required.** Command and arguments that start the GitLab MCP server over stdio. Reads go through its `gitlab_api_get` tool, approved actions through its write tools. |
 | `reviewerUsernames` | — | **Required.** The reviewer's GitLab usernames. Their notes never wake the bot, which prevents a reply loop. |
 | `reviewOwnMergeRequests` | `false` | Also review merge requests the reviewer authored. An approval of such an MR is never drafted nor published. |
+| `autoApprove` | `false` | Approve without asking when the review's only proposal is the approval. Code checks first that the MR is open, not a draft, not the reviewer's, unchanged since the review, without conflicts and without an unresolved thread of anyone's; otherwise the draft goes to Telegram with the reason. Telegram gets a notice either way. |
 | `lessonsDir` | `""` | The reviewer's memory directory. Notes there tagged with `applies_to` / `keywords` that match the MR's changes are put into the prompt. Empty disables it. |
 | `lessonsBudgetChars` | `40000` | How much lesson text goes into one prompt; further matches are listed by name only. |
 | `clickupMcpCommand` | `[]` | Command and arguments that start the ClickUp MCP server. Every draft and notice names the MR's tasks (keys from its title and description, not the branch — a branch can hold commits of several tasks) with their ClickUp names and links, read with its `clickup_get_task` tool. |

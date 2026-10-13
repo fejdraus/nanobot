@@ -16,6 +16,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "gitlabMcpCommand": field("list"),
         "reviewerUsernames": field("list"),
         "reviewOwnMergeRequests": field("bool", default=False),
+        "autoApprove": field("bool", default=False),
         "lessonsDir": field(),
         "clickupMcpCommand": field("list"),
         "jiraUrl": field(),

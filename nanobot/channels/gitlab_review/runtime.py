@@ -183,6 +183,19 @@ class _ChatRequest:
     reply_to: int | None = None
 
 
+def _only_approve(draft: ReviewDraft) -> bool:
+    """A draft whose sole proposal is the approval: no remark, question or reply."""
+    return not draft.errors and len(draft.actions) == 1 and draft.actions[0].type == "approve"
+
+
+def _unresolved(discussion: dict[str, Any]) -> bool:
+    notes = discussion.get("notes")
+    if not isinstance(notes, list):
+        return False
+    entries = [cast("dict[str, Any]", note) for note in cast("list[object]", notes) if isinstance(note, dict)]
+    return any(entry.get("resolvable") and not entry.get("resolved") for entry in entries)
+
+
 @dataclass
 class _MergeRequestInfo:
     iid: int
@@ -195,6 +208,7 @@ class _MergeRequestInfo:
     diff_refs: dict[str, Any] = field(default_factory=dict)
     description: str = ""
     state: str = "opened"
+    has_conflicts: bool = False
 
     @property
     def state_label(self) -> str:
@@ -595,7 +609,56 @@ class GitLabReviewChannel(BaseChannel):
                 actions=tuple(action for action in draft.actions if action.type != "approve"),
                 errors=(*draft.errors, "аппрув своего MR снят"),
             )
+        if self.config.auto_approve and _only_approve(draft):
+            blocker = await self._approve_unattended(iid, pending)
+            if blocker is None:
+                await self._report_auto_approval(iid, draft, pending)
+                return
+            draft = ReviewDraft(
+                summary=draft.summary, actions=draft.actions,
+                errors=(*draft.errors, f"сам не аппрувлю: {blocker}"),
+            )
         await self._send_draft(iid, draft, pending)
+
+    async def _approve_unattended(self, iid: int, pending: _PendingRun) -> str | None:
+        """Approve when nothing stands in the way; otherwise say what does."""
+        assert self._gitlab is not None
+        try:
+            info = await self._merge_request(iid)
+            if not info.open:
+                return f"MR уже {info.state_label}"
+            if info.draft:
+                return "MR в статусе Draft"
+            if pending.own or self.config.is_reviewer(info.author):
+                return "это ваш MR"
+            if info.head_sha != pending.head_sha:
+                return f"ветка изменилась после ревью ({pending.head_sha[:10]} → {info.head_sha[:10]})"
+            if info.has_conflicts:
+                return "у MR конфликты"
+            open_threads = [
+                discussion for discussion in await self._gitlab.list_discussions(iid)
+                if _unresolved(discussion)
+            ]
+            if open_threads:
+                return f"нерешённых тредов: {len(open_threads)}"
+            await self._gitlab.approve(iid, info.head_sha)
+        except GitLabApiError as exc:
+            return f"GitLab ответил ошибкой — {exc}"
+        return None
+
+    async def _report_auto_approval(self, iid: int, draft: ReviewDraft, pending: _PendingRun) -> None:
+        self._state.delete_draft(iid)
+        text = (
+            f"{draft.summary or 'Замечаний нет.'}\n\n"
+            f"Замечаний нет — апрув поставлен автоматически на {pending.head_sha[:10]}."
+        )
+        chunks = render_notice(iid, pending.title, text, task=pending.task)
+        message_ids = await self._tell(chunks)
+        if pending.review_id is not None:
+            self._state.record_review_messages(pending.review_id, message_ids)
+            self._state.add_event(pending.review_id, "system", "\n\n".join(chunks))
+            self._state.add_published(pending.review_id, 1)
+            self._state.set_review_status(pending.review_id, "approved automatically")
 
     async def _send_draft(self, iid: int, draft: ReviewDraft, pending: _PendingRun) -> None:
         """Store a new draft version of this MR, show it, and file it in the archive."""
@@ -635,7 +698,7 @@ class GitLabReviewChannel(BaseChannel):
                     status, body = channel.handle_webhook(self)
                 except GitLabWebhookError as exc:
                     status, body = exc.status, str(exc).encode()
-                except Exception:  # pragma: no cover - defensive
+                except Exception:  # pragma: no cover
                     channel.logger.exception("GitLab webhook handling failed")
                     status, body = 500, b"internal error"
                 self._send(status, body)
@@ -1488,6 +1551,7 @@ class GitLabReviewChannel(BaseChannel):
             diff_refs=cast("dict[str, Any]", refs) if isinstance(refs, dict) else {},
             description=str(mr.get("description") or ""),
             state=str(mr.get("state") or ""),
+            has_conflicts=mr.get("has_conflicts") is True,
         )
 
     async def _tell(self, chunks: list[str]) -> list[int]:

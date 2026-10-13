@@ -23,6 +23,12 @@ class GitLabReviewConfig(Base):
     ``reviewOwnMergeRequests`` also reviews merge requests the reviewer
     authored; approving them is never proposed or published.
 
+    ``autoApprove`` lets the channel approve on its own when the review's only
+    proposal is the approval, after checking in code that the MR is open, not
+    a draft, not the reviewer's, unchanged since the review, free of conflicts
+    and without an unresolved thread of anyone's. Otherwise the draft goes to
+    Telegram as usual, with the reason.
+
     ``lessonsDir`` points at the reviewer's memory notes; lessons tagged with
     ``applies_to``/``keywords`` that match the merge request are put into the
     prompt by code (see :mod:`lessons`).
@@ -54,6 +60,7 @@ class GitLabReviewConfig(Base):
     gitlab_mcp_command: list[str] = Field(default_factory=list)
     reviewer_usernames: list[str] = Field(default_factory=list)
     review_own_merge_requests: bool = False
+    auto_approve: bool = False
     lessons_dir: str = ""
     clickup_mcp_command: list[str] = Field(default_factory=list)
     jira_url: str = ""

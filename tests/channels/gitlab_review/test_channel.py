@@ -1382,3 +1382,40 @@ async def test_lessons_fall_back_to_tags_when_jev_fails(tmp_path: Path) -> None:
     assert "Урок про лиды." in prompt and "Общее правило." in prompt
     assert "Урок без тегов." not in prompt
 
+
+
+@pytest.mark.asyncio
+async def test_a_clean_review_is_approved_without_asking(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        await h.answer(42, [{"type": "approve"}], "Замечаний нет")
+    assert h.gitlab.writes == [("approve", SHA)]
+    assert "апрув поставлен автоматически" in h.telegram.text()
+    assert h.channel._state.load_draft(42) is None
+
+
+@pytest.mark.asyncio
+async def test_someone_elses_open_thread_keeps_the_approval_for_a_human(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        h.gitlab.discussions["d1"] = [{"author": {"username": "qa"}, "resolvable": True, "resolved": False}]
+        await h.answer(42, [{"type": "approve"}])
+    assert h.gitlab.writes == []
+    assert "сам не аппрувлю: нерешённых тредов: 1" in h.telegram.text()
+    assert h.channel._state.load_draft(42) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_branch_moved_after_the_review_is_not_approved_unattended(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        h.expect(42)
+        h.gitlab.mr["sha"] = "f" * 40
+        await h.answer(42, [{"type": "approve"}], waiting=False)
+    assert h.gitlab.writes == []
+    assert "ветка изменилась после ревью" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_a_remark_beside_the_approval_waits_for_a_human(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_approve=True) as h:
+        await h.answer(42, [{"type": "note", "body": "мелочь"}, {"type": "approve"}])
+    assert h.gitlab.writes == []
+    assert "публикуй" in h.telegram.text()
