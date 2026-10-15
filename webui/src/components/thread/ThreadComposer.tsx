@@ -43,8 +43,8 @@ import {
   cliAppInitials,
   mcpPresetInitials,
   splitCapabilityMentionSegments,
-  type CapabilityMentionSegment,
 } from "@/components/CliAppMentionText";
+import type { CapabilityMentionSegment } from "@/lib/composer-mention-text";
 import { INLINE_TOKEN_HIGHLIGHT_COLOR } from "@/components/InlineTokenHighlight";
 import {
   ArrowUp,
@@ -2386,7 +2386,6 @@ export function ThreadComposer({
     <WorkspaceAccessToggle
       scope={workspaceScope}
       disabled={interactionDisabled || workspaceScopeDisabled}
-      canUseFullAccess={workspaceControls?.can_use_full_access !== false}
       isHero={isHero}
       onChange={onWorkspaceScopeChange}
     />
@@ -2646,7 +2645,7 @@ export function ThreadComposer({
             aria-label={inputAriaLabel ?? t("thread.composer.inputAria")}
             className={cn(
               inputTextClasses,
-              "relative z-10 block caret-foreground placeholder:text-muted-foreground/70",
+              "relative z-10 block caret-foreground placeholder:text-muted-foreground",
               "focus:outline-none focus-visible:outline-none",
               "disabled:cursor-not-allowed",
               hasMentionDecorations && "text-transparent selection:bg-primary/20",
