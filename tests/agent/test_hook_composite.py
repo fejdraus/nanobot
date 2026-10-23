@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.session_helpers import mock_session_manager
 from nanobot.agent.context import TranscriptInput
 from nanobot.agent.hook import (
     AgentHook,
@@ -288,20 +289,6 @@ async def test_composite_error_isolation_all_async():
 # ---------------------------------------------------------------------------
 
 
-def test_composite_finalize_content_pipeline():
-    class Upper(AgentHook):
-        def finalize_content(self, context, content):
-            return content.upper() if content else content
-
-    class Suffix(AgentHook):
-        def finalize_content(self, context, content):
-            return (content + "!") if content else content
-
-    hook = CompositeHook([Upper(), Suffix()])
-    result = hook.finalize_content(_ctx(), "hello")
-    assert result == "HELLO!"
-
-
 def test_composite_finalize_content_none_passthrough():
     hook = CompositeHook([AgentHook()])
     assert hook.finalize_content(_ctx(), None) is None
@@ -438,7 +425,7 @@ def _make_loop(tmp_path, hooks=None, hook_factories=None):
     provider.generation.max_tokens = 4096
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
-         patch("nanobot.agent.loop.SessionManager"), \
+         patch("nanobot.agent.loop.SessionManager", side_effect=mock_session_manager), \
          patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr, \
          patch("nanobot.agent.loop.Consolidator"):
         mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)

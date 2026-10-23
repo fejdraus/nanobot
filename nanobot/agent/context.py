@@ -21,7 +21,7 @@ from nanobot.security.workspace_access import WorkspaceScopeResolver
 from nanobot.session.keys import last_channel_from_metadata
 from nanobot.session.manager import Session
 from nanobot.session.summary import SessionSummary
-from nanobot.utils.helpers import detect_image_mime, load_bundled_template
+from nanobot.utils.helpers import detect_image_mime, image_placeholder_text, load_bundled_template
 from nanobot.utils.prompt_templates import render_template
 
 # MiniMax rejects a base64 video data URL over 50 MB (the Files API route allows
@@ -118,7 +118,7 @@ class ContextBuilder:
         if include_memory:
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
-                parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+                parts.append(memory)
 
         with self.skills.snapshot():
             active_skills = self.skills.get_always_skills()
@@ -345,7 +345,7 @@ class ContextBuilder:
         if not image_paths:
             return text
 
-        image_blocks: list[dict[str, Any]] = []
+        media_blocks: list[dict[str, Any]] = []
         for path in image_paths:
             p = Path(path)
             if not p.is_file():
@@ -383,13 +383,14 @@ class ContextBuilder:
             if not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            image_blocks.append({
+            media_blocks.append({"type": "text", "text": image_placeholder_text(str(p))})
+            media_blocks.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
                 "_meta": {"path": str(p)},
             })
             logger.debug("Image attached to LLM request: {} ({}, {} bytes)", path, mime, len(raw))
 
-        if not image_blocks:
+        if not media_blocks:
             return text
-        return image_blocks + [{"type": "text", "text": text}]
+        return media_blocks + [{"type": "text", "text": text}]
