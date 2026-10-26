@@ -624,13 +624,15 @@ class GitLabReviewChannel(BaseChannel):
 
     async def _deliver_draft(self, iid: int, answer: str, pending: _PendingRun) -> None:
         draft = parse_draft(answer)
+        unparsed = bool(draft.errors)
         if pending.own and any(action.type == "approve" for action in draft.actions):
             draft = ReviewDraft(
                 summary=draft.summary,
                 actions=tuple(action for action in draft.actions if action.type != "approve"),
                 errors=(*draft.errors, "аппрув своего MR снят"),
             )
-        if self.config.auto_approve and _only_approve(draft):
+        approval_tried = self.config.auto_approve and _only_approve(draft)
+        if approval_tried:
             blocker = await self._approve_unattended(iid, pending)
             if blocker is None:
                 await self._report_auto_approval(iid, draft, pending)
@@ -640,6 +642,16 @@ class GitLabReviewChannel(BaseChannel):
                 errors=(*draft.errors, f"сам не аппрувлю: {blocker}"),
             )
         await self._send_draft(iid, draft, pending)
+        if self.config.auto_publish and draft.actions and not (pending.own or unparsed or approval_tried):
+            await self._publish_unattended(iid)
+
+    async def _publish_unattended(self, iid: int) -> None:
+        """Publish the draft just shown, as if the approver answered «публикуй» to it."""
+        stored = self._state.load_draft(iid)
+        if stored is None:
+            return
+        await self._tell([f"!{iid}/{stored.version}: публикую сам — включена автопубликация."])
+        await self.publish(ApprovalCommand(True, iid, (), stored.version))
 
     async def _approve_unattended(self, iid: int, pending: _PendingRun) -> str | None:
         """Approve when nothing stands in the way; otherwise say what does."""

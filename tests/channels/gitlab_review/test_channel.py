@@ -1471,6 +1471,36 @@ async def test_approval_waits_while_a_thread_of_the_reviewer_is_unresolved(tmp_p
     assert "1. аппрув MR: пропущено — не закрыто ваших тредов: 1" in h.telegram.text()
 
 
+@pytest.mark.asyncio
+async def test_auto_publish_posts_a_fresh_draft_without_asking(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_publish=True) as h:
+        await h.answer(42, [{"type": "discussion", "path": "a.cs", "line": 3, "body": "вопрос"}, {"type": "note", "body": "мелочь"}])
+    assert [kind for kind, _ in h.gitlab.writes] == ["discussion", "note"]
+    assert "публикую сам" in h.telegram.text()
+    assert h.channel._state.load_draft(42) is None
+
+
+@pytest.mark.asyncio
+async def test_auto_publish_keeps_the_branch_guard(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_publish=True) as h:
+        h.expect(42)
+        h.gitlab.mr["sha"] = "f" * 40
+        await h.answer(42, [{"type": "discussion", "path": "a.cs", "line": 3, "body": "вопрос"}], waiting=False)
+    assert h.gitlab.writes == []
+    assert "ветка изменилась после ревью" in h.telegram.text()
+
+
+@pytest.mark.asyncio
+async def test_auto_publish_leaves_the_reviewers_own_mr_to_a_human(tmp_path: Path) -> None:
+    async with Harness(tmp_path, review_own_merge_requests=True, auto_publish=True) as h:
+        h.gitlab.mr["author"] = {"username": "a.tyra"}
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        h.channel._pending["gitlab-review:42"] = _PendingRun(future, SHA, "feat: thing", "", own=True, iid=42)
+        await h.answer(42, [{"type": "note", "body": "general"}], waiting=False)
+    assert h.gitlab.writes == []
+    assert h.channel._state.load_draft(42) is not None
+
+
 def _thread(*notes: dict[str, Any], resolved: bool = False) -> list[dict[str, Any]]:
     return [dict(note, id=n, resolvable=True, resolved=resolved) for n, note in enumerate(notes, start=1)]
 

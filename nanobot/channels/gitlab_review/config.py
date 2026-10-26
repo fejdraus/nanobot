@@ -29,6 +29,11 @@ class GitLabReviewConfig(Base):
     and without an unresolved thread the reviewer opened. Otherwise the draft
     goes to Telegram as usual, with the reason.
 
+    ``autoPublish`` publishes every fresh review draft right after showing it,
+    through the same path and guards as «публикуй». Drafts of the reviewer's
+    own MRs, drafts with unparsed actions and drafts written in a conversation
+    still wait for a human.
+
     ``lessonsDir`` points at the reviewer's memory notes; lessons tagged with
     ``applies_to``/``keywords`` that match the merge request are put into the
     prompt by code (see :mod:`lessons`).
@@ -42,8 +47,9 @@ class GitLabReviewConfig(Base):
     description): name and link from ClickUp when ``clickupMcpCommand`` is set,
     otherwise a link under ``jiraUrl``.
 
-    The reviewer never publishes on its own. Drafts go to one Telegram chat;
-    only an approval sent from that chat makes the channel post to GitLab. The
+    Unless ``autoApprove`` or ``autoPublish`` says otherwise, the reviewer
+    never publishes on its own. Drafts go to one Telegram chat; only an
+    approval sent from that chat makes the channel post to GitLab. The
     comments appear under the GitLab MCP server's account, a real person, so
     every guard that keeps the bot quiet lives in code here rather than in the
     prompt.
@@ -61,6 +67,7 @@ class GitLabReviewConfig(Base):
     reviewer_usernames: list[str] = Field(default_factory=list)
     review_own_merge_requests: bool = False
     auto_approve: bool = False
+    auto_publish: bool = False
     lessons_dir: str = ""
     clickup_mcp_command: list[str] = Field(default_factory=list)
     jira_url: str = ""
