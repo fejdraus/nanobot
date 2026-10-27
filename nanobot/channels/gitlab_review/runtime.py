@@ -459,6 +459,14 @@ class GitLabReviewChannel(BaseChannel):
                         "Kerio VPN ждёт код подтверждения — без него Jira недоступна. "
                         "Пришлите 6 цифр из приложения-аутентификатора. Больше напоминать не буду."
                     ])
+            elif status == "jira_down":
+                self._vpn_down_since = None
+                if status not in self._vpn_reported:
+                    self._vpn_reported.add(status)
+                    await self._tell_safe([
+                        "Jira не отвечает, хотя Kerio VPN подключён — это сбой самой Jira. "
+                        "Код не нужен, VPN не трогаю, жду."
+                    ])
             else:
                 self._vpn_down_since = self._vpn_down_since or now
                 if now - self._vpn_down_since >= self.config.vpn_reconnect_after_s:

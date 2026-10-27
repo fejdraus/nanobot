@@ -7,9 +7,11 @@ container's control port, says in Telegram when a code is needed, and passes
 on the six digits the approver sends back.
 
 The control protocol is one line each way: ``status`` answers ``ok``,
-``needs_code`` or ``down``; ``code <digits>`` answers ``ok`` or ``error: …``;
-``reconnect`` restarts the tunnel. A VPN that stays down is reconnected by the
-channel on its own; the approver can ask for it too.
+``needs_code``, ``jira_down`` (the tunnel works, Jira itself does not answer)
+or ``down``; ``code <digits>`` answers ``ok`` or ``error: …``; ``reconnect``
+restarts the tunnel. A VPN that stays down is reconnected by the channel on
+its own; the approver can ask for it too. ``jira_down`` is only reported:
+reconnecting cannot fix it.
 """
 from __future__ import annotations
 

@@ -1181,6 +1181,17 @@ async def test_vpn_down_for_a_while_is_reconnected_on_its_own(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_jira_down_behind_a_working_vpn_is_reported_once_and_not_reconnected(tmp_path: Path) -> None:
+    server, endpoint, seen = await _vpn_control({"status": "jira_down", "reconnect": "ok"})
+    async with server:
+        async with Harness(tmp_path, vpn_control=endpoint, vpn_check_interval_s=0.01, vpn_reconnect_after_s=0.02) as h:
+            await _until(lambda: seen.count("status") >= 10)
+    assert "reconnect" not in seen
+    assert h.telegram.text().count("Jira не отвечает") == 1
+    assert "ждёт код" not in h.telegram.text()
+
+
+@pytest.mark.asyncio
 async def test_vpn_waiting_for_a_code_is_not_repeated_until_it_works_again(tmp_path: Path) -> None:
     answers = {"status": "needs_code"}
     server, endpoint, seen = await _vpn_control(answers)
