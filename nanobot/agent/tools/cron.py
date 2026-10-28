@@ -215,6 +215,8 @@ class CronTool(Tool):
         tz: str | None, at: str | None,
     ) -> CronSchedule | str:
         if tz and not cron_expr and not at:
+            if delay_seconds is None and every_seconds is None:
+                return ToolResult.error("Error: tz can only be used with cron_expr or at")
             tz = None
         if tz:
             if err := self._validate_timezone(tz):
