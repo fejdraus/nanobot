@@ -111,7 +111,11 @@ from nanobot.channels.gitlab_review.reverts import (
 )
 from nanobot.channels.gitlab_review.state import GitLabReviewStateStore, ReviewRecord
 from nanobot.channels.gitlab_review.tasks import TaskLookup, find_task_keys
-from nanobot.channels.gitlab_review.telegram_api import TelegramApi, TelegramMessage
+from nanobot.channels.gitlab_review.telegram_api import (
+    TelegramApi,
+    TelegramApiError,
+    TelegramMessage,
+)
 from nanobot.channels.gitlab_review.triage import triage_thread
 from nanobot.channels.gitlab_review.vpn import asks_reconnect, verification_code, vpn_request
 from nanobot.config.paths import get_runtime_subdir
@@ -130,6 +134,14 @@ TYPING_INTERVAL_S = 4.0
 _MR_REF_RE = re.compile(r"!(\d+)")
 _CATCH_UP_RE = re.compile(r"^\s*(?:проверь|проверить|check)\s+(?:новые|все|new)(?:\s+(?:mr|мр|ревью))?\s*$", re.IGNORECASE)
 _REVIEW_REQUEST_RE = re.compile(r"^\s*(?:проверь|отревьюй|ревью|review)\s+!?(\d+)\s*$", re.IGNORECASE)
+_SLASH_RE = re.compile(r"^\s*/([a-z_]+)(?:@\w+)?(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("queue", "Найти MR без ревью и поставить в очередь"),
+    ("review", "Ревью MR: /review 6386"),
+    ("drafts", "Черновики, ждущие решения"),
+    ("state", "VPN, очередь, автопубликация и автоапрув"),
+    ("vpn", "Переподключить VPN"),
+)
 CONTINUE_WINDOW = timedelta(hours=12)
 _TIED_TO_CODE = frozenset({"discussion", "approve"})
 _REMARKS = frozenset({"discussion", "note"})
@@ -221,6 +233,18 @@ def _unresolved(discussion: dict[str, Any]) -> bool:
     return any(note.get("resolvable") and not note.get("resolved") for note in _notes(discussion))
 
 
+def _check_bot_commands() -> None:
+    """Refuse to start when a menu command would shadow a built-in nanobot command such as /new."""
+    from nanobot.command.builtin import register_builtin_commands
+    from nanobot.command.router import CommandRouter
+
+    router = CommandRouter()
+    register_builtin_commands(router)
+    taken = [name for name, _ in BOT_COMMANDS if router.command_name(f"/{name}") is not None]
+    if taken:
+        raise RuntimeError("GitLab review commands clash with nanobot commands: " + ", ".join(f"/{n}" for n in taken))
+
+
 def _resolved(discussion: dict[str, Any]) -> bool:
     """A resolvable thread somebody closed; a reply alone does not reopen it in GitLab."""
     return any(note.get("resolvable") for note in _notes(discussion)) and not _unresolved(discussion)
@@ -290,12 +314,17 @@ class GitLabReviewChannel(BaseChannel):
 
     async def start(self) -> None:
         self.config.validate_runtime()
+        _check_bot_commands()
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
         if self._gitlab is None:
             self._gitlab = GitLabApi(McpServer("gitlab", self.config.gitlab_mcp_command), self.config.project_path)
         if self._telegram is None:
             self._telegram = TelegramApi(self.config.telegram_bot_token)
+        try:
+            await self._telegram.set_commands(list(BOT_COMMANDS))
+        except TelegramApiError as exc:
+            self.logger.warning("Telegram command menu not set: {}", exc)
         if self._task_lookup is None:
             clickup = McpServer("clickup", self.config.clickup_mcp_command) if self.config.clickup_mcp_command else None
             self._task_lookup = TaskLookup(clickup=clickup, jira_url=self.config.jira_url)
@@ -1268,6 +1297,10 @@ class GitLabReviewChannel(BaseChannel):
         text = message.text or ""
         if not text.strip():
             return
+        slash = _SLASH_RE.match(text)
+        if slash is not None and slash.group(1).lower() in {name for name, _ in BOT_COMMANDS}:
+            await self._run_bot_command(slash.group(1).lower(), slash.group(2) or "")
+            return
         code = verification_code(text) if self.config.vpn_control else None
         if code is not None:
             await self._submit_vpn_code(code)
@@ -1303,6 +1336,52 @@ class GitLabReviewChannel(BaseChannel):
         if self._pending or not self._queue.empty():
             await self._tell(["Принял. Отвечу, как закончу текущую работу."])
         self._queue.put_nowait(_ChatRequest(text, message.reply_to))
+
+    async def _run_bot_command(self, name: str, argument: str) -> None:
+        """One of :data:`BOT_COMMANDS`, typed or picked from the Telegram menu."""
+        assert self._queue is not None
+        busy = " после текущей работы" if self._pending else ""
+        if name == "queue":
+            self._queue.put_nowait(_CatchUpRequest(asked=True))
+            await self._tell([f"Ищу MR без ревью{busy}."])
+        elif name == "review":
+            digits = argument.strip().lstrip("!")
+            number = int(digits) if digits.isdigit() and int(digits) > 0 else None
+            if number is None:
+                await self._tell(["Укажите номер MR: /review 6386"])
+                return
+            self._queue.put_nowait(ReviewCandidate(kind="merge_request", iid=number, requested=True))
+            await self._tell([f"!{number}: запускаю ревью{busy}."])
+        elif name == "drafts":
+            drafts = self._state.pending_drafts()
+            await self._tell([
+                "Черновики, ждущие решения («публикуй !N/V» или ответом на черновик):\n"
+                + "\n".join(self._describe_draft(iid, version) for iid, version in drafts)
+                if drafts else "Нет черновиков, ждущих решения."
+            ])
+        elif name == "state":
+            await self._tell([await self._state_report()])
+        elif not self.config.vpn_control:
+            await self._tell(["VPN не настроен."])
+        else:
+            await self._reconnect_vpn("по вашей просьбе")
+
+    async def _state_report(self) -> str:
+        assert self._queue is not None
+        running = sorted({run.iid for run in self._pending.values() if run.iid is not None})
+        deferred = sorted({int(key.split(":")[0]) for key in self._deferred})
+        lines = [
+            "Сейчас проверяю: " + (", ".join(f"!{iid}" for iid in running) if running else "ничего"),
+            f"В очереди: {self._queue.qsize()}",
+            f"Ждут решения: {len(self._state.pending_drafts())} черновиков",
+        ]
+        if deferred:
+            lines.append("Отложено из-за лимита: " + ", ".join(f"!{iid}" for iid in deferred))
+        if self.config.vpn_control:
+            lines.append(f"VPN: {await vpn_request(self.config.vpn_control, 'status')}")
+        lines.append(f"Автоапрув: {'включён' if self.config.auto_approve else 'выключен'}")
+        lines.append(f"Автопубликация: {'включена' if self.config.auto_publish else 'выключена'}")
+        return "\n".join(lines)
 
     def _command_for(self, text: str, reply_to: int | None) -> ApprovalCommand | None:
         """A command naming its draft: by reply to a draft or its review, or by number."""

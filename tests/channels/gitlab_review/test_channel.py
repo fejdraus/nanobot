@@ -15,7 +15,11 @@ from nanobot.channels.gitlab_review.config import GitLabReviewConfig
 from nanobot.channels.gitlab_review.events import ReviewCandidate
 from nanobot.channels.gitlab_review.gitlab_api import GitLabApiError
 from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, ProposedAction
-from nanobot.channels.gitlab_review.runtime import GitLabReviewChannel, _PendingRun
+from nanobot.channels.gitlab_review.runtime import (
+    GitLabReviewChannel,
+    _check_bot_commands,
+    _PendingRun,
+)
 from nanobot.channels.gitlab_review.telegram_api import TelegramMessage
 
 SECRET = "s3cret-token"
@@ -143,6 +147,10 @@ class FakeGitLab:
 class FakeTelegram:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.commands: list[tuple[str, str]] = []
+
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        self.commands = commands
 
     async def send_message(self, chat_id: str, text: str) -> int:
         self.sent.append((chat_id, text))
@@ -1228,6 +1236,31 @@ async def test_vpn_waiting_for_a_code_is_not_repeated_until_it_works_again(tmp_p
             await _until(lambda: seen.count("status") >= 8)
             answers["status"] = "needs_code"
             await _until(lambda: h.telegram.text().count("ждёт код подтверждения") == 2)
+
+
+@pytest.mark.asyncio
+async def test_bot_commands_fill_the_menu_and_stay_clear_of_nanobot_commands(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        assert [name for name, _ in h.telegram.commands] == ["queue", "review", "drafts", "state", "vpn"]
+    _check_bot_commands()
+
+
+@pytest.mark.asyncio
+async def test_menu_commands_queue_reviews_and_report(tmp_path: Path) -> None:
+    async with Harness(tmp_path, auto_publish=True) as h:
+        await h.channel.handle_telegram(_tg(1, "/review@MyReviewerBot 42"))
+        await h.channel.handle_telegram(_tg(2, "/review"))
+        await h.channel.handle_telegram(_tg(3, "/drafts"))
+        await h.channel.handle_telegram(_tg(4, "/state"))
+        await h.channel.handle_telegram(_tg(5, "/queue"))
+        assert "!42: запускаю ревью" in h.telegram.text()
+        assert "Укажите номер MR" in h.telegram.text()
+        assert "Нет черновиков, ждущих решения." in h.telegram.text()
+        assert "Автопубликация: включена" in h.telegram.text()
+        assert "Ищу MR без ревью" in h.telegram.text()
+        await _until(lambda: len(h.inbound) == 1)
+        await h.answer(42, [])
+    assert not any(m.content.startswith("/") for m in h.inbound)
 
 
 @pytest.mark.asyncio

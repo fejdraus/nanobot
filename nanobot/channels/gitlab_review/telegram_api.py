@@ -97,6 +97,14 @@ class TelegramApi:
             )
         return messages
 
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Fill the bot's command menu in Telegram: ``(name, description)`` pairs."""
+        self._result(await self._request(
+            "POST",
+            "/setMyCommands",
+            json={"commands": [{"command": name, "description": text} for name, text in commands]},
+        ))
+
     async def send_typing(self, chat_id: str) -> None:
         """Show «печатает…» for a few seconds while an answer is being prepared."""
         self._result(
