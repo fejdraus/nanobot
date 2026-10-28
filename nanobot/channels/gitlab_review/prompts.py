@@ -43,7 +43,7 @@ End your answer with exactly one block of proposed actions:
 ```{ACTIONS_FENCE}
 {{"actions": [
   {{"type": "discussion", "path": "Pkg/.../File.cs", "line": 42, "body": "comment text"}},
-  {{"type": "reply", "discussion_id": "<thread id>", "body": "reply text"}},
+  {{"type": "reply", "discussion_id": "<thread id>", "body": "reply text", "awaits_author": true}},
   {{"type": "note", "body": "general comment not tied to a line"}},
   {{"type": "approve"}}
 ]}}
@@ -53,7 +53,9 @@ End your answer with exactly one block of proposed actions:
 (old_line for a removed line).
 - reply: only in a thread the reviewer started, and only when the author has to answer or act. \
 Do not post agreement («принято», «ок», «спасибо»): the author resolves the thread, and the \
-reviewer's agreement is the approval.
+reviewer's agreement is the approval. awaits_author says whether the reply waits for an answer \
+or an action of the author: true reopens a resolved thread, false resolves the thread. Set false \
+only when the reply settles the question and nothing is left for the author to do.
 - approve: only if approval is warranted by the rules of step 8.
 If there is nothing to propose, output the block with an empty actions list. The text before the \
 block is a short summary for the human, in Russian."""
@@ -180,7 +182,8 @@ text outside the block is never published. Propose a thread reply only when the 
 answer or act. If the question is settled, write nothing in the thread — the author resolves it; \
 once all of the reviewer's questions are settled, propose an approval. The format is the same as \
 in the review: {{"actions": [{{"type": "discussion", "path": "...", "line": 42, "body": "..."}}, \
-{{"type": "note", "body": "..."}}, {{"type": "reply", "discussion_id": "...", "body": "..."}}]}}.
+{{"type": "note", "body": "..."}}, {{"type": "reply", "discussion_id": "...", "body": "...", \
+"awaits_author": true}}]}}; awaits_author false resolves the thread, true reopens it.
 - If the human's message asks to publish or cancel a draft — in any words («выкатывай», \
 «отправь», «ок, давай», «не надо, убери») — output at the end the block
 

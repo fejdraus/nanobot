@@ -1665,9 +1665,15 @@ class GitLabReviewChannel(BaseChannel):
         elif action.type == "reply":
             assert action.discussion_id
             await self._gitlab.reply(info.iid, action.discussion_id, action.body)
-            if _resolved(await self._gitlab.get_discussion(info.iid, action.discussion_id)):
-                await self._gitlab.reopen_thread(info.iid, action.discussion_id)
+            discussion = await self._gitlab.get_discussion(info.iid, action.discussion_id)
+            if not self.config.is_reviewer(_opened_by(discussion)):
+                return "опубликовано"
+            if action.awaits_author and _resolved(discussion):
+                await self._gitlab.set_thread_resolved(info.iid, action.discussion_id, False)
                 return "опубликовано, тред открыт заново"
+            if not action.awaits_author and _unresolved(discussion):
+                await self._gitlab.set_thread_resolved(info.iid, action.discussion_id, True)
+                return "опубликовано, тред закрыт"
         elif action.type == "approve":
             await self._gitlab.approve(info.iid, info.head_sha)
         else:

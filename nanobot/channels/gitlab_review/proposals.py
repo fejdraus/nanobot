@@ -56,13 +56,15 @@ class ProposedAction:
     line: int | None = None
     old_line: int | None = None
     discussion_id: str | None = None
+    awaits_author: bool = True
 
     def label(self) -> str:
         if self.type == "discussion":
             line = self.line if self.line is not None else self.old_line
             return f"инлайн {self.path}:{line}"
         if self.type == "reply":
-            return f"ответ в тред {self.discussion_id}"
+            outcome = "ждёт автора" if self.awaits_author else "закрывает тред"
+            return f"ответ в тред {self.discussion_id}, {outcome}"
         if self.type == "approve":
             return "аппрув MR"
         return "общий комментарий"
@@ -305,7 +307,8 @@ def _parse_action(raw: object) -> tuple[ProposedAction | None, str]:
         discussion_id = item.get("discussion_id")
         if not isinstance(discussion_id, str) or not discussion_id:
             return None, "для ответа нужен discussion_id"
-        return ProposedAction("reply", body, discussion_id=discussion_id), ""
+        awaits_author = item.get("awaits_author") is not False
+        return ProposedAction("reply", body, discussion_id=discussion_id, awaits_author=awaits_author), ""
     if kind == "approve":
         return ProposedAction("approve"), ""
     return ProposedAction("note", body), ""
