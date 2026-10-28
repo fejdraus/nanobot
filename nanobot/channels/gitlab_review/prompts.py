@@ -145,6 +145,33 @@ def reply_prompt(
     )
 
 
+def replies_prompt(
+    iid: int,
+    answers: list[tuple[str, str | None, str]],
+    *,
+    lessons: str = "",
+    people: str = "",
+    authors: list[str] | None = None,
+    attachments_dir: str = "",
+) -> str:
+    """Several threads answered while the MR was quiet, checked in one run."""
+    quoted = "\n\n".join(
+        f"Thread {discussion_id}, {author or 'a participant'}:\n"
+        + ("\n".join(f"> {line}" for line in (body or "").splitlines()) or "> (empty)")
+        for discussion_id, author, body in answers
+    )
+    extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
+    return (
+        f"Run the review-gitlab-mrs skill for merge request !{iid}.\n\n"
+        f"In merge request !{iid} these threads started by the reviewer got replies:\n\n{quoted}\n\n"
+        "Check each reply against the code and the task (step 9) and decide for each thread whether "
+        "it needs a reply. Propose an approval only if every thread the reviewer started is settled "
+        f"(step 8). Do not touch other threads.\n\n{lessons + chr(10) * 2 if lessons else ''}"
+        f"{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
+        + "".join(f"\n\n{rule}" for rule in extra)
+    )
+
+
 def recheck_prompt(
     iid: int,
     discussion_ids: list[str],

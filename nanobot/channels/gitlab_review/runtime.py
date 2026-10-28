@@ -4,12 +4,15 @@ Flow:
 
 1. A GitLab webhook arrives; :mod:`events` drops anything that can never
    concern the reviewer.
-2. Activity is debounced per thread (or per MR) and queued. A single worker
-   runs one review at a time, so two reviews never share a repository clone.
+2. Activity is debounced per MR and queued; thread replies that arrive while
+   the MR is quiet for ``threadDebounceSeconds`` are checked in one run. A
+   single worker runs one review at a time, so two reviews never share a
+   repository clone.
 3. Before a run, live GitLab state is checked in code: the MR is open, not a
    draft, not authored by the reviewer unless ``reviewOwnMergeRequests`` is on;
-   a note passes :mod:`triage`; the MR is within its hourly run budget. An
-   approval of the reviewer's own MR is never drafted nor published.
+   a note passes :mod:`triage`; the MR is within its hourly run budget, else
+   the run waits until the budget frees up. An approval of the reviewer's own
+   MR is never drafted nor published.
 4. The agent reviews in draft mode and answers with proposed actions.
 5. The draft goes to one Telegram chat. Only an explicit «публикуй» from its
    approver makes the channel post to GitLab — as a reply to the draft, with
@@ -78,6 +81,7 @@ from nanobot.channels.gitlab_review.prompts import (
     chat_prompt,
     dream_prompt,
     recheck_prompt,
+    replies_prompt,
     reply_prompt,
     review_prompt,
 )
@@ -276,6 +280,8 @@ class GitLabReviewChannel(BaseChannel):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue: asyncio.Queue[ReviewCandidate | _ChatRequest | _DreamRequest | _CatchUpRequest] | None = None
         self._timers: dict[str, asyncio.TimerHandle] = {}
+        self._deferred: dict[str, asyncio.TimerHandle] = {}
+        self._answered_threads: dict[int, list[str]] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._pending: dict[str, _PendingRun] = {}
         self._dream_report: list[str] = []
@@ -327,9 +333,10 @@ class GitLabReviewChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
-        for timer in self._timers.values():
+        for timer in (*self._timers.values(), *self._deferred.values()):
             timer.cancel()
         self._timers.clear()
+        self._deferred.clear()
         tasks, self._tasks = self._tasks, []
         for task in tasks:
             task.cancel()
@@ -810,21 +817,46 @@ class GitLabReviewChannel(BaseChannel):
         return 200, b'{"ok":true}'
 
     def _schedule(self, candidate: ReviewCandidate) -> None:
-        """Restart the quiet-period timer for this thread or MR."""
+        """Restart the quiet-period timer for this MR, collecting the threads answered meanwhile."""
         key = candidate.debounce_key
+        if candidate.kind == "note" and candidate.discussion_id:
+            self._remember_threads(candidate.iid, [candidate.discussion_id])
+        if key in self._deferred:
+            return
         previous = self._timers.pop(key, None)
         if previous is not None:
             previous.cancel()
         if self._loop is None:
             return
-        self._timers[key] = self._loop.call_later(
-            self.config.debounce_seconds, self._enqueue, key, candidate
-        )
+        delay = self.config.thread_debounce_seconds if candidate.kind == "note" else self.config.debounce_seconds
+        self._timers[key] = self._loop.call_later(delay, self._enqueue, key, candidate)
+
+    def _remember_threads(self, iid: int, discussion_ids: list[str]) -> None:
+        threads = self._answered_threads.setdefault(iid, [])
+        threads.extend(item for item in discussion_ids if item not in threads)
 
     def _enqueue(self, key: str, candidate: ReviewCandidate) -> None:
         self._timers.pop(key, None)
+        self._deferred.pop(key, None)
         if self._queue is not None:
             self._queue.put_nowait(candidate)
+
+    async def _defer(self, candidate: ReviewCandidate, info: _MergeRequestInfo, threads: list[str]) -> None:
+        """Run later, when the MR's hourly budget frees up; say so once."""
+        self._remember_threads(info.iid, threads)
+        self._state.set_value(f"recheck:{info.iid}", "")
+        key = candidate.debounce_key
+        if key in self._deferred or self._loop is None:
+            return
+        at = self._state.run_slot_frees_at(info.iid, self.config.max_runs_per_mr_per_hour)
+        delay = max((at - datetime.now()).total_seconds(), 0.0) + 5
+        self._deferred[key] = self._loop.call_later(delay, self._enqueue, key, candidate)
+        await self._tell(render_notice(
+            info.iid,
+            info.title,
+            f"Лимит запусков ревью на этот MR за час исчерпан. Проверю в {at:%H:%M}; "
+            "что придёт до этого, войдёт в ту же проверку.",
+        ))
 
     async def _worker(self) -> None:
         assert self._queue is not None
@@ -880,6 +912,7 @@ class GitLabReviewChannel(BaseChannel):
 
         own = self.config.is_reviewer(info.author)
         authors = self._profiled([info.author] if info.author else [])
+        threads: list[str] = []
         if candidate.kind == "merge_request":
             if own and not self.config.review_own_merge_requests:
                 return
@@ -893,24 +926,28 @@ class GitLabReviewChannel(BaseChannel):
             )
         else:
             assert self._gitlab is not None and candidate.discussion_id
-            discussion = await self._gitlab.get_discussion(info.iid, candidate.discussion_id)
-            notes = discussion.get("notes")
-            decision = triage_thread(
-                cast("list[dict[str, Any]]", notes if isinstance(notes, list) else []),
-                mr_author=info.author,
-                is_reviewer=self.config.is_reviewer,
-            )
-            if decision.action == "skip":
-                self.logger.info("MR !{}: {}", info.iid, decision.reason)
-                return
-            if decision.action in ("notify", "ask"):
-                text = (
-                    f"{decision.reason}.\nТред {candidate.discussion_id}, "
-                    f"{decision.note_author}:\n{decision.note_body}"
+            threads = self._answered_threads.pop(info.iid, [])
+            if candidate.discussion_id not in threads:
+                threads.append(candidate.discussion_id)
+            answers: list[tuple[str, str | None, str]] = []
+            for discussion_id in threads:
+                discussion = await self._gitlab.get_discussion(info.iid, discussion_id)
+                notes = discussion.get("notes")
+                decision = triage_thread(
+                    cast("list[dict[str, Any]]", notes if isinstance(notes, list) else []),
+                    mr_author=info.author,
+                    is_reviewer=self.config.is_reviewer,
                 )
-                await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
+                if decision.action == "skip":
+                    self.logger.info("MR !{}: {}", info.iid, decision.reason)
+                elif decision.action in ("notify", "ask"):
+                    text = f"{decision.reason}.\nТред {discussion_id}, {decision.note_author}:\n{decision.note_body}"
+                    await self._tell(render_notice(info.iid, info.title, text, task=await self._task_line(info)))
+                else:
+                    answers.append((discussion_id, decision.note_author, decision.note_body))
+            if not answers:
                 return
-            authors = self._profiled([decision.note_author or "", info.author or ""])
+            authors = self._profiled([*(author or "" for _, author, _ in answers), info.author or ""])
             answered = await self._all_threads_answered(info)
             if answered == []:
                 return
@@ -923,12 +960,22 @@ class GitLabReviewChannel(BaseChannel):
                     authors=authors,
                     attachments_dir=self.config.attachments_dir,
                 )
+            elif len(answers) > 1:
+                prompt = replies_prompt(
+                    info.iid,
+                    answers,
+                    lessons=await self._lessons_for(info),
+                    people=self._people_for(authors),
+                    authors=authors,
+                    attachments_dir=self.config.attachments_dir,
+                )
             else:
+                discussion_id, note_author, note_body = answers[0]
                 prompt = reply_prompt(
                     info.iid,
-                    candidate.discussion_id,
-                    decision.note_author,
-                    decision.note_body,
+                    discussion_id,
+                    note_author,
+                    note_body,
                     lessons=await self._lessons_for(info),
                     people=self._people_for(authors),
                     authors=authors,
@@ -936,13 +983,7 @@ class GitLabReviewChannel(BaseChannel):
                 )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):
-            await self._tell(
-                render_notice(
-                    info.iid,
-                    info.title,
-                    "Лимит запусков ревью на этот MR за час исчерпан, событие пропущено.",
-                )
-            )
+            await self._defer(candidate, info, threads)
             return
         await self._run_agent(
             info,

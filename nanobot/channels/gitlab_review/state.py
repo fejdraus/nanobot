@@ -191,6 +191,21 @@ class GitLabReviewStateStore:
             )
             return True
 
+    def run_slot_frees_at(self, iid: int, limit_per_hour: int, now: datetime | None = None) -> datetime:
+        """When the MR may start a run again under its hourly budget."""
+        moment = now or datetime.now()
+        since = (moment - timedelta(hours=1)).isoformat()
+        with self._lock, self._connect() as conn:
+            started = [
+                row[0] for row in conn.execute(
+                    "SELECT started_at FROM review_runs WHERE mr_iid = ? AND started_at > ? ORDER BY started_at",
+                    (iid, since),
+                )
+            ]
+        if len(started) < limit_per_hour:
+            return moment
+        return datetime.fromisoformat(started[len(started) - limit_per_hour]) + timedelta(hours=1)
+
     def record_draft_messages(self, iid: int, version: int, message_ids: list[int]) -> None:
         """Remember which Telegram messages show this draft, so a reply can name it."""
         moment = datetime.now()

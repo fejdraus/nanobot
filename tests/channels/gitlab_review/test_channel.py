@@ -43,6 +43,7 @@ def _config(port: int, **overrides: Any) -> GitLabReviewConfig:
         "telegram_bot_token": "1:abc",
         "telegram_chat_id": CHAT,
         "debounce_seconds": 0.05,
+        "thread_debounce_seconds": 0.05,
         "review_timeout_s": 5,
     }
     values.update(overrides)
@@ -376,7 +377,7 @@ async def test_reply_in_reviewer_thread_runs_scoped_review(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_notes_in_one_thread_are_debounced_into_one_run(tmp_path: Path) -> None:
-    async with Harness(tmp_path, debounce_seconds=0.3) as h:
+    async with Harness(tmp_path, thread_debounce_seconds=0.3) as h:
         h.gitlab.discussions["d1"] = [_note("a.tyra"), _note("author", "img"), _note("author", "text")]
         for uuid in ("u1", "u2", "u3"):
             await asyncio.to_thread(_post, h.port, _note_payload(), event="Note Hook", event_uuid=uuid)
@@ -405,15 +406,36 @@ async def test_mention_in_foreign_thread_only_notifies(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_hourly_limit_stops_runs(tmp_path: Path) -> None:
+async def test_replies_in_several_threads_are_checked_in_one_run(tmp_path: Path) -> None:
+    async with Harness(tmp_path, thread_debounce_seconds=0.3) as h:
+        h.gitlab.discussions["d1"] = [_note("a.tyra", "q1"), _note("author", "answer one")]
+        h.gitlab.discussions["d2"] = [_note("a.tyra", "q2"), _note("author", "answer two")]
+        h.gitlab.discussions["d3"] = [dict(_note("a.tyra", "q3"), resolvable=True, resolved=False)]
+        for uuid, thread in (("u1", "d1"), ("u2", "d2")):
+            await asyncio.to_thread(_post, h.port, _note_payload(thread), event="Note Hook", event_uuid=uuid)
+        await _until(lambda: len(h.inbound) == 1)
+        await asyncio.sleep(0.5)
+        assert len(h.inbound) == 1
+        prompt = h.inbound[0].content
+        assert "answer one" in prompt and "answer two" in prompt
+        await h.answer(42, [])
+
+
+@pytest.mark.asyncio
+async def test_hourly_limit_postpones_the_run_and_says_so_once(tmp_path: Path) -> None:
     async with Harness(tmp_path, max_runs_per_mr_per_hour=1) as h:
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))
         await h.answer(42, [])
     async with Harness(tmp_path, max_runs_per_mr_per_hour=1) as h2:
-        h2.gitlab.mr["sha"] = "f" * 40
-        await h2.channel.process(ReviewCandidate(kind="merge_request", iid=42))
+        h2.gitlab.discussions["d1"] = [_note("a.tyra", "q1"), _note("author", "answer one")]
+        h2.gitlab.discussions["d2"] = [_note("a.tyra", "q2"), _note("author", "answer two")]
+        await h2.channel.process(ReviewCandidate(kind="note", iid=42, discussion_id="d1"))
+        h2.channel._schedule(ReviewCandidate(kind="note", iid=42, discussion_id="d2"))
+        await h2.channel.process(ReviewCandidate(kind="note", iid=42, discussion_id="d2"))
         assert h2.inbound == []
-        assert "Лимит" in h2.telegram.text()
+        assert h2.telegram.text().count("Проверю в") == 1
+        assert "42:notes" in h2.channel._deferred
+        assert h2.channel._answered_threads[42] == ["d1", "d2"]
 
 
 @pytest.mark.asyncio

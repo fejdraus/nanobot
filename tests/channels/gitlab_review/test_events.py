@@ -85,7 +85,7 @@ def test_note_is_a_candidate_per_thread() -> None:
     assert candidate.kind == "note"
     assert candidate.discussion_id == "abc123"
     assert candidate.note_id == 900
-    assert candidate.debounce_key == "42:abc123"
+    assert candidate.debounce_key == "42:notes"
 
 
 def test_reviewer_own_note_is_ignored() -> None:

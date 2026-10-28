@@ -41,6 +41,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "telegramChatId": field(),
         "telegramUserIds": field("list"),
         "debounceSeconds": field("float", default=90.0),
+        "threadDebounceSeconds": field("float", default=300.0),
         "maxRunsPerMrPerHour": field("int", default=6),
         "reviewTimeoutS": field("float", default=3900.0),
     },

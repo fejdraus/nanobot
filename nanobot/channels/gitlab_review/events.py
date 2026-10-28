@@ -36,12 +36,13 @@ class ReviewCandidate:
     def debounce_key(self) -> str:
         """Group activity that should end in a single review run.
 
-        A reply often arrives as several notes in a row (a screenshot, then the
-        text), so notes are grouped per thread and the run starts once the
-        thread goes quiet.
+        Authors answer remarks one thread after another, a reply often in
+        several notes (a screenshot, then the text), so the notes of all
+        threads of an MR are grouped and checked in one run once the MR goes
+        quiet.
         """
         if self.kind == "note" and self.discussion_id:
-            return f"{self.iid}:{self.discussion_id}"
+            return f"{self.iid}:notes"
         return f"{self.iid}:mr"
 
 

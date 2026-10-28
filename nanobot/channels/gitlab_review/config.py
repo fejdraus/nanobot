@@ -93,6 +93,7 @@ class GitLabReviewConfig(Base):
     telegram_user_ids: list[str] = Field(default_factory=list)
 
     debounce_seconds: float = Field(default=90.0, ge=0)
+    thread_debounce_seconds: float = Field(default=300.0, ge=0)
     max_runs_per_mr_per_hour: int = Field(default=6, ge=1)
     review_timeout_s: float = Field(default=3900.0, gt=0)
 
