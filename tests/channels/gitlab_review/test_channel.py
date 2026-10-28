@@ -129,6 +129,9 @@ class FakeGitLab:
     async def reply(self, iid: int, discussion_id: str, body: str) -> dict[str, Any]:
         return await self._write("reply", (discussion_id, body))
 
+    async def reopen_thread(self, iid: int, discussion_id: str) -> dict[str, Any]:
+        return await self._write("reopen", discussion_id)
+
     async def approve(self, iid: int, sha: str) -> dict[str, Any]:
         return await self._write("approve", sha)
 
@@ -1523,6 +1526,21 @@ async def _thread_run(h: Harness, discussion_id: str) -> InboundMessage:
     await h.reply_as_agent("gitlab-review:42", _answer("Проверил", [{"type": "approve"}]))
     await task
     return h.inbound[before]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_into_a_closed_thread_reopens_it_like_the_gitlab_ui(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.discussions["d1"] = _thread(_note("a.tyra", "вопрос"), _note("author", "Не надо"), resolved=True)
+        h.gitlab.discussions["d2"] = _thread(_note("a.tyra", "вопрос 2"), _note("author", "Почему?"))
+        await h.answer(42, [
+            {"type": "reply", "discussion_id": "d1", "body": "Надо: ошибка остаётся"},
+            {"type": "reply", "discussion_id": "d2", "body": "Потому что"},
+        ])
+        await h.channel.handle_telegram(_tg(1, "публикуй !42"))
+    assert [kind for kind, _ in h.gitlab.writes] == ["reply", "reopen", "reply"]
+    assert ("reopen", "d1") in h.gitlab.writes
+    assert "тред открыт заново" in h.telegram.text()
 
 
 @pytest.mark.asyncio

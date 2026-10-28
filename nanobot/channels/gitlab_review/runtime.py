@@ -217,6 +217,11 @@ def _unresolved(discussion: dict[str, Any]) -> bool:
     return any(note.get("resolvable") and not note.get("resolved") for note in _notes(discussion))
 
 
+def _resolved(discussion: dict[str, Any]) -> bool:
+    """A resolvable thread somebody closed; a reply alone does not reopen it in GitLab."""
+    return any(note.get("resolvable") for note in _notes(discussion)) and not _unresolved(discussion)
+
+
 @dataclass
 class _MergeRequestInfo:
     iid: int
@@ -1660,6 +1665,9 @@ class GitLabReviewChannel(BaseChannel):
         elif action.type == "reply":
             assert action.discussion_id
             await self._gitlab.reply(info.iid, action.discussion_id, action.body)
+            if _resolved(await self._gitlab.get_discussion(info.iid, action.discussion_id)):
+                await self._gitlab.reopen_thread(info.iid, action.discussion_id)
+                return "опубликовано, тред открыт заново"
         elif action.type == "approve":
             await self._gitlab.approve(info.iid, info.head_sha)
         else:

@@ -90,6 +90,11 @@ class GitLabApi:
             "project": self._project, "iid": iid, "discussion_id": discussion_id, "body": body,
         })
 
+    async def reopen_thread(self, iid: int, discussion_id: str) -> None:
+        await self._call("gitlab_resolve_thread", {
+            "project": self._project, "iid": iid, "discussion_id": discussion_id, "resolved": False,
+        })
+
     async def approve(self, iid: int, sha: str) -> None:
         await self._call("gitlab_approve_mr", {"project": self._project, "iid": iid, "sha": sha})
 
