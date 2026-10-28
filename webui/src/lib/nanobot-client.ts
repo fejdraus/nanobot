@@ -87,6 +87,7 @@ type SessionUpdateHandler = (
   workspaceScope?: WorkspaceScopePayload,
 ) => void;
 type SidebarStateUpdateHandler = (state: SidebarStatePayload) => void;
+type PairingChangeHandler = () => void;
 type RunStatusHandler = (chatId: string, state: RunState) => void;
 
 /** Structured errors surfaced to the UI.
@@ -238,6 +239,8 @@ export class NanobotClient {
   private runCompletionHandlers = new Set<RunCompletionHandler>();
   private errorHandlers = new Set<ErrorHandler>();
   private taskNoticeHandlers = new Set<(notice: TaskNotice) => void>();
+  private pairingChangeHandlers = new Set<PairingChangeHandler>();
+  private readyHandlers = new Set<() => void>();
   private chatHandlers = new Map<string, Set<EventHandler>>();
   private transcriptHandlers = new Map<string, { handler: EventHandler }>();
   /** Inbound frames received while the transcript owner is absent, regardless of observers. */
@@ -315,6 +318,16 @@ export class NanobotClient {
     return () => {
       this.sessionUpdateHandlers.delete(handler);
     };
+  }
+
+  onPairingChange(handler: PairingChangeHandler): Unsubscribe {
+    this.pairingChangeHandlers.add(handler);
+    return () => { this.pairingChangeHandlers.delete(handler); };
+  }
+
+  onReady(handler: () => void): Unsubscribe {
+    this.readyHandlers.add(handler);
+    return () => { this.readyHandlers.delete(handler); };
   }
 
   onSidebarStateUpdate(handler: SidebarStateUpdateHandler): Unsubscribe {
@@ -753,6 +766,24 @@ export class NanobotClient {
     }
   }
 
+  async sendUserShellCommand(
+    chatId: string, content: string, options?: Parameters<NanobotClient["sendMessage"]>[3],
+  ): Promise<void> {
+    const turnId = options?.turnId ?? crypto.randomUUID();
+    try {
+      await this.receipts.wait(turnId, () => {
+        if (!this.sendMessage(chatId, content, undefined, { ...options, turnId, userShell: true, startsNewRun: false })) {
+          throw new Error("Shell command was not sent; draft retained");
+        }
+      });
+    } catch (error) {
+      this.applyRunEffects(this.runs.transition({ kind: "reject", chatId, turnId }));
+      this.emitError({ kind: "turn_rejected", chatId, turnId, detail: "message_rejected",
+        reason: error instanceof Error ? error.message : "Shell command send failed" });
+      throw error;
+    }
+  }
+
   sendMessage(
     chatId: string,
     content: string,
@@ -763,12 +794,14 @@ export class NanobotClient {
       sessionMentions?: SessionMention[];
       quotedContext?: string;
       intent?: "create_automation";
+      userShell?: boolean;
       workspaceScope?: WorkspaceScopePayload | null;
       turnId?: string;
       /** False for side-channel or injected messages that do not own a lifecycle. */
       startsNewRun?: boolean;
     },
   ): boolean {
+    if (options?.userShell && this.socket?.readyState !== WS_OPEN) return false;
     const temporary = this.temporaryChatIds.has(chatId);
     if (!temporary) this.knownChats.add(chatId);
     const frame: Outbound = {
@@ -783,6 +816,7 @@ export class NanobotClient {
         : {}),
       ...(options?.quotedContext?.trim() ? { quoted_context: options.quotedContext.trim() } : {}),
       ...(options?.intent === "create_automation" ? { intent: options.intent } : {}),
+      ...(options?.userShell ? { user_shell: true } : {}),
       ...(options?.workspaceScope ? { workspace_scope: options.workspaceScope } : {}),
       ...(options?.turnId ? { turn_id: options.turnId } : {}),
       webui: true,
@@ -806,6 +840,7 @@ export class NanobotClient {
         role: options.startsNewRun === false ? "supplement" : "candidate-owner",
       }));
     }
+    if (options?.userShell) return this.rawSend(frame);
     this.queueSend(frame);
     return true;
   }
@@ -966,6 +1001,9 @@ export class NanobotClient {
       this.upload = uploadCapability(parsed.upload);
       this.readyChatId = parsed.chat_id;
       this.knownChats.add(parsed.chat_id);
+      for (const handler of this.readyHandlers) {
+        try { handler(); } catch { /* One listener must not block another ready consumer. */ }
+      }
       return;
     }
 
@@ -984,6 +1022,13 @@ export class NanobotClient {
         this.pendingNewChat = null;
       }
       this.dispatch(parsed.chat_id, parsed);
+      return;
+    }
+
+    if (parsed.event === "pairing_changed") {
+      for (const handler of this.pairingChangeHandlers) {
+        try { handler(); } catch { /* One listener must not block another pairing refresh. */ }
+      }
       return;
     }
 
@@ -1262,8 +1307,8 @@ export class NanobotClient {
     return new TextEncoder().encode(JSON.stringify(frame)).byteLength <= this.maxFrameBytes;
   }
 
-  private rawSend(frame: Outbound): void {
-    if (!this.socket) return;
+  private rawSend(frame: Outbound): boolean {
+    if (!this.socket) return false;
     try {
       this.socket.send(JSON.stringify(frame));
       this.lastSocketMessageSend = null;
@@ -1274,9 +1319,11 @@ export class NanobotClient {
           this.lastSocketMessageSend = ref;
         }
       }
+      return true;
     } catch {
-      // Send failure will materialize as a close; queue the frame for retry.
-      this.sendQueue.push(frame);
+      // Shell commands require a new explicit submission, never reconnect replay.
+      if (frame.type !== "message" || !frame.user_shell) this.sendQueue.push(frame);
+      return false;
     }
   }
 

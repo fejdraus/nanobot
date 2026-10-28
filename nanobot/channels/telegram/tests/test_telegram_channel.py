@@ -797,7 +797,7 @@ async def test_running_message_handler_reorders_same_session_updates() -> None:
     seen: list[int] = []
     processed = asyncio.Event()
 
-    async def fake_process(update, context) -> None:
+    async def fake_process(update) -> None:
         seen.append(update.message.message_id)
         if len(seen) == 2:
             processed.set()
@@ -2465,7 +2465,7 @@ async def test_forward_command_pairs_unauthorized_private_user(monkeypatch) -> N
     )
     _install_ready_app(channel)
     monkeypatch.setattr(
-        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+        "nanobot.channels.base.generate_code", lambda _ch, _sid, *, on_change=None: "ABCD-EFGH"
     )
 
     await channel._forward_command(_make_telegram_update(text="/new", chat_type="private"), None)
@@ -2692,7 +2692,7 @@ async def test_on_start_sends_pairing_code_to_unauthorized_private_user(monkeypa
     update = _make_telegram_update(text="/start", chat_type="private")
     update.message.reply_text = AsyncMock()
     monkeypatch.setattr(
-        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+        "nanobot.channels.base.generate_code", lambda _ch, _sid, *, on_change=None: "ABCD-EFGH"
     )
 
     await channel._on_start(update, None)
@@ -2712,7 +2712,7 @@ async def test_on_help_sends_pairing_code_to_unauthorized_private_user(monkeypat
     update = _make_telegram_update(text="/help", chat_type="private")
     update.message.reply_text = AsyncMock()
     monkeypatch.setattr(
-        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+        "nanobot.channels.base.generate_code", lambda _ch, _sid, *, on_change=None: "ABCD-EFGH"
     )
 
     await channel._on_help(update, None)
@@ -2736,7 +2736,7 @@ async def test_on_message_pairs_unauthorized_private_user_before_side_effects(
     channel._add_reaction = AsyncMock(return_value=None)
     channel._download_message_media = AsyncMock(return_value=([], []))
     monkeypatch.setattr(
-        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+        "nanobot.channels.base.generate_code", lambda _ch, _sid, *, on_change=None: "ABCD-EFGH"
     )
 
     await channel._on_message(_make_telegram_update(text="hello", chat_type="private"), None)

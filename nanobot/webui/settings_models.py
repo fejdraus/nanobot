@@ -41,6 +41,7 @@ from nanobot.providers.oauth_model_catalog import (
     invalidate_oauth_model_catalog,
 )
 from nanobot.providers.registry import (
+    KIMI_K3_MODELS,
     PROVIDERS,
     ProviderModelSpec,
     ProviderSpec,
@@ -177,19 +178,11 @@ def mask_secret_hint(secret: str | None) -> str | None:
 def _resolve_env_placeholders(value: str | None) -> str | None:
     if not value:
         return None
-    missing = False
 
     def replace(match: re.Match[str]) -> str:
-        nonlocal missing
-        env_value = os.environ.get(match.group(1))
-        if env_value is None:
-            missing = True
-            return ""
-        return env_value
+        return os.environ.get(match.group(1), "")
 
     resolved = _ENV_REF_RE.sub(replace, value).strip()
-    if missing and not resolved:
-        return None
     return resolved or None
 
 
@@ -1022,7 +1015,7 @@ def reasoning_effort_values_for(provider_name: str, model: str) -> list[str]:
         return list(_DEFAULT_REASONING_EFFORT_VALUES)
 
     model_lower = (model or "").lower()
-    if model_lower.rsplit("/", 1)[-1] == "kimi-k3":
+    if model_lower.rsplit("/", 1)[-1] in KIMI_K3_MODELS:
         return ["", "low", "high", "max"]
 
     implicit = getattr(spec, "implicit_reasoning_models", ())
@@ -1728,7 +1721,6 @@ def login_oauth_provider(
     *,
     oauth_flows: WebUIOAuthFlowRegistry,
     config_path: Path | None,
-    settings_payload: SettingsPayloadBuilder,
 ) -> dict[str, Any]:
     provider_name = (query_first(query, "provider") or "").strip()
     if not provider_name:

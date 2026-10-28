@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 from loguru import logger
 
 from nanobot.bus.events import INBOUND_META_LOCAL_MEDIA, INBOUND_META_TURN_ID
+from nanobot.command.builtin import USER_SHELL_COMMAND
 from nanobot.runtime_context import public_history_message
 from nanobot.session.automation_turns import is_automation_kind
 from nanobot.session.display_history import (
@@ -389,13 +390,13 @@ def _coerce_page_limit(limit: int | None) -> int:
 
 
 def _transcript_turn_at_ordinal(
-    session_key: str, ordinal: int, *, history: HistoryReader,
+    ordinal: int, *, history: HistoryReader,
 ) -> list[dict[str, Any]] | None:
     return turn_records(history, ordinal) or None
 
 
 def _select_transcript_page(
-    session_key: str, *, history: HistoryReader, limit: int | None,
+    *, history: HistoryReader, limit: int | None,
     before: str | None, after: str | None = None, stats: TranscriptReplayStats | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     stats = stats or TranscriptReplayStats()
@@ -754,6 +755,15 @@ def _is_legacy_raw_subagent_result(message: dict[str, Any]) -> bool:
         and "\n\nTask:" in text
         and "\n\nResult:" in text
         and "Summarize this naturally" in text
+    )
+
+
+def _is_user_shell_command(message: Mapping[str, Any]) -> bool:
+    content = message.get("content")
+    return (
+        message.get("role") == "user" and message.get("_command") is True
+        and isinstance(content, str)
+        and (content == USER_SHELL_COMMAND or content.startswith(f"{USER_SHELL_COMMAND} "))
     )
 
 
@@ -1302,7 +1312,7 @@ def build_webui_trace_detail_response(
         return None
     ordinal = int(match.group("turn"))
     message_id = match.group("message")
-    turn = _transcript_turn_at_ordinal(session_key, ordinal, history=history)
+    turn = _transcript_turn_at_ordinal(ordinal, history=history)
     if turn is None:
         return None
     turn, _ = _compact_completed_stream_deltas(turn, include_projection_receipts=True)
@@ -1453,9 +1463,12 @@ def _client_projection_event(
     if event == "message":
         text = record.get("text")
         content = text if isinstance(text, str) else ""
-        if augment_assistant_text is not None:
+        render_as_text = record.get("render_as") == "text"
+        if not render_as_text and augment_assistant_text is not None:
             content = augment_assistant_text(content)
         projected = {"event": "message", **common, "text": content}
+        if render_as_text:
+            projected["render_as"] = "text"
         kind = record.get("kind")
         if kind in {"tool_hint", "progress", "reasoning"}:
             projected["kind"] = kind
@@ -1762,7 +1775,6 @@ def build_webui_thread_response(
     """Return canonical transcript events for the WebUI projector."""
     replay_stats = stats or TranscriptReplayStats()
     lines, page = _select_transcript_page(
-        session_key,
         history=history,
         limit=limit,
         before=before,
@@ -1796,6 +1808,31 @@ def build_webui_thread_response(
         lines = recovered_lines
     if _needs_incomplete_turn_recovery(lines):
         lines = _recover_incomplete_turns(lines, load_session_turns())
+    bang_inputs = {
+        record.get("turn_id") for record in lines
+        if record.get("event") == "user" and isinstance(text := record.get("text"), str)
+        and text.startswith("!")
+    }
+    legacy_shell_candidates = {
+        record.get("turn_id") for record in lines
+        if record.get("event") == "message" and record.get("kind") is None
+        and record.get("render_as") != "text" and record.get("turn_id") in bang_inputs
+        and isinstance(record.get("turn_id"), str)
+    }
+    if legacy_shell_candidates:
+        if session_messages is None and session_messages_loader is not None:
+            session_messages = session_messages_loader()
+        shell_turns = {
+            message.get(INBOUND_META_TURN_ID) for message in session_messages or []
+            if _is_user_shell_command(message)
+            and message.get(INBOUND_META_TURN_ID) in legacy_shell_candidates
+        }
+        lines = [
+            {**record, "render_as": "text"}
+            if record.get("event") == "message" and record.get("kind") is None
+            and record.get("turn_id") in shell_turns else record
+            for record in lines
+        ]
     lines = _ensure_replay_identities(lines)
     payload: dict[str, Any] = {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
@@ -1919,7 +1956,6 @@ def _history_prompt_summaries(history: HistoryReader) -> _ChunkPromptView:
 
 
 def _build_prompt_view(
-    session_key: str,
     *,
     history: HistoryReader,
     session_turns_loader: Callable[[], list[_SessionBackfillTurn]] | None = None,
@@ -2009,7 +2045,7 @@ def _prompt_view_snapshot(
             if cached is not None and (not cached.needs_canonical or session_version_loader is not None):
                 _PROMPT_SNAPSHOTS.move_to_end(cache_key)
                 return cached, revision
-    view = _build_prompt_view(session_key, history=history, session_turns_loader=session_turns_loader)
+    view = _build_prompt_view(history=history, session_turns_loader=session_turns_loader)
     # A caller supplying only messages cannot validate canonical changes, so a
     # recovered view needs a version loader before it can be reused.
     if (view.needs_canonical and session_version_loader is None) or revision != read_revision():

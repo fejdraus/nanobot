@@ -210,6 +210,12 @@ class ProviderSpec:
 # PROVIDERS — the registry. Order = priority. Copy any entry as template.
 # ---------------------------------------------------------------------------
 
+KIMI_K3_MODELS: frozenset[str] = frozenset({
+    "kimi-k3",
+    "kimi-k3.1-pro",
+    "kimi-k3.1-pro-highspeed",
+})
+
 _DEEPSEEK_REASONING_EFFORTS = ("none", "low", "high", "max")
 
 PROVIDERS: tuple[ProviderSpec, ...] = (
