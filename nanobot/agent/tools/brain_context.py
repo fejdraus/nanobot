@@ -37,7 +37,7 @@ from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import RequestContext
 from nanobot.runtime_context import RuntimeContextBlock, RuntimeContextProvider
 
-_DEFAULT_CLI_DIR = "/home/dietpi/clawd/brain"
+_DEFAULT_CLI_DIR = "/home/dietpi/brain"
 _RECALL_TIMEOUT_S = 8.0
 _MIN_QUERY_LEN = 4
 _MAX_CONTEXT_LINES = 24
