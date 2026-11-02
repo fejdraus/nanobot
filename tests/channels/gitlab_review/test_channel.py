@@ -430,6 +430,27 @@ async def test_replies_in_several_threads_are_checked_in_one_run(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_a_thread_deleted_before_the_check_is_skipped_and_the_rest_is_checked(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        h.gitlab.discussions["d1"] = [_note("a.tyra", "q1"), _note("author", "answer one")]
+        h.gitlab.discussions["d3"] = [dict(_note("a.tyra", "q3"), resolvable=True, resolved=False)]
+        found = h.gitlab.get_discussion
+
+        async def get_discussion(iid: int, discussion_id: str) -> dict[str, Any]:
+            if discussion_id == "gone":
+                raise GitLabApiError("GitLab 404 Not Found: 404 Discussion Not Found", status=404)
+            return await found(iid, discussion_id)
+        h.gitlab.get_discussion = get_discussion  # type: ignore[method-assign]
+        h.channel._answered_threads[42] = ["gone"]
+        task = asyncio.create_task(h.channel.process(ReviewCandidate(kind="note", iid=42, discussion_id="d1")))
+        await _until(lambda: len(h.inbound) == 1)
+        assert "answer one" in h.inbound[0].content
+        await h.reply_as_agent("gitlab-review:42", _answer("Проверил", []))
+        await task
+    assert "Ревью не выполнено" not in h.telegram.text()
+
+
+@pytest.mark.asyncio
 async def test_hourly_limit_postpones_the_run_and_says_so_once(tmp_path: Path) -> None:
     async with Harness(tmp_path, max_runs_per_mr_per_hour=1) as h:
         await h.channel.process(ReviewCandidate(kind="merge_request", iid=42))

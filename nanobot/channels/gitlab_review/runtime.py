@@ -960,7 +960,13 @@ class GitLabReviewChannel(BaseChannel):
                 threads.append(candidate.discussion_id)
             answers: list[tuple[str, str | None, str]] = []
             for discussion_id in threads:
-                discussion = await self._gitlab.get_discussion(info.iid, discussion_id)
+                try:
+                    discussion = await self._gitlab.get_discussion(info.iid, discussion_id)
+                except GitLabApiError as exc:
+                    if exc.status != 404:
+                        raise
+                    self.logger.info("MR !{}: thread {} was deleted before the check", info.iid, discussion_id)
+                    continue
                 notes = discussion.get("notes")
                 decision = triage_thread(
                     cast("list[dict[str, Any]]", notes if isinstance(notes, list) else []),
