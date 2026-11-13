@@ -1,5 +1,3 @@
-"""Pairing protocol, restricted authorization and local API regression tests."""
-
 import json
 import os
 import shutil
@@ -182,7 +180,6 @@ def test_paired_transport_cannot_fall_back_to_generic_probe_or_forwarding(pair, 
 
 @pytest.mark.parametrize("command", ["echo MUST-NOT-EXECUTE", "nanobot-remote-bridge-v2"])
 def test_fixed_bridge_streams_only_to_baked_in_loopback_port(tmp_path, command):
-    # Real bidirectional bytes, no SSH_ORIGINAL_COMMAND interpolation.
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -228,7 +225,7 @@ def test_guarded_bridge_rejects_new_channels_without_connecting(tmp_path, reason
     result = subprocess.run([sys.executable, "-I", "-S", str(bridge)], capture_output=True, timeout=5,
                             env={**os.environ, "SSH_ORIGINAL_COMMAND": "nanobot-remote-bridge-v2"})
     assert result.returncode == 1
-    assert not result.stdout  # No reuse capability or connection to the target.
+    assert not result.stdout
     assert b"Permission denied" in result.stderr
 
 
@@ -298,10 +295,10 @@ async def test_repeated_pairing_groups_one_instance_without_deleting_authorizati
     code = seal(second, renewed)
     preview = await manager.action("pair_preview", {"id": second.id, "code": code})
     assert preview["existing_connection"] == {"id": first.id, "name": "My team", "connected": False}
-    assert len(manager.snapshot()["profiles"]) == 1  # Preview never saves or deletes.
+    assert len(manager.snapshot()["profiles"]) == 1
     result = await manager.action("pair_finish", {"id": second.id, "code": code})
     assert result["id"] == second.id
-    assert len(result["profiles"]) == 2  # Grants remain separately manageable.
+    assert len(result["profiles"]) == 2
     assert {item["instance_id"] for item in result["profiles"]} == {first.id}
     assert {item["name"] for item in result["profiles"]} == {"My team"}
     assert manager.pairing.path(first.id).joinpath("identity").read_bytes() == before
@@ -349,7 +346,7 @@ async def test_rename_paired_instance_updates_only_verified_sibling_grants(tmp_p
     before = manager._read()
     receipts = {item.id: manager.pairing.path(item.id).joinpath("receipt").read_bytes() for item in requests}
     live = SimpleNamespace(tunnel=SimpleNamespace(active=True), error="", gateway_id="live-session",
-                           proxy=SimpleNamespace(pause=AsyncMock()))
+                           health_check=None, health_checked_at=0, proxy=SimpleNamespace(pause=AsyncMock()))
     manager.connections[first.id] = live
     result = await manager.action("rename", {"id": requests[1].id, "name": "My cloud"})
     assert [p["name"] for p in result["profiles"]] == ["My cloud", "My cloud", original.hostname]
@@ -372,7 +369,7 @@ async def test_repair_retains_route_and_reuses_only_a_healthy_existing_connectio
     profiles[first.id].local_port = 23456
     manager._write(profiles)
     live = SimpleNamespace(tunnel=SimpleNamespace(active=True), error="", gateway_id="live-session",
-                           proxy=SimpleNamespace(pause=AsyncMock()))
+                           health_check=None, health_checked_at=0, proxy=SimpleNamespace(pause=AsyncMock()))
     manager.connections[first.id] = live
 
     async def check(connection):
@@ -511,7 +508,6 @@ def test_expired_device_cannot_connect(pair, monkeypatch):
     monkeypatch.setattr(remote_pairing.time, "time", lambda: value.authorized_until + 1)
     with pytest.raises(RemoteError, match="pair_authorization_expired"):
         store.connection(request.id)
-    # The UI can explain expiry without opening a path around connection().
     assert store.authorization_until(request.id) == value.authorized_until
 
 

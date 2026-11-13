@@ -1,5 +1,3 @@
-"""Foreground gateway runtime and lifecycle helpers."""
-
 import asyncio
 import signal
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
@@ -46,19 +44,15 @@ from nanobot.config.schema import Config
 from nanobot.gateway.runtime import GatewayHealthIdentity, GatewayInstance, GatewayRuntime
 from nanobot.installation_lock import installation_access
 from nanobot.security.network import is_loopback_host
-from nanobot.session.keys import (
-    HEARTBEAT_SESSION_KEY,
-    UNIFIED_SESSION_KEY,
-    last_channel_from_metadata,
-    session_key_for_channel,
-)
+from nanobot.session.keys import HEARTBEAT_SESSION_KEY
 from nanobot.session.manager import SessionManager
 from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.token_encoding import warmup_token_encoding
 from nanobot.webui.build import BuildMode
+from nanobot.webui.context_source_hook import create_context_source_hook
 from nanobot.webui.dev import WebUIDevError, WebUIDevServer
-from nanobot.webui.sidebar_state import read_webui_sidebar_state
+from nanobot.webui.sidebar_state import ensure_webui_session_archives
 
 if TYPE_CHECKING:
     from nanobot.update_profiles import ProfileReceipt
@@ -74,12 +68,10 @@ async def _deliver_to_channel(
     *,
     bus: MessageBus,
     session_manager: SessionManager,
-    unified_session: bool = False,
     record: bool = False,
     session_key: str | None = None,
     session_generation: str | None = None,
 ) -> None:
-    """Publish a user-visible message and mirror it into its admitted session."""
     metadata = dict(msg.metadata or {})
     record = record or bool(metadata.pop("_record_channel_delivery", False))
     raw_key = metadata.pop("_session_key", None)
@@ -91,9 +83,7 @@ async def _deliver_to_channel(
     )
     key = session_key or (raw_key if isinstance(raw_key, str) else None)
     if key is None:
-        key = session_key_for_channel(
-            msg.channel, msg.chat_id, unified_session=unified_session,
-        )
+        key = f"{msg.channel}:{msg.chat_id}"
     if msg.channel == "websocket":
         from nanobot.agent.turn_delivery import TurnRoute
         from nanobot.session.display_history import HISTORY_GENERATION_METADATA_KEY
@@ -135,7 +125,6 @@ class _MCPReadinessHook(AgentHook):
 
 
 def _http_endpoint_responding(url: str, *, timeout_s: float = 0.25) -> bool:
-    """Return whether an HTTP endpoint responds, including with an auth error."""
     import urllib.error
     import urllib.request
 
@@ -154,7 +143,6 @@ async def _watch_webui_dev_server(
     *,
     poll_interval_s: float = 0.2,
 ) -> None:
-    """Fail the foreground gateway when its owned Vite sidecar exits."""
     while not shutdown_event.is_set():
         await asyncio.sleep(poll_interval_s)
         if shutdown_event.is_set():
@@ -174,7 +162,6 @@ def _install_gateway_shutdown_handlers(
     tasks: list[asyncio.Task[Any]],
     print_status: Callable[[str], None],
 ) -> Callable[[], None]:
-    """Install foreground gateway signal handlers and return a restore callback."""
     loop_signals: list[int] = []
     previous_handlers: list[tuple[int, Any]] = []
     shutdown_requested = False
@@ -229,7 +216,6 @@ def _advance_dream_cursor_if_behind(memory: Any) -> None:
 
 
 def _commit_dream_changes(memory: Any) -> str | None:
-    """Commit durable Dream edits, without entering the commit path for a no-op run."""
     if not memory.git.is_initialized():
         return None
     diff_body = memory.dream_content_diff()
@@ -252,7 +238,6 @@ _HEARTBEAT_PREAMBLE = (
 
 
 def _heartbeat_has_active_tasks(content: str) -> bool:
-    """True if HEARTBEAT.md has task lines, ignoring headers, blanks and comments."""
     in_comment = False
     in_active_section: bool = False
     for line in content.splitlines():
@@ -281,20 +266,12 @@ def _pick_heartbeat_target_from_sessions(
     enabled_channels: Iterable[str],
     sessions: Iterable[dict[str, Any]],
     archived_keys: Iterable[str],
-    unified_session_metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     enabled = set(enabled_channels)
     archived = set(archived_keys)
     for item in sessions:
         key = item.get("key") or ""
         if key in archived:
-            continue
-        if key == UNIFIED_SESSION_KEY:
-            route = last_channel_from_metadata(unified_session_metadata)
-            if route is not None:
-                channel, chat_id = route
-                if channel not in {"cli", "system"} and channel in enabled:
-                    return channel, chat_id
             continue
         if ":" not in key:
             continue
@@ -311,7 +288,6 @@ _GATEWAY_HEALTH_READ_TIMEOUT_SECONDS = 2.0
 
 
 def _print_gateway_health_endpoint(host: str, port: int) -> None:
-    """Print a usable health URL and make non-loopback binds explicit."""
     console.print(
         f"[green]✓[/green] Health endpoint: {_gateway_health_url(host, port)}"
         f"{_gateway_health_bind_note(host)}"
@@ -327,7 +303,6 @@ def _print_gateway_health_endpoint(host: str, port: int) -> None:
 
 
 def _gateway_readiness_payload(channels: Any) -> tuple[bool, dict[str, object]]:
-    """Describe process liveness separately from required WebSocket readiness."""
     channel_status: dict[str, Any] = {}
     get_status = getattr(channels, "get_status", None)
     if callable(get_status):
@@ -433,7 +408,6 @@ def _run_gateway(
     gateway_instance: GatewayInstance | None = None,
     update_startup: "GatewayStartup | None" = None,
 ) -> None:
-    """Claim the installation and profile before initializing any runtime writers."""
     from nanobot.config.loader import get_config_path
     from nanobot.update_profiles import record_gateway_profile
 
@@ -485,7 +459,6 @@ def _run_claimed_gateway(
     update_startup: "GatewayStartup | None" = None,
     update_profile: "ProfileReceipt | None" = None,
 ) -> None:
-    """Initialize and run only while the caller holds the gateway lifecycle claim."""
     from nanobot.agent.model_presets import load_model_preset_catalog
     from nanobot.agent.tools.message import MessageTool
     from nanobot.agent.turn_delivery import TurnDeliveryFactory
@@ -584,7 +557,6 @@ def _run_claimed_gateway(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path, admission=bus.admission)
     trigger_store = LocalTriggerStore(config.workspace_path)
@@ -603,10 +575,10 @@ def _run_claimed_gateway(
     recovery = RecoveryCoordinator(
         sessions=session_manager,
         bus=bus,
-        unified_session=config.agents.defaults.unified_session,
     )
 
-    # Create agent with cron service
+    from nanobot.goal.assembly import install_goal
+
     agent = AgentLoop.from_config(
         config, bus,
         provider=provider_snapshot.provider,
@@ -620,10 +592,12 @@ def _run_claimed_gateway(
         provider_signature=provider_snapshot.signature,
         local_trigger_store=trigger_store,
         hooks=[_MCPReadinessHook(mcp_provider)],
-        hook_factories=[create_file_edit_activity_hook],
+        hook_factories=[create_file_edit_activity_hook, create_context_source_hook],
         tool_registry=tools,
         recovery_admission=recovery,
+        builtin_assembly=install_goal,
     )
+
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
         agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))
 
@@ -633,27 +607,17 @@ def _run_claimed_gateway(
         schedule_background=_schedule_webui_background,
         recovery=recovery,
     )
-    def _channel_session_key(channel: str, chat_id: str) -> str:
-        return session_key_for_channel(
-            channel,
-            chat_id,
-            unified_session=config.agents.defaults.unified_session,
-        )
-
     deliver_to_channel = partial(
         _deliver_to_channel,
         bus=bus,
         session_manager=session_manager,
-        unified_session=config.agents.defaults.unified_session,
     )
 
     message_tool = agent.tools.get("message")
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(deliver_to_channel)
 
-    # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | CronRunResult | None:
-        """Execute a cron job through the agent."""
         async def _silent(*_args: Any, **_kwargs: Any) -> None:
             pass
 
@@ -719,7 +683,6 @@ def _run_claimed_gateway(
                 await agent.sessions.state.prune_dream_sessions()
             return None
 
-        # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
         if job.name == "heartbeat":
             heartbeat_file = config.workspace_path / "HEARTBEAT.md"
             try:
@@ -734,7 +697,7 @@ def _run_claimed_gateway(
             channel, chat_id = await _pick_heartbeat_target()
             if channel == "cli":
                 return None
-            delivery_key = _channel_session_key(channel, chat_id)
+            delivery_key = f"{channel}:{chat_id}"
             delivery_session = await session_manager.state.read(delivery_key)
             if delivery_session is None:
                 return None
@@ -825,8 +788,6 @@ def _run_claimed_gateway(
             registry=tools,
         )
 
-    # Create channel manager (forwards SessionManager so the WebSocket channel
-    # can serve the embedded webui's REST surface).
     channels = ChannelManager(
         config,
         bus,
@@ -851,18 +812,11 @@ def _run_claimed_gateway(
     )
 
     async def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
-        sidebar_state = await asyncio.to_thread(read_webui_sidebar_state)
-        unified_metadata = None
-        if config.agents.defaults.unified_session:
-            record = await session_manager.state.read_metadata(UNIFIED_SESSION_KEY)
-            if isinstance(record, dict) and isinstance(record.get("metadata"), dict):
-                unified_metadata = record["metadata"]
+        archived_keys = await ensure_webui_session_archives(session_manager.state)
         return _pick_heartbeat_target_from_sessions(
             enabled_channels=channels.enabled_channels,
             sessions=await session_manager.state.list_sessions(),
-            archived_keys=sidebar_state.get("archived_keys", []),
-            unified_session_metadata=unified_metadata,
+            archived_keys=archived_keys,
         )
 
     if channels.enabled_channels:
@@ -877,7 +831,6 @@ def _run_claimed_gateway(
         console.print("[yellow]✗[/yellow] Heartbeat: disabled")
 
     async def _health_server(host: str, health_port: int) -> None:
-        """Lightweight HTTP health endpoint on the gateway port."""
         import json as _json
 
         connection_slots = asyncio.Semaphore(_GATEWAY_HEALTH_MAX_CONNECTIONS)
@@ -934,7 +887,6 @@ def _run_claimed_gateway(
         _print_gateway_health_endpoint(host, health_port)
         async with server:
             await server.serve_forever()
-    # Register Dream system job (idempotent on restart)
     from nanobot.cron.types import CronJob, CronPayload, CronSchedule
     dream_cfg = config.agents.defaults.dream
     if dream_cfg.enabled:
@@ -951,7 +903,6 @@ def _run_claimed_gateway(
         _advance_dream_cursor_if_behind(agent.context.memory)
         cron.remove_system_job("dream")
 
-    # Register Heartbeat system job (idempotent on restart)
     if hb_cfg.enabled:
         cron.register_system_job(CronJob(
             id="heartbeat",
@@ -972,7 +923,6 @@ def _run_claimed_gateway(
         console.print(f"[green]✓[/green] Cron: {cron_job_count} scheduled jobs")
 
     async def _open_browser_when_ready() -> None:
-        """Wait for the gateway to bind, then point the user's browser at the webui."""
         if not open_browser_url:
             return
         from urllib.parse import urlparse
@@ -981,7 +931,7 @@ def _run_claimed_gateway(
         # readiness route, wait for an actual HTTP response rather than probing
         # the WebSocket listener with an incomplete TCP connection.
         if open_browser_ready_url:
-            for _ in range(40):  # ~4s max per listener
+            for _ in range(40):
                 if await asyncio.to_thread(
                     _http_endpoint_responding,
                     open_browser_ready_url,
@@ -992,7 +942,7 @@ def _run_claimed_gateway(
         parsed = urlparse(open_browser_url)
         target_host = parsed.hostname or config.gateway.host or "127.0.0.1"
         target_port = parsed.port or port
-        for _ in range(40):  # ~4s max
+        for _ in range(40):
             try:
                 _reader, writer = await asyncio.open_connection(
                     target_host,
@@ -1019,7 +969,6 @@ def _run_claimed_gateway(
         tasks: list[asyncio.Task[Any]] = []
         shutdown_task: asyncio.Task[Any] | None = None
         runtime_tasks: asyncio.Future[list[Any]] | None = None
-        startup_complete = False
         shutdown_event = asyncio.Event()
         cli_terminal._ensure_interactive_tty_mode()
         restore_shutdown_handlers = _install_gateway_shutdown_handlers(
@@ -1123,7 +1072,6 @@ def _run_claimed_gateway(
                     name="nanobot-webui-dev-server",
                 ))
             runtime_tasks = asyncio.gather(*tasks)
-            startup_complete = True
             shutdown_task = asyncio.create_task(
                 shutdown_event.wait(),
                 name="nanobot-gateway-shutdown",
@@ -1145,10 +1093,7 @@ def _run_claimed_gateway(
 
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
-            if not startup_complete:
-                # Do not report a successful gateway command when startup
-                # failed before any runtime task or listener was created.
-                raise typer.Exit(1)
+            raise typer.Exit(1)
         finally:
             try:
                 if shutdown_task and not shutdown_task.done():

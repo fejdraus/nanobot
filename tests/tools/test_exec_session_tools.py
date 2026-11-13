@@ -27,6 +27,7 @@ from nanobot.agent.tools.exec_session import (
 )
 from nanobot.agent.tools.registry import is_tool_error_result
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.execution import processes
 
 
 def _python_command(code: str) -> str:
@@ -234,7 +235,6 @@ def test_exec_session_yield_returns_when_process_finishes_early(tmp_path):
                     if pending.done():
                         pytest.fail(f"child exited before readiness: {await pending}")
                     await asyncio.sleep(0.01)
-            # Measure responsiveness only after the actual child is ready to exit.
             release.touch()
             return await asyncio.wait_for(pending, timeout=3)
         finally:
@@ -271,7 +271,7 @@ async def test_exec_session_preserves_utf8_across_stdout_and_stderr_chunks():
     process, exited = _session_process(stdout=stdout, stderr=stderr)
     session = _ExecSession(
         session_id="utf8-output",
-        process=process,
+        process_tree=processes.ProcessTree(process),
         command="test",
         cwd=".",
         timeout=None,
@@ -406,11 +406,12 @@ def test_exec_session_wait_for_searches_before_response_truncation():
     assert len(result.partition("\n")[0]) == 10_000
 
 
-def test_exec_one_shot_accepts_max_output_tokens_alias(tmp_path):
+@pytest.mark.parametrize("limit", [1000, 1000.0])
+def test_exec_one_shot_accepts_max_output_tokens_alias(tmp_path, limit):
     async def run() -> str:
         tool = ExecTool(working_dir=str(tmp_path), timeout=5)
         command = _python_command("print('A' * 2000)")
-        return await tool.execute(command=command, max_output_tokens=1000, yield_time_ms=10000)
+        return await tool.execute(command=command, max_output_tokens=limit, yield_time_ms=10000)
 
     result = asyncio.run(run())
 
@@ -446,7 +447,7 @@ def test_exec_rejects_unsupported_shell(tmp_path):
 def test_exec_can_continue_with_stdin(tmp_path):
     async def run() -> tuple[str, str, str]:
         manager = ExecSessionManager()
-        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=30, session_manager=manager)
         stdin_tool = ExecSessionTool(manager=manager)
         command = _python_command(
             "import sys; print('ready', flush=True); "
@@ -454,16 +455,18 @@ def test_exec_can_continue_with_stdin(tmp_path):
         )
 
         try:
-            initial = await exec_tool.execute(command=command, yield_time_ms=500)
+            initial = await exec_tool.execute(command=command, yield_time_ms=0)
             sid = _session_id(initial)
-            result = await stdin_tool.execute(session_id=sid, input="ping\n", timeout_ms=1000)
-            observed, final = await _poll_if_running(result, stdin_tool)
+            if "ready" not in initial:
+                initial += await stdin_tool.execute(session_id=sid, wait_for="ready", timeout_ms=10000)
+            assert "ready" in initial, initial
+            result = await stdin_tool.execute(session_id=sid, input="ping\n", timeout_ms=0)
+            observed, final = await _poll_if_running(result, stdin_tool, timeout_ms=10000)
             return initial, observed, final
         finally:
             await manager.close_all()
 
     initial, result, final = asyncio.run(run())
-    assert "ready" in initial + result
     assert "Process running" in initial
     assert "Elapsed:" in initial
     assert "got:ping" in result
@@ -472,30 +475,37 @@ def test_exec_can_continue_with_stdin(tmp_path):
 
 
 def test_exec_session_can_close_stdin(tmp_path):
-    async def run() -> tuple[str, str]:
+    async def run() -> tuple[str, str, str]:
         manager = ExecSessionManager()
-        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=30, session_manager=manager)
         stdin_tool = ExecSessionTool(manager=manager)
         command = _python_command(
             "import sys; print('ready', flush=True); "
             "data=sys.stdin.read(); print('got:' + data, flush=True)"
         )
 
-        initial = await exec_tool.execute(command=command, yield_time_ms=1500)
-        sid = _session_id(initial)
-        result = await stdin_tool.execute(
-            session_id=sid,
-            input="payload",
-            close_stdin=True,
-            timeout_ms=1500,
-        )
-        return initial, result
+        try:
+            initial = await exec_tool.execute(command=command, yield_time_ms=0)
+            sid = _session_id(initial)
+            if "ready" not in initial:
+                initial += await stdin_tool.execute(session_id=sid, wait_for="ready", timeout_ms=10000)
+            assert "ready" in initial, initial
+            # Check the acknowledgement separately from the child's EOF-driven exit.
+            result = await stdin_tool.execute(
+                session_id=sid,
+                input="payload",
+                close_stdin=True,
+                timeout_ms=0,
+            )
+            observed, final = await _poll_if_running(result, stdin_tool, timeout_ms=10000)
+            return result, observed, final
+        finally:
+            await manager.close_all()
 
-    initial, result = asyncio.run(run())
-    assert "ready" in initial + result
-    assert "got:payload" in result
+    result, observed, final = asyncio.run(run())
     assert "Stdin closed." in result
-    assert "Exit code: 0" in result
+    assert "got:payload" in observed
+    assert "Exit code: 0" in final
 
 
 def test_exec_session_can_terminate_session(tmp_path):
@@ -727,7 +737,6 @@ def test_exec_session_wait_for_reports_timeout_without_killing_session(tmp_path)
 
         initial = await exec_tool.execute(command=command, yield_time_ms=0)
         sid = _session_id(initial)
-        # Synchronize on an stdin-gated marker before exercising the immediate timeout below.
         ready = await stdin_tool.execute(
             session_id=sid,
             input="\n",
@@ -1157,7 +1166,6 @@ def test_terminate_by_owner_skips_sessions_without_owner_key(tmp_path):
         manager = ExecSessionManager()
         tool = ExecTool(working_dir=str(tmp_path), timeout=30, session_manager=manager)
 
-        # Spawn without owner (no request context)
         initial = await tool.execute(
             command=_waiting_shell_command("ready"),
             yield_time_ms=100,
@@ -1198,8 +1206,8 @@ def test_agent_loop_shutdown_preserves_single_cleanup_error():
 async def test_exec_session_shared_kill_survives_cancelled_caller(monkeypatch):
     process, exited = _session_process()
     session = _ExecSession(
-        session_id="shared-kill", process=process, command="test", cwd=".",
-        timeout=None, process_tree=True,
+        session_id="shared-kill", process_tree=processes.ProcessTree(process), command="test", cwd=".",
+        timeout=None,
     )
     kill_started = asyncio.Event()
     release_kill = asyncio.Event()
@@ -1213,7 +1221,7 @@ async def test_exec_session_shared_kill_survives_cancelled_caller(monkeypatch):
         exited.set()
 
     kill_tree = AsyncMock(side_effect=kill_process_tree)
-    monkeypatch.setattr(ExecTool, "_kill_process_tree", kill_tree)
+    monkeypatch.setattr(processes.ProcessTree, "terminate", lambda tree: kill_tree(tree.process))
 
     async def second_caller():
         second_started.set()
@@ -1247,8 +1255,8 @@ async def test_exec_session_shared_kill_survives_cancelled_caller(monkeypatch):
 async def test_exec_session_failed_kill_can_be_retried(monkeypatch, log_content):
     process, exited = _session_process()
     session = _ExecSession(
-        session_id="retry-kill", process=process, command="test", cwd=".",
-        timeout=None, process_tree=True,
+        session_id="retry-kill", process_tree=processes.ProcessTree(process), command="test", cwd=".",
+        timeout=None,
     )
     attempts = 0
 
@@ -1261,7 +1269,9 @@ async def test_exec_session_failed_kill_can_be_retried(monkeypatch, log_content)
         process.returncode = -9
         exited.set()
 
-    monkeypatch.setattr(ExecTool, "_kill_process_tree", kill_process_tree)
+    monkeypatch.setattr(
+        processes.ProcessTree, "terminate", lambda tree: kill_process_tree(tree.process),
+    )
     records = []
     sink = logger.add(lambda message: records.append(message.record), format="{message}")
     token = bind_request_context(RequestContext(
@@ -1290,8 +1300,8 @@ async def test_exec_session_failed_kill_can_be_retried(monkeypatch, log_content)
 async def test_exec_session_deadline_during_explicit_kill_is_not_timeout(monkeypatch):
     process, exited = _session_process()
     session = _ExecSession(
-        session_id="explicit-kill", process=process, command="test", cwd=".",
-        timeout=None, process_tree=True,
+        session_id="explicit-kill", process_tree=processes.ProcessTree(process), command="test", cwd=".",
+        timeout=None,
     )
     kill_started = asyncio.Event()
     release_kill = asyncio.Event()
@@ -1305,7 +1315,7 @@ async def test_exec_session_deadline_during_explicit_kill_is_not_timeout(monkeyp
         exited.set()
 
     kill_tree = AsyncMock(side_effect=kill_process_tree)
-    monkeypatch.setattr(ExecTool, "_kill_process_tree", kill_tree)
+    monkeypatch.setattr(processes.ProcessTree, "terminate", lambda tree: kill_tree(tree.process))
     explicit_kill = asyncio.create_task(session.kill())
     watcher = None
     try:

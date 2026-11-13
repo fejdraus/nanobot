@@ -6,11 +6,10 @@ import { NanobotClient } from "@/lib/nanobot-client";
 import { ThreadMessageCache } from "@/lib/thread-message-cache";
 import { ClientProvider } from "@/providers/ClientProvider";
 
-// The browser spec controls HTTP and WebSocket frames; all projection and caching
-// run through the real client and thread, without model calls or saved user data.
 export function AnswerOrderFixture() {
   const [client] = useState(() => new NanobotClient({
-    url: `ws://${location.host}/answer-order-socket`, reconnect: false,
+    url: `ws://${location.host}/answer-order-socket`,
+    reconnect: new URLSearchParams(location.search).get("reconnect") === "1",
   }));
   const [cache] = useState(() => new ThreadMessageCache(() => false));
   const [chatId, setChatId] = useState("answer-order");

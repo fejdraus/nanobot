@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, NotRequired, TypedDi
 import httpx
 
 from nanobot.config.loader import resolve_config_env_vars
-from nanobot.config.provider_api_migration import migrate_legacy_provider_api
 from nanobot.config.schema import (
     Config,
     FallbackCandidate,
@@ -131,7 +130,14 @@ _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PROVIDER_STRUCTURED_FIELDS = ("extra_headers", "extra_body", "extra_query")
 
 
-def _provider_config_updates(query: QueryParams) -> dict[str, Any]:
+def _provider_config_updates(
+    query: QueryParams, *, ignore_retired_api_type: bool = False,
+) -> dict[str, Any]:
+    if not ignore_retired_api_type and query_has_alias(query, "api_type", "apiType"):
+        raise WebUISettingsError(
+            "This client sent the retired apiType setting. Update the client or use the WebUI "
+            "served by the gateway to save the provider settings."
+        )
     updates: dict[str, Any] = {}
     string_fields = (
         ("api_key", "apiKey"),
@@ -161,9 +167,6 @@ def _provider_config_updates(query: QueryParams) -> dict[str, Any]:
             updates["api"] = json.loads(query_first(query, "api") or "null")
         except ValueError as exc:
             raise WebUISettingsError("api must declare supportedApis and a preferredApi from that list") from exc
-    # Temporary input compatibility for older clients during the two-release window.
-    if query_has_alias(query, "api_type", "apiType"):
-        updates["api_type"] = query_first_alias(query, "api_type", "apiType") or "auto"
     return updates
 
 
@@ -407,7 +410,6 @@ def _provider_settings_rows(
     selected_provider: str | None,
     oauth_status: OAuthStatusReader,
 ) -> list[dict[str, Any]]:
-    """Return one Settings row per provider family while preserving legacy configs."""
     aliases: dict[str, list[Any]] = {}
     for spec in PROVIDERS:
         if spec.settings_alias_for:
@@ -525,7 +527,6 @@ def _model_shutdown_date(row: object) -> date | None:
 
 
 def _model_catalog_row_active(row: object, *, on: date | None = None) -> bool:
-    """True when a provider catalog row should stay in the advisory model list."""
     shutdown = _model_shutdown_date(row)
     if shutdown is None:
         return True
@@ -828,7 +829,6 @@ def _model_configuration_slug(label: str) -> str:
 
 
 def _model_configuration_name(value: str) -> str:
-    """Validate a user-facing preset name without inventing a second identity."""
     name = value.strip()
     if not name:
         raise WebUISettingsError("configuration name is required")
@@ -855,7 +855,6 @@ def _model_configuration_name_exists(
 
 
 def _rename_model_configuration(config: Config, old_name: str, new_name: str) -> bool:
-    """Rename one preset and every config reference to it."""
     if old_name == new_name:
         return False
     if _model_configuration_name_exists(config, new_name, exclude=old_name):
@@ -916,7 +915,6 @@ def _provider_display_name_exists(
 
 
 def _unique_model_configuration_name(config: Config, label: str) -> str:
-    """Return a stable, unused preset name for a migrated model configuration."""
     try:
         base = _model_configuration_slug(label)
     except WebUISettingsError:
@@ -1106,6 +1104,7 @@ def model_settings_payload(
             "max_tokens": defaults.max_tokens,
             "context_window_tokens": defaults.context_window_tokens,
             "temperature": defaults.temperature,
+            "supports_images": defaults.supports_images,
             "reasoning_effort": defaults.reasoning_effort,
             "api": defaults.api.model_dump(mode="json") if defaults.api is not None else None,
             "reasoning_effort_values": reasoning_effort_values_for(
@@ -1134,6 +1133,7 @@ def model_settings_payload(
                 "max_tokens": preset.max_tokens,
                 "context_window_tokens": preset.context_window_tokens,
                 "temperature": preset.temperature,
+                "supports_images": preset.supports_images,
                 "reasoning_effort": preset.reasoning_effort,
                 "api": preset.api.model_dump(mode="json") if preset.api is not None else None,
                 **{
@@ -1160,6 +1160,7 @@ def model_settings_payload(
             "max_tokens": effective_preset.max_tokens,
             "context_window_tokens": effective_preset.context_window_tokens,
             "temperature": effective_preset.temperature,
+            "supports_images": effective_preset.supports_images,
             "reasoning_effort": effective_preset.reasoning_effort,
             "api": (
                 effective_preset.api.model_dump(mode="json")
@@ -1351,6 +1352,9 @@ def create_model_configuration(
         ),
         temperature=temperature if temperature is not None else base.temperature,
         reasoning_effort=reasoning_effort,
+        supports_images=parse_bool(
+            query_first_alias(query, "supports_images", "supportsImages") or "true", "supports_images",
+        ),
         api=_parse_preset_api(config, model, provider, query_first(query, "api")),
     )
     config.model_presets[name] = _preset_with_request_updates(config, candidate, query)
@@ -1440,6 +1444,13 @@ def update_model_configuration(
         if preset.reasoning_effort != reasoning_effort:
             preset.reasoning_effort = reasoning_effort
             changed = True
+    if "supports_images" in query or "supportsImages" in query:
+        supports_images = parse_bool(
+            query_first_alias(query, "supports_images", "supportsImages") or "", "supports_images",
+        )
+        if preset.supports_images != supports_images:
+            preset.supports_images = supports_images
+            changed = True
     if "api" in query:
         api = _parse_preset_api(config, preset.model, preset.provider, query_first(query, "api"))
         if preset.api != api:
@@ -1485,6 +1496,19 @@ def update_model_call_order(
         raise WebUISettingsError("model call order must contain at least one preset")
 
     normalized_order = [cast(str, name).strip() for name in cast(list[object], order)]
+    return _set_model_call_order(config, normalized_order, oauth_status=oauth_status)
+
+
+def append_model_call_order(config: Config, name: str, *, oauth_status: OAuthStatusReader) -> None:
+    order, _ = _model_call_order_state(config)
+    if name not in order:
+        order.append(name)
+    _set_model_call_order(config, order, oauth_status=oauth_status)
+
+
+def _set_model_call_order(
+    config: Config, normalized_order: list[str], *, oauth_status: OAuthStatusReader,
+) -> bool:
     unknown = [name for name in normalized_order if name not in config.model_presets]
     if unknown:
         raise WebUISettingsError(f"unknown model preset: {unknown[0]}")
@@ -1530,6 +1554,7 @@ def migrate_model_configurations(
         config.model_presets[name] = ModelPresetConfig(
             model=primary.model,
             provider=primary.provider,
+            supports_images=primary.supports_images,
             max_tokens=primary.max_tokens,
             context_window_tokens=primary.context_window_tokens,
             temperature=primary.temperature,
@@ -1549,6 +1574,7 @@ def migrate_model_configurations(
         config.model_presets[name] = ModelPresetConfig(
             model=fallback.model,
             provider=fallback.provider,
+            supports_images=fallback.supports_images,
             max_tokens=(
                 fallback.max_tokens if fallback.max_tokens is not None else primary.max_tokens
             ),
@@ -1644,18 +1670,16 @@ def update_provider_settings(
     if resolved_provider is None:
         raise WebUISettingsError("unknown provider")
     spec, provider_key, provider_config = resolved_provider
-    updates = _provider_config_updates(query)
+    # Keep the current declaration authoritative and preserve saves from old
+    # clients that also sent this irrelevant field for other providers.
+    updates = _provider_config_updates(
+        query, ignore_retired_api_type="api" in query or (not spec.is_oauth and spec.name != "openai"),
+    )
     if updates.get("use_proxy"):
         try:
             config.network.resolve_proxy(True)
         except ValueError as exc:
             raise WebUISettingsError(str(exc)) from None
-    if not spec.is_oauth and spec.name != "openai":
-        updates.pop("api_type", None)
-    try:
-        updates = migrate_legacy_provider_api(updates, provider_name=provider_key)
-    except ValueError as exc:
-        raise WebUISettingsError(str(exc)) from None
     if spec.is_oauth:
         if spec.name not in _OAUTH_PROXY_PROVIDERS:
             raise WebUISettingsError("unknown provider")
@@ -1962,7 +1986,6 @@ class ModelSettingsHandler:
             self._remove_pending_work = None
 
     def _refresh_runtime_config(self) -> None:
-        """Make a successful model-settings mutation visible to live clients now."""
         if self.settings.refresh_runtime_config is not None:
             self.settings.refresh_runtime_config()
 

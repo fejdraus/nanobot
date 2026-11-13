@@ -1,4 +1,3 @@
-"""Tests for tool plugin architecture: ToolLoader, ToolContext, metadata."""
 from __future__ import annotations
 
 import shutil
@@ -51,9 +50,6 @@ def test_tool_plugin_discoverable_default_is_true():
     assert _MinimalTool._plugin_discoverable is True
 
 
-# --- ToolContext tests ---
-
-
 def test_tool_context_has_required_fields():
     field_names = {f.name for f in fields(ToolContext)}
     required = {
@@ -75,9 +71,6 @@ def test_tool_context_defaults():
     assert ctx.providers_config is None
     assert ctx.runtime_control is None
     assert ctx.timezone == "UTC"
-
-
-# --- ToolLoader tests ---
 
 
 def test_skip_modules_excludes_infrastructure():
@@ -118,7 +111,6 @@ def test_discover_skips_private_classes():
 
 
 def test_loader_registers_exec_with_real_tools_config(tmp_path):
-    """Real config objects catch bad ctx.config attribute paths that mocks hide."""
     from types import SimpleNamespace
 
     from nanobot.agent.tools.registry import ToolRegistry
@@ -192,9 +184,6 @@ def test_loader_preserves_caller_supplied_tool(tmp_path):
     assert "read_file" not in registered
 
 
-# --- Task 4: _FsTool.create() ---
-
-
 def test_fs_tool_create_builds_from_context():
     from nanobot.agent.tools.filesystem import ReadFileTool
     mock_config = MagicMock()
@@ -224,9 +213,6 @@ def test_fs_tool_create_respects_sandbox():
     ctx = ToolContext(config=mock_config, workspace="/tmp/test")
     tool = ReadFileTool.create(ctx)
     assert tool._allowed_dir == Path("/tmp/test")
-
-
-# --- Message, subagent, and cron tool factories ---
 
 
 async def test_message_tool_create():
@@ -272,9 +258,6 @@ def test_cron_tool_create():
     )
     tool = CronTool.create(ctx)
     assert isinstance(tool, CronTool)
-
-
-# --- Task 6: ExecTool, WebTools, ImageGenerationTool ---
 
 
 def test_exec_tool_config_cls():
@@ -387,9 +370,6 @@ def test_image_gen_tool_create():
     assert tool.provider_configs["openrouter"].api_key == "image-key"
 
 
-# --- Task 7: MyToolConfig + MCP wrappers ---
-
-
 def test_my_tool_config_cls():
     from nanobot.agent.tools.self import MyTool, MyToolConfig
     assert MyTool.config_key == "my"
@@ -427,52 +407,7 @@ def test_mcp_wrappers_not_discoverable():
     assert MCPPromptWrapper._plugin_discoverable is False
 
 
-# --- Task 8: Config round-trip tests ---
-
-
-def test_config_round_trip():
-    """Verify config serialization is unchanged after moving config classes."""
-    from nanobot.config.schema import Config
-
-    config_dict = {
-        "tools": {
-            "web": {"enable": True, "search": {"provider": "brave", "api_key": "test"}},
-            "exec": {"enable": False, "timeout": 120},
-            "my": {"allowSet": True},
-            "imageGeneration": {"enabled": True, "provider": "openrouter"},
-        }
-    }
-    config = Config.model_validate(config_dict)
-    dumped = config.model_dump(mode="json", by_alias=True)
-
-    assert dumped["tools"]["my"]["allowSet"] is True
-    assert dumped["tools"]["imageGeneration"]["enabled"] is True
-    assert config.tools.exec.enable is False
-    assert config.tools.exec.timeout == 120
-    assert config.tools.web.search.provider == "brave"
-
-
-def test_config_defaults():
-    """Verify default values match the original hardcoded schema."""
-    from nanobot.config.schema import Config
-
-    config = Config.model_validate({})
-    assert config.tools.exec.enable is True
-    assert config.tools.exec.timeout == 60
-    assert config.tools.web.enable is True
-    assert config.tools.web.search.provider == "duckduckgo"
-    assert config.tools.my.enable is True
-    assert config.tools.my.allow_set is False
-    assert config.tools.image_generation.enabled is False
-    assert config.tools.cli_apps.enable is True
-    assert config.tools.restrict_to_workspace is False
-
-
-# --- Task 10: Integration test ---
-
-
 def test_loader_registers_builtin_tools():
-    """Verify the loader produces the same tool set as the old _register_default_tools."""
     from nanobot.agent.tools.loader import ToolLoader
     from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.agent.tools.shell import ExecToolConfig

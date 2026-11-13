@@ -1,5 +1,3 @@
-"""Tests for /stop task cancellation."""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +11,6 @@ from nanobot.agent.memory import Consolidator
 from nanobot.bus.outbound_events import StreamDeltaEvent, StreamEndEvent
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import GenerationSettings
-from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.utils.llm_runtime import LLMRuntime
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
@@ -513,7 +510,6 @@ class TestSubagentCancellation:
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
             consolidator=MagicMock(spec=Consolidator),
         )
-        # Replace the real exec session manager with a mock
         mock_exec_mgr = AsyncMock(spec=ExecSessionManager)
         mock_exec_mgr.terminate_by_owner = AsyncMock(return_value=0)
         mgr._exec_session_manager = mock_exec_mgr
@@ -727,7 +723,6 @@ class TestSubagentCancellation:
 
 
 class TestSubagentAnnounceSessionKey:
-    """Verify _announce_result uses the effective session key for mid-turn routing."""
 
     def _make_mgr(self):
         """Create a SubagentManager with mocked deps and its bus."""
@@ -744,33 +739,18 @@ class TestSubagentAnnounceSessionKey:
         return mgr, bus
 
     @pytest.mark.asyncio
-    async def test_announce_uses_effective_key_in_unified_mode(self):
-        """In unified session mode, session_key_override must be 'unified:default'
-        so the result matches the pending queue key."""
+    async def test_announce_uses_explicit_topic_session_key(self):
         mgr, bus = self._make_mgr()
 
-        origin = {"channel": "telegram", "chat_id": "111", "session_key": UNIFIED_SESSION_KEY}
+        origin = {"channel": "telegram", "chat_id": "111", "session_key": "telegram:111:topic:5"}
         await mgr._announce_result("sub-1", "label", "task", "result", origin, "ok")
 
         msg = await bus.consume_inbound()
-        assert msg.session_key_override == UNIFIED_SESSION_KEY
-        assert msg.session_key == UNIFIED_SESSION_KEY
-
-    @pytest.mark.asyncio
-    async def test_announce_uses_raw_key_in_normal_mode(self):
-        """Without unified sessions, session_key_override is the raw channel:chat_id."""
-        mgr, bus = self._make_mgr()
-
-        origin = {"channel": "telegram", "chat_id": "222", "session_key": "telegram:222"}
-        await mgr._announce_result("sub-2", "label", "task", "result", origin, "ok")
-
-        msg = await bus.consume_inbound()
-        assert msg.session_key_override == "telegram:222"
-        assert msg.session_key == "telegram:222"
+        assert msg.session_key_override == "telegram:111:topic:5"
+        assert msg.session_key == "telegram:111:topic:5"
 
     @pytest.mark.asyncio
     async def test_announce_falls_back_to_origin_when_no_session_key(self):
-        """When session_key is None, fallback to f'{channel}:{chat_id}'."""
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "discord", "chat_id": "333", "session_key": None}
@@ -783,7 +763,6 @@ class TestSubagentAnnounceSessionKey:
 
     @pytest.mark.asyncio
     async def test_spawn_routes_result_to_parent_session(self):
-        """Background results return to the parent's canonical session."""
 
         mgr, bus = self._make_mgr()
 
@@ -803,9 +782,9 @@ class TestSubagentAnnounceSessionKey:
             origin_channel="telegram",
             origin_chat_id="444",
             runtime=_runtime(),
-            session_key=UNIFIED_SESSION_KEY,
+            session_key="telegram:444:topic:5",
         )
         await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
         msg = await bus.consume_inbound()
-        assert msg.session_key_override == UNIFIED_SESSION_KEY
+        assert msg.session_key_override == "telegram:444:topic:5"

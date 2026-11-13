@@ -372,7 +372,7 @@ describe("MessageBubble", () => {
 
     rerender(<MessageBubble message={message} />);
     expect(bubble).not.toHaveClass("border-dashed");
-    expect(bubble).toHaveClass("bg-secondary/70");
+    expect(bubble).toHaveClass("user-message-surface", "bg-secondary/70");
   });
 
   it("renders completed message branches with static wrapper classes", async () => {
@@ -474,7 +474,10 @@ describe("MessageBubble", () => {
     expect(quote).toHaveTextContent("selected assistant excerpt");
     expect(quote).not.toHaveAttribute("title");
     expect(screen.queryByText("Quoted context")).not.toBeInTheDocument();
-    expect(screen.getByText("What about this?")).toBeInTheDocument();
+    const messageBubble = screen.getByText("What about this?");
+    expect(messageBubble).toBeInTheDocument();
+    expect(quote).toHaveClass("rounded-floating");
+    expect(messageBubble).toHaveClass("rounded-floating");
 
     rerender(
       <MessageBubble
@@ -538,7 +541,7 @@ describe("MessageBubble", () => {
     expect(command.firstElementChild).toHaveClass("opacity-90");
     expect(command.className).not.toMatch(/(?:^|\s)(?:bg-|border|ring|rounded)/);
     expect(command.parentElement).toHaveTextContent("/model gpt-5");
-    expect(command.parentElement).toHaveClass("rounded-floating", "bg-secondary/70");
+    expect(command.parentElement).toHaveClass("rounded-floating", "user-message-surface", "bg-secondary/70");
   });
 
   it("keeps unknown and invalid slash commands as plain message text", () => {

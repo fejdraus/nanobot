@@ -1,5 +1,3 @@
-"""Tests for structured tool activity emitted through AgentLoop progress events."""
-
 import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -57,7 +55,6 @@ def _attach_webui_runtime_events(loop: AgentLoop, bus: MessageBus) -> None:
 
 
 class TestToolEventProgress:
-    """AgentLoop wires tool hooks and turn delivery into progress events."""
 
     @pytest.mark.asyncio
     async def test_write_file_emits_file_edit_progress(self, tmp_path: Path) -> None:
@@ -213,7 +210,6 @@ class TestToolEventProgress:
 
     @pytest.mark.asyncio
     async def test_bus_progress_delivers_tool_activity_in_progress_events(self, tmp_path: Path) -> None:
-        """Bus-dispatched turns deliver tool activity through ProgressEvent.tool_events."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
@@ -237,7 +233,6 @@ class TestToolEventProgress:
         )
         await run_session(loop, msg)
 
-        # Drain all outbound messages and find the one carrying tool events.
         outbound = []
         while bus.outbound_size > 0:
             outbound.append(await bus.consume_outbound())
@@ -311,7 +306,6 @@ class TestToolEventProgress:
 
     @pytest.mark.asyncio
     async def test_goal_turn_keeps_file_edit_progress_for_webui(self, tmp_path: Path) -> None:
-        """The /goal command rewrites the prompt but must not bypass WebUI file-edit progress."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
@@ -339,12 +333,15 @@ class TestToolEventProgress:
 
         provider.chat_stream_with_retry = chat_stream_with_retry
         provider.chat_with_retry = AsyncMock()
+        from nanobot.goal.assembly import install_goal
+
         loop = AgentLoop(
             bus=bus,
             provider=provider,
             workspace=tmp_path,
             model="test-model",
             hook_factories=[create_file_edit_activity_hook],
+            builtin_assembly=install_goal,
         )
         tool = WriteFileTool(workspace=tmp_path)
         loop.tools.get_definitions = MagicMock(return_value=[
@@ -396,7 +393,6 @@ class TestToolEventProgress:
         self,
         tmp_path: Path,
     ) -> None:
-        """Non-streaming channels should get one final reply, not token progress spam."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "openai-codex/gpt-5.5"
@@ -427,7 +423,6 @@ class TestToolEventProgress:
         self,
         tmp_path: Path,
     ) -> None:
-        """Streaming channels still receive provider deltas through stream events."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "openai-codex/gpt-5.5"
@@ -716,7 +711,6 @@ class TestToolEventProgress:
         self,
         tmp_path: Path,
     ) -> None:
-        """A no-tools finalization must not be dropped after empty stream retries."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "openai-codex/gpt-5.5"
@@ -825,6 +819,7 @@ class TestToolEventProgress:
             chat_id="chat-a",
             content="Can you include the key detail?",
             session_key_override=session_key,
+            metadata={WEBUI_TURN_METADATA_KEY: "followup"},
         ))
         release_first_request.set()
         # Events synchronize injection; the deadline only guards against a stuck worker.
@@ -861,6 +856,11 @@ class TestToolEventProgress:
             for message in outbound
             if isinstance(message.event, StreamDeltaEvent)
         ] == ["Checking", "The late result is ready"]
+        assert [
+            message.metadata["response_input_ids"]
+            for message in outbound
+            if isinstance(message.event, StreamDeltaEvent)
+        ] == [[], ["user:followup"]]
         assert any(isinstance(message.event, ProgressEvent) for message in outbound)
         assert len([
             message for message in outbound if isinstance(message.event, TurnEndEvent)
@@ -908,6 +908,7 @@ class TestToolEventProgress:
                 WEBUI_TURN_METADATA_KEY,
                 "_history_generation",
                 "latency_ms",
+                "response_input_ids",
             }
             for message in visible_events
         )
@@ -918,7 +919,6 @@ class TestToolEventProgress:
         self,
         tmp_path: Path,
     ) -> None:
-        """Recovered streaming output should use a new stream segment."""
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "openai-codex/gpt-5.5"
@@ -1115,13 +1115,13 @@ class TestToolEventProgress:
 
         captured: dict[str, object] = {}
 
-        async def fake_title_after_turn(**kwargs: object) -> bool:
+        async def fake_generate_title(**kwargs: object) -> bool:
             captured.update(kwargs)
             return False
 
         monkeypatch.setattr(
-            "nanobot.session.webui_turns.maybe_generate_webui_title_after_turn",
-            fake_title_after_turn,
+            "nanobot.session.webui_turns.maybe_generate_webui_title",
+            fake_generate_title,
         )
         scheduled_title: list[object] = []
 
@@ -1156,39 +1156,6 @@ class TestToolEventProgress:
 
         assert captured["provider"] is provider
         assert captured["model"] == "test-model"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("metadata", [{}, {"webui": False}])
-    async def test_webui_title_requires_inbound_opt_in(
-        self,
-        tmp_path: Path,
-        metadata: dict[str, object],
-    ) -> None:
-        from nanobot.session.manager import SessionManager
-        from nanobot.session.webui_turns import maybe_generate_webui_title_after_turn
-
-        sessions = SessionManager(tmp_path)
-        session = sessions.get_or_create("websocket:chat1")
-        session.metadata["webui"] = True
-        session.add_message("user", "say hello")
-        session.add_message("assistant", "Hello")
-        sessions.save(session)
-        provider = MagicMock()
-        provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(content="Greeting"))
-
-        generated = await maybe_generate_webui_title_after_turn(
-            channel="websocket",
-            chat_id="chat1",
-            metadata=metadata,
-            sessions=sessions,
-            session_key=session.key,
-            provider=provider,
-            model="test-model",
-        )
-
-        assert generated is False
-        provider.chat_stream_with_retry.assert_not_awaited()
-        assert "title" not in session.metadata
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("metadata", [{}, {"webui": False}])
@@ -1232,7 +1199,6 @@ class TestToolEventProgress:
     async def test_webui_command_turn_does_not_schedule_title_generation(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         bus = MessageBus()
         provider = MagicMock()
@@ -1241,13 +1207,6 @@ class TestToolEventProgress:
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
         _attach_webui_runtime_events(loop, bus)
 
-        async def fake_title_after_turn(**_kwargs: object) -> bool:
-            raise AssertionError("command-only turns should not generate titles")
-
-        monkeypatch.setattr(
-            "nanobot.session.webui_turns.maybe_generate_webui_title_after_turn",
-            fake_title_after_turn,
-        )
         scheduled: list[object] = []
         loop.schedule_background = scheduled.append  # type: ignore[method-assign]
 

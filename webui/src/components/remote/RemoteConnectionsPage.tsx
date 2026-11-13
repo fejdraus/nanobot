@@ -26,7 +26,6 @@ const emptyProfile = (): Omit<RemoteProfile, "id" | "connected"> => ({
   config_path: "~/.nanobot/config.json", runtime_user: "",
 });
 
-/** The page is a server directory. Add/edit/first-use verification share one dialog. */
 export function RemoteConnectionsPage({ mainNavigationExpanded = false, hostChromeInset = false, onBackToChat }: {
   mainNavigationExpanded?: boolean;
   hostChromeInset?: boolean;
@@ -72,6 +71,9 @@ export function RemoteConnectionsPage({ mainNavigationExpanded = false, hostChro
   const nameId = useId();
   const nameInput = useRef<HTMLInputElement>(null);
   const refresh = connections?.refresh;
+  const watchDirectory = connections?.watchDirectory;
+  const visible = connections?.localActive || connections?.managing;
+  useEffect(() => { if (visible) return watchDirectory?.(); }, [visible, watchDirectory]);
   const page = useRef<HTMLDivElement>(null);
   useEffect(() => { if (connections?.managing) page.current?.focus({ preventScroll: true }); }, [connections?.managing]);
 

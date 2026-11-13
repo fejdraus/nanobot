@@ -4,6 +4,13 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/**", (route) => route.abort());
 });
 
+test("appearance puts interface settings before activity display", async ({ page }) => {
+  await page.goto("/browser/fixture.html?case=appearance");
+  await expect(page.locator(".appearance-page > section > h2")).toHaveText([
+    "Theme", "Reading", "Interface", "Activity display",
+  ]);
+});
+
 test("system theme stays live, explicit choices persist, and tabs agree", async ({ page, context }) => {
   await page.emulateMedia({ colorScheme: "light" });
   await page.goto("/browser/fixture.html?case=appearance");
@@ -52,7 +59,7 @@ test("custom reading size previews, persists and survives preset changes", async
   await page.reload();
   await expect(input).toHaveValue("24");
   await page.getByRole("radio", { name: "Small reading text", exact: true }).click();
-  await expect(paragraph).toHaveCSS("font-size", "16px");
+  await expect(paragraph).toHaveCSS("font-size", "15px");
   await page.getByRole("spinbutton", { name: "Custom text size", exact: true }).click();
   await expect(input).toHaveValue("24");
   await expect(paragraph).toHaveCSS("font-size", "24px");
@@ -238,7 +245,10 @@ test("unfinished numeric input reports an error instead of acting like a cleared
     expect(await input.evaluate((element: HTMLInputElement) => element.validity.badInput)).toBe(true);
     await input.press("Enter");
     await expect(input).toHaveAttribute("aria-invalid", "true");
+    // The pointer can leave the editor while the user reads the validation hint.
+    await page.mouse.move(0, 0);
     await expect(page.getByRole("tooltip", { name: /Your text remains at 18 px\./ })).toBeVisible();
+    await expect(input).toBeFocused();
     await expect(paragraph).toHaveCSS("font-size", "18px");
     await input.click();
     await input.press("Escape");

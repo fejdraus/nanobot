@@ -28,7 +28,8 @@
   <p>
     <a href="https://discord.gg/MnCvHqpUGB">Discord</a> ·
     <a href="https://x.com/nanobot_project">X</a> ·
-    <a href="./COMMUNICATION.md">WeChat / Feishu</a>
+    <a href="./COMMUNICATION.md#wechat">WeChat 微信交流群</a> ·
+    <a href="./COMMUNICATION.md#hkuds-community">Feishu</a>
   </p>
 </div>
 
@@ -46,7 +47,7 @@
 | Connect Telegram, Discord, WeChat, Slack, Email, Mattermost, Linear, or another channel | [Chat app guide](./docs/guides/chat-app-ai-agent.md) |
 | Configure providers, fallback models, Langfuse, MCP, web tools, or security | [Docs](./docs/README.md) and [Configuration](./docs/configuration.md) |
 | Develop the browser UI | [Install current source](#-install), then [WebUI development](./webui/README.md) and [Contributing](./CONTRIBUTING.md) |
-| Integrate from Python or HTTP | [Python SDK](./docs/python-sdk.md) or [Agent API](./docs/openai-api.md) |
+| Integrate from Python | [Python SDK](./docs/python-sdk.md) |
 | Understand or extend the internals | [Architecture](./docs/architecture.md), [Contributing](./CONTRIBUTING.md), and [Provider extensions](./docs/development.md) |
 | Deploy to the cloud or keep nanobot running as a service | [Deployment](./docs/deployment.md) |
 
@@ -60,13 +61,13 @@ nanobot can:
 - use shell, web search/fetch, MCP integrations, cron, image generation, and multi-agent delegation
 - keep session history and long-term memory through [Dream](./docs/memory.md#save-and-check-a-preference)
 - run [long-horizon goals](./docs/guides/long-running-ai-agent.md) and [scheduled automations](./docs/automations.md)
-- expose a Python SDK and OpenAI-compatible API for integrations
+- embed the agent with the Python SDK
 - deploy as a long-running local or server-side agent gateway
 
 ## 💡 Why nanobot
 
 - **Persistent workflows**: keep saved conversations, long-term memory, and task results for later work.
-- **Chat-native reach**: WebUI, API, Telegram, Feishu, Slack, Discord, Teams, email, Mattermost, and Linear.
+- **Chat-native reach**: WebUI, Telegram, Feishu, Slack, Discord, Teams, email, Mattermost, and Linear.
 - **Model freedom**: OpenAI-compatible APIs, local LLMs, image generation, search, and fallbacks.
 - **Small core**: readable internals with MCP, memory, deployment, and automation built in.
 - **Own your stack**: inspect, customize, self-host, and extend without a giant platform.
@@ -300,7 +301,7 @@ Use a regular topic for a bounded objective with a clear completion condition, f
 /goal Review this project's tests and list the smallest missing test case.
 ```
 
-The goal lets nanobot continue work across model turns while the gateway runs; a scheduled automation instead starts a turn at specified times. Use `/stop` to interrupt the current work, and ask nanobot to cancel the goal if you want to abandon it. Keep the gateway running for unattended work using the background or service options below.
+An active goal keeps nanobot working beyond the ordinary iteration limit until it records completion, cancellation, or a blocked state. This can use more model tokens; `/stop` interrupts the current work, while asking nanobot to cancel the goal abandons the objective. Execution errors can also stop the work. A scheduled automation instead starts work at specified times. Keep the gateway running for unattended work using the background or service options below.
 
 After a gateway restart, reopen the original topic and review saved results before explicitly continuing any interrupted work. Recovery does not blindly replay uncertain tool actions. See the [long-running agent guide](./docs/guides/long-running-ai-agent.md) for starting conditions and related automation options.
 
@@ -458,7 +459,7 @@ See the [WebUI guide](./docs/webui.md) for LAN access, background operation, wor
 
 The Python gateway owns agent execution, sessions, tools, memory, and security policy for the WebUI, TUI, and chat apps. The clients share that runtime; the core agent loop builds context, calls the model, executes requested tools, and returns the result. Memory, skills, channels, and MCP integrations extend that loop.
 
-The [Python SDK](./docs/python-sdk.md) embeds the agent runtime in your application process. The [OpenAI-compatible API](./docs/openai-api.md) starts a separate HTTP service for `/v1/chat/completions`: each request contains one user message, history is managed by the server, and the model comes from configuration. Responses return to the HTTP client; that service does not deliver tool messages to chat apps.
+The [Python SDK](./docs/python-sdk.md) embeds the agent runtime in your application process.
 
 See [Architecture](./docs/architecture.md) for source ownership and extension points.
 
@@ -470,7 +471,7 @@ Browse the [repo docs](./docs/README.md) for current source documentation, or vi
 - Choose and configure a model: [Providers and Models](./docs/providers.md) and [Provider Cookbook](./docs/provider-cookbook.md).
 - Connect a chat app: [Chat App AI Agent](./docs/guides/chat-app-ai-agent.md) and [channel reference](./docs/chat-apps.md).
 - Schedule or deploy work: [Automations](./docs/automations.md) and [Deployment](./docs/deployment.md).
-- Integrate from code: [Python SDK](./docs/python-sdk.md) and [OpenAI-Compatible API](./docs/openai-api.md).
+- Integrate from code: [Python SDK](./docs/python-sdk.md).
 - Look up runtime concepts or exact settings: [Concepts](./docs/concepts.md) and [Configuration](./docs/configuration.md).
 - Diagnose a failure: [Troubleshooting](./docs/troubleshooting.md).
 - Extend the core: [Architecture](./docs/architecture.md) and [contribution workflow](./CONTRIBUTING.md).
@@ -523,7 +524,7 @@ Use nanobot for a real task, report what broke, and then pick a focused improvem
 <table>
   <tr>
     <td align="center"><a href="https://github.com/re-bin"><img src="https://avatars.githubusercontent.com/u/52506698?v=4&s=80" width="80" height="80" alt="Xubin Ren"><br><strong>Xubin Ren</strong></a><br><a href="https://x.com/xubinrencs"><img src="https://img.shields.io/badge/@xubinrencs-000000?style=flat&logo=x&logoColor=white" alt="Xubin Ren on X"></a></td>
-    <td align="center"><a href="https://github.com/chengyongru"><img src="https://avatars.githubusercontent.com/u/61816729?v=4&s=80" width="80" height="80" alt="Yongru Chen"><br><strong>Yongru Chen</strong></a><br><a href="https://x.com/chengyongru"><img src="https://img.shields.io/badge/@chengyongru-000000?style=flat&logo=x&logoColor=white" alt="Yongru Chen on X"></a></td>
+    <td align="center"><a href="https://github.com/chengyongru"><img src="https://avatars.githubusercontent.com/u/61816729?v=4&s=80" width="80" height="80" alt="Yongru Cheng"><br><strong>Yongru Cheng</strong></a><br><a href="https://x.com/chengyongru"><img src="https://img.shields.io/badge/@chengyongru-000000?style=flat&logo=x&logoColor=white" alt="Yongru Cheng on X"></a></td>
   </tr>
 </table>
 

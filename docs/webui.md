@@ -89,6 +89,8 @@ Open **Settings → About** to check for updates automatically. Startup, reconne
 
 The sidebar is the topic switcher. Each topic keeps its own history, title, workspace selection, and linked automations. Use a new topic when you want a separate context; use fork when you want to continue from an existing point without changing the original thread.
 
+If creating or forking a topic times out, it may already have succeeded; it is not automatically retried. Reconnecting ends temporary chats.
+
 Drag topics within a sidebar group to reorder them. **Rename** edits a topic title in place; a failed save keeps the draft for retry.
 
 Use **Select** in a topic's action menu to archive or delete several topics with one confirmation. Click outside the topic rows and toolbar, or press **Esc**, to leave selection mode. Cancelling a confirmation keeps your selection. Archiving removes pins and hides topics from the default list while keeping their conversations. Use **Show archived** to find them again; selecting only archived topics offers **Unarchive**.
@@ -110,6 +112,10 @@ Scroll past the oldest loaded message, or pull down and release on touch devices
 Tasks in persistent topics can continue while the connection is lost. Status and completed replies update after reconnecting; some missed text may appear only when the task finishes. [Temporary chats](#temporary-chats) end on connection loss.
 
 The context indicator beside the model badge shows context-window usage. **Recent rounds** includes token usage, generation time and KV cache hits when reported. Provider figures may be estimated or unavailable and are not a billing statement.
+
+Open the file graph to see files used since the latest compaction and local Markdown references discovered in those files. Click a node to see its estimated token count or open the file, and drag across the usage bar or use replay to review earlier rounds. A loaded node means the file was read or supplied during this phase; it does not guarantee that the whole file, or its original text, remains in the model's current request. Compaction starts a new replay phase; its graph appears with the next request. Previously saved snapshots remain readable, but missing historical snapshots are not reconstructed from current files.
+
+Switching topics closes the previous topic's graph. Reopen it from the context indicator for the selected topic. Large or continuously growing graphs may be less responsive on slower devices.
 
 During compaction, the model switches to a summary plus subsequent messages; the original messages remain in chat history. Use `/compact` to compact the current topic manually. See [Memory](./memory.md) for compaction and Dream consolidation.
 
@@ -143,7 +149,7 @@ When nanobot delegates work to subagents, **Subtasks** appears above the message
 
 Finished tasks leave the live list when it is closed. If you are already reading the list, they remain until you close it. When all tasks finish with the list closed, a brief completion or failure summary appears and then disappears; focusing or hovering over it keeps it available.
 
-Saved results appear as compact, expandable records beside the requests that started the work, and scroll with the conversation. Tasks without a matching request in the displayed history remain under **Other tasks**. Refreshing or reopening the WebUI restores active work in the fixed entry and finished work in the conversation, without restarting tasks or bringing all old tasks back into the live list.
+Saved results appear as compact, expandable records beside their associated requests, and scroll with the conversation. Results for earlier requests appear when their turns are loaded; tasks without a matching request in the displayed history are not shown there. Refreshing or reopening the WebUI restores active work in the fixed entry and finished work in the conversation, without restarting tasks or bringing all old tasks back into the live list. The WebUI retrieves finished tasks only for the loaded turns.
 
 Select a task for its read-only conversation and tool activity. Closing the details leaves it running; its stop button cancels only that task. Give follow-up instructions to nanobot in the main conversation.
 
@@ -160,6 +166,10 @@ Temporary chats do not create saved files for oversized text tool results; these
 Temporary does not mean consequence-free. Requests still go to the configured model provider, and tools can still change files, run commands, or affect external services. Files and image artifacts created or exported by tools (including images returned by MCP tools) are not erased when the chat closes. Temporary chats always use the default workspace in Restricted mode; the project picker and Full Access are unavailable. Commands and tools that create durable goals, automations, or subagent work are also unavailable. Use a regular topic when you need reusable context, scheduled work, or a result you must retain.
 
 ## Workspace and Access
+
+Project selection and Full Access controls require an owner-authenticated WebUI connection. Ordinary WebSocket clients stay within the workspace and access mode configured by the operator; an owner's saved topic scope or WebUI preference does not grant a client additional access. Existing topics remain available to the owner, while clients attempting to resume a topic outside their configured authority receive an error instead of silently changing its scope. Legacy plain-text clients use the same permission boundary. Keep the configured `tokenIssueSecret` (or fallback `token`) private: it can issue owner credentials. Share short-lived client connection tokens, not that owner secret.
+
+Inputs to the same session with different workspace permissions wait for the active turn to finish, then run with their own permissions. Inputs with the same scope can still join the active turn.
 
 Use the workspace picker to browse folders on the connected nanobot host, enter an absolute path, or return to recent and starred projects; favorites persist across gateway restarts. The host name appears above saved locations. Project paths refer to that machine, not the browser's filesystem.
 
@@ -242,6 +252,8 @@ Open **Skills → Installed** to review built-in and workspace-provided skills. 
 Open **Skills → Discover** to browse or search skills from skills.sh and SkillHub. A marketplace skill is copied into the active agent workspace after you confirm the installation. skills.sh installation requires Node.js with `npx`; SkillHub installation does not.
 
 Marketplace skills are third-party instructions and may include executable scripts. Review the source and instructions before installing one, and enable only skills you trust with the same files, tools, and credentials available to your agent.
+
+Discover marks a skill as installed only when its recorded marketplace source matches. A skill with the same name from another source is a name conflict, not another installed copy. Older or manually copied skills without a source record remain usable and show “Installed source unknown.” Review the existing skill in **Installed** before removing it if you want a different source; installation never replaces it automatically. New installs keep a small `.nanobot-origin.json` receipt beside `SKILL.md`. Keep that receipt with the skill when moving or backing up the workspace. Older nanobot versions ignore it; no skill-directory rename or history migration is required.
 
 ## Automations
 
