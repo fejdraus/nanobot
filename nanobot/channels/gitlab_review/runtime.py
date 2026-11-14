@@ -235,7 +235,7 @@ def _unresolved(discussion: dict[str, Any]) -> bool:
 
 def _check_bot_commands() -> None:
     """Refuse to start when a menu command would shadow a built-in nanobot command such as /new."""
-    from nanobot.command.builtin import register_builtin_commands
+    from nanobot.command.application import register_builtin_commands
     from nanobot.command.router import CommandRouter
 
     router = CommandRouter()

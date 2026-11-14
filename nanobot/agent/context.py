@@ -375,7 +375,7 @@ class ContextBuilder:
                 }
                 if video_fps is not None:
                     block["video_url"]["fps"] = video_fps
-                image_blocks.append(block)
+                media_blocks.append(block)
                 logger.debug(
                     "Video attached to LLM request: {} ({}, {} bytes)", path, mime, len(raw)
                 )
