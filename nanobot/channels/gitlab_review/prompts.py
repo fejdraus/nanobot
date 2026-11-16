@@ -120,6 +120,20 @@ def review_prompt(
     )
 
 
+def _history_note(history: list[str] | None) -> str:
+    """Earlier reviews of the MR, so a thread check starts from the reasoning behind the remark."""
+    if not history:
+        return ""
+    return (
+        "Your earlier reviews of this merge request, from the archive, newest first. They show "
+        "what you checked and why you wrote each remark: recall the reasoning from them instead "
+        "of reconstructing it from the thread text. The code may have changed since, so still "
+        "verify every reply against the current commit (step 9).\n\n"
+        + "\n\n---\n\n".join(history)
+        + "\n\n"
+    )
+
+
 def reply_prompt(
     iid: int,
     discussion_id: str,
@@ -130,6 +144,7 @@ def reply_prompt(
     people: str = "",
     authors: list[str] | None = None,
     attachments_dir: str = "",
+    history: list[str] | None = None,
 ) -> str:
     quoted = "\n".join(f"> {line}" for line in (note_body or "").splitlines()) or "> (empty)"
     extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
@@ -139,7 +154,7 @@ def reply_prompt(
         f"{note_author or 'a participant'} replied:\n{quoted}\n\n"
         "Work only with this thread: check the reply against the code and the task (step 9), "
         "decide whether the thread needs a reply and whether an approval can be proposed (step 8). "
-        f"Do not touch other threads.\n\n{lessons + chr(10) * 2 if lessons else ''}"
+        f"Do not touch other threads.\n\n{_history_note(history)}{lessons + chr(10) * 2 if lessons else ''}"
         f"{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
         + "".join(f"\n\n{rule}" for rule in extra)
     )
@@ -153,6 +168,7 @@ def replies_prompt(
     people: str = "",
     authors: list[str] | None = None,
     attachments_dir: str = "",
+    history: list[str] | None = None,
 ) -> str:
     """Several threads answered while the MR was quiet, checked in one run."""
     quoted = "\n\n".join(
@@ -166,7 +182,7 @@ def replies_prompt(
         f"In merge request !{iid} these threads started by the reviewer got replies:\n\n{quoted}\n\n"
         "Check each reply against the code and the task (step 9) and decide for each thread whether "
         "it needs a reply. Propose an approval only if every thread the reviewer started is settled "
-        f"(step 8). Do not touch other threads.\n\n{lessons + chr(10) * 2 if lessons else ''}"
+        f"(step 8). Do not touch other threads.\n\n{_history_note(history)}{lessons + chr(10) * 2 if lessons else ''}"
         f"{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
         + "".join(f"\n\n{rule}" for rule in extra)
     )
@@ -180,6 +196,7 @@ def recheck_prompt(
     people: str = "",
     authors: list[str] | None = None,
     attachments_dir: str = "",
+    history: list[str] | None = None,
 ) -> str:
     extra = [rule for rule in (attachment_rules(attachments_dir, iid), people_rules(authors or [])) if rule]
     return (
@@ -189,7 +206,7 @@ def recheck_prompt(
         "commit (step 9). Propose a thread reply only where an answer does not hold. If every answer "
         "holds and you have no new remark, propose the approval (step 8); if something new comes up, "
         "propose it as a remark and no approval.\n\n"
-        f"{lessons + chr(10) * 2 if lessons else ''}{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
+        f"{_history_note(history)}{lessons + chr(10) * 2 if lessons else ''}{people + chr(10) * 2 if people else ''}{_DRAFT_RULES}"
         + "".join(f"\n\n{rule}" for rule in extra)
     )
 

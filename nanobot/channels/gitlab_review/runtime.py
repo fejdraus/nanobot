@@ -986,6 +986,10 @@ class GitLabReviewChannel(BaseChannel):
             answered = await self._all_threads_answered(info)
             if answered == []:
                 return
+            history = [
+                self._state.render_review(review)[:ARCHIVE_ENTRY_CHARS]
+                for review in self._state.find_reviews([info.iid], [], ARCHIVE_LIMIT)
+            ]
             if answered is not None and len(answered) > 1:
                 prompt = recheck_prompt(
                     info.iid,
@@ -994,6 +998,7 @@ class GitLabReviewChannel(BaseChannel):
                     people=self._people_for(authors),
                     authors=authors,
                     attachments_dir=self.config.attachments_dir,
+                    history=history,
                 )
             elif len(answers) > 1:
                 prompt = replies_prompt(
@@ -1003,6 +1008,7 @@ class GitLabReviewChannel(BaseChannel):
                     people=self._people_for(authors),
                     authors=authors,
                     attachments_dir=self.config.attachments_dir,
+                    history=history,
                 )
             else:
                 discussion_id, note_author, note_body = answers[0]
@@ -1015,6 +1021,7 @@ class GitLabReviewChannel(BaseChannel):
                     people=self._people_for(authors),
                     authors=authors,
                     attachments_dir=self.config.attachments_dir,
+                    history=history,
                 )
 
         if not self._state.try_start_run(info.iid, self.config.max_runs_per_mr_per_hour):

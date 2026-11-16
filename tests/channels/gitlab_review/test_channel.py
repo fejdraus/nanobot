@@ -384,6 +384,23 @@ async def test_reply_in_reviewer_thread_runs_scoped_review(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_reply_in_reviewer_thread_brings_the_earlier_review_of_the_mr(tmp_path: Path) -> None:
+    async with Harness(tmp_path) as h:
+        await h.review(42, [{"type": "note", "body": "флаг не учитывает отменённые"}], summary="Проверил фильтр по статусу")
+        await h.review(43, [{"type": "note", "body": "чужое замечание"}])
+        h.gitlab.discussions["d1"] = [_note("a.tyra", "issue"), _note("author", "fixed it")]
+        before = len(h.inbound)
+        assert await asyncio.to_thread(_post, h.port, _note_payload(), event="Note Hook") == 200
+        await _until(lambda: len(h.inbound) > before)
+        turn = h.inbound[before]
+        await h.answer(42, [])
+    assert "Your earlier reviews of this merge request" in turn.content
+    assert "Проверил фильтр по статусу" in turn.content
+    assert "флаг не учитывает отменённые" in turn.content
+    assert "чужое замечание" not in turn.content
+
+
+@pytest.mark.asyncio
 async def test_notes_in_one_thread_are_debounced_into_one_run(tmp_path: Path) -> None:
     async with Harness(tmp_path, thread_debounce_seconds=0.3) as h:
         h.gitlab.discussions["d1"] = [_note("a.tyra"), _note("author", "img"), _note("author", "text")]
