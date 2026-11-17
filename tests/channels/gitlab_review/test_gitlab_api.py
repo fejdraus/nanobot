@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from nanobot.channels.gitlab_review.gitlab_api import GitLabApi, GitLabApiError
+from nanobot.channels.gitlab_review.gitlab_api import AI_MARK, GitLabApi, GitLabApiError
 from nanobot.channels.gitlab_review.mcp_client import McpToolError
 
 PROJECT = "group/project"
@@ -62,12 +62,15 @@ async def test_every_published_text_starts_with_the_ai_mark() -> None:
     api = GitLabApi(mcp, PROJECT)
     await api.create_discussion(42, "Поле не учитывает отмену", {"new_path": "f", "new_line": 3})
     await api.create_note(42, "- первое\n- второе")
-    await api.reply(42, "d1", "[AI] Уже помечено")
+    await api.reply(42, "d1", AI_MARK + " Уже помечено")
+    await api.reply(42, "d2", "[AI] Модель поставила метку сама")
     await api.approve(42, "sha")
     bodies = [args.get("body") for _, args in mcp.calls]
+    assert AI_MARK.startswith("🤖 ") and "[AI]" in AI_MARK
     assert bodies == [
-        "[AI] Поле не учитывает отмену",
-        "[AI]\n\n- первое\n- второе",
-        "[AI] Уже помечено",
+        AI_MARK + " Поле не учитывает отмену",
+        AI_MARK + "\n\n- первое\n- второе",
+        AI_MARK + " Уже помечено",
+        AI_MARK + " Модель поставила метку сама",
         None,
     ]

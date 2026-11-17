@@ -16,19 +16,26 @@ from typing import Any, cast
 from nanobot.channels.gitlab_review.mcp_client import McpToolError, ToolCaller
 
 _STATUS_RE = re.compile(r"GitLab (\d{3})\b")
-AI_MARK = "[AI]"
+AI_MARK = "🤖 $`\\color{#7B58CF}\\textbf{[AI]}`$"
+_PLAIN_MARKS = ("🤖 [AI]", "[AI]")
 _BLOCK_START_RE = re.compile(r"(#|[-*+] |> |\||```|\d+[.)] )")
 
 
 def mark_as_ai(body: str) -> str:
-    """Start a published text with ``[AI]`` so readers see the reviewer bot wrote it, not a person.
+    """Start a published text with the robot and a bold violet ``[AI]`` so readers see the bot wrote it.
 
-    A text that opens with a Markdown block (heading, list, quote, table, code) gets the mark on a
-    line of its own, so the block still renders.
+    The colour is GitLab inline math, so mail notifications show its source; the robot stays
+    readable there. A text that opens with a Markdown block (heading, list, quote, table, code)
+    gets the mark on a line of its own, so the block still renders. A plain ``[AI]`` mark the text
+    already starts with is replaced, not doubled.
     """
     text = body.lstrip()
     if text.startswith(AI_MARK):
         return body
+    plain = next((mark for mark in _PLAIN_MARKS if text.startswith(mark)), None)
+    if plain is not None:
+        body = text[len(plain):].lstrip(" ")
+        text = body.lstrip()
     if _BLOCK_START_RE.match(text):
         return f"{AI_MARK}\n\n{body}"
     return f"{AI_MARK} {body}"
