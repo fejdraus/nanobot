@@ -51,3 +51,23 @@ async def test_gitlab_status_survives_the_mcp_error_text() -> None:
     assert caught.value.status == 400
     assert "line_code" in str(caught.value)
 
+
+
+@pytest.mark.asyncio
+async def test_every_published_text_starts_with_the_ai_mark() -> None:
+    def answer(tool: str, arguments: dict[str, Any]) -> str:
+        return "{}"
+
+    mcp = FakeMcp(answer)
+    api = GitLabApi(mcp, PROJECT)
+    await api.create_discussion(42, "Поле не учитывает отмену", {"new_path": "f", "new_line": 3})
+    await api.create_note(42, "- первое\n- второе")
+    await api.reply(42, "d1", "[AI] Уже помечено")
+    await api.approve(42, "sha")
+    bodies = [args.get("body") for _, args in mcp.calls]
+    assert bodies == [
+        "[AI] Поле не учитывает отмену",
+        "[AI]\n\n- первое\n- второе",
+        "[AI] Уже помечено",
+        None,
+    ]

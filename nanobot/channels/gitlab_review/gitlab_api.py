@@ -16,6 +16,22 @@ from typing import Any, cast
 from nanobot.channels.gitlab_review.mcp_client import McpToolError, ToolCaller
 
 _STATUS_RE = re.compile(r"GitLab (\d{3})\b")
+AI_MARK = "[AI]"
+_BLOCK_START_RE = re.compile(r"(#|[-*+] |> |\||```|\d+[.)] )")
+
+
+def mark_as_ai(body: str) -> str:
+    """Start a published text with ``[AI]`` so readers see the reviewer bot wrote it, not a person.
+
+    A text that opens with a Markdown block (heading, list, quote, table, code) gets the mark on a
+    line of its own, so the block still renders.
+    """
+    text = body.lstrip()
+    if text.startswith(AI_MARK):
+        return body
+    if _BLOCK_START_RE.match(text):
+        return f"{AI_MARK}\n\n{body}"
+    return f"{AI_MARK} {body}"
 
 
 class GitLabApiError(RuntimeError):
@@ -78,16 +94,16 @@ class GitLabApi:
         return await self._pages(f"/project/merge_requests/{iid}/diffs", {}, max_pages)
 
     async def create_discussion(self, iid: int, body: str, position: dict[str, Any]) -> None:
-        arguments = {"project": self._project, "iid": iid, "body": body}
+        arguments = {"project": self._project, "iid": iid, "body": mark_as_ai(body)}
         arguments.update({key: value for key, value in position.items() if value is not None})
         await self._call("gitlab_create_mr_discussion", arguments)
 
     async def create_note(self, iid: int, body: str) -> None:
-        await self._call("gitlab_create_mr_note", {"project": self._project, "iid": iid, "body": body})
+        await self._call("gitlab_create_mr_note", {"project": self._project, "iid": iid, "body": mark_as_ai(body)})
 
     async def reply(self, iid: int, discussion_id: str, body: str) -> None:
         await self._call("gitlab_reply_to_mr_discussion", {
-            "project": self._project, "iid": iid, "discussion_id": discussion_id, "body": body,
+            "project": self._project, "iid": iid, "discussion_id": discussion_id, "body": mark_as_ai(body),
         })
 
     async def set_thread_resolved(self, iid: int, discussion_id: str, resolved: bool) -> None:
