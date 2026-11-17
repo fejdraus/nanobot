@@ -20,9 +20,13 @@ from nanobot.channels.gitlab_review.people import (
 from nanobot.channels.gitlab_review.proposals import ACTIONS_FENCE, DECISION_FENCE
 
 _LANGUAGE = (
-    "Language: only these instructions are in English. Everything people read must be in Russian — "
-    "the summary before the actions block (a Russian-speaking human reads it in Telegram), the "
-    "bodies of comments and replies for GitLab, and your answers in the conversation."
+    "Language: only these instructions are in English. The summary before the actions block and "
+    "your answers in the conversation must be in Russian: a Russian-speaking human reads them in "
+    "Telegram. The bodies of comments and replies for GitLab are written in the language of the "
+    "developer they address: a thread reply in the language of the message it answers, a new "
+    "remark in the language the MR author writes in, as their profile or their own messages in "
+    "the MR show. If that language is unclear, write in Russian. Code, identifiers and quotes stay "
+    "as they are."
 )
 
 RUSSIAN_RETRY = (
