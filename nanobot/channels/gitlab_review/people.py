@@ -42,6 +42,20 @@ _PROFILE_RE = re.compile(
     r"```" + re.escape(PROFILE_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)\r?\n```",
     re.DOTALL,
 )
+DELIVERY_RULES = """\
+Profiles of the people involved. Use them to choose how to put each remark and reply to that \
+person; what you flag, how strictly, and when you propose an approval are the same for everyone.
+- Every remark says briefly why it matters, enough to understand it without asking back. Adapt \
+the form of that explanation, never drop it.
+- Judge understanding by the code, not by silence: a fix that follows the letter of a remark but \
+misses its point, or the same kind of mistake again after a fix, means the remark was not \
+understood. For such a person explain more: the mechanism, an example of the right solution, a \
+similar place in the code.
+- If they ask several questions or number them, answer each one, in their order.
+- Back a remark with the kind of evidence that convinces this person: data from the database, \
+a reference to code, a screenshot.
+- With someone who argues with facts, lead with the facts.\
+"""
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._-]{0,63})")
 _LABEL_RE = re.compile(
@@ -173,10 +187,7 @@ class PeopleStore:
             sections.append(text.rstrip())
         if not sections:
             return ""
-        return (
-            "Profiles of the people involved — how best to discuss with them. Adapt the delivery, "
-            "but review everyone equally strictly.\n\n" + "\n\n".join(sections)
-        )
+        return f"{DELIVERY_RULES}\n\n" + "\n\n".join(sections)
 
 
 def _parse_block(body: str) -> list[PersonNote]:

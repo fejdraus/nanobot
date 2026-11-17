@@ -94,7 +94,9 @@ def people_rules(usernames: list[str]) -> str:
         "daily consolidation decides what becomes their profile. Good evidence: the language and tone "
         "they write in, how they take a remark (argue with facts, agree and fix, answer with a "
         "screenshot, defer), what helped them understand it, a kind of mistake you have seen from them "
-        "before. Skip ordinary work (fixed the remarks, answered quickly), the specific mistakes "
+        "before, a fix that followed the letter of your remark but missed its point, the same kind of "
+        "mistake coming back after a fix. Silence alone shows nothing: do not note it. Skip ordinary "
+        "work (fixed the remarks, answered quickly), the specific mistakes "
         "already in your comments, judgements of character, anything personal outside work, and "
         "guesses. Write the notes in Russian. If there is nothing to record, omit the block."
     )
@@ -321,6 +323,9 @@ def dream_prompt(
 - Communication: the language they write in, length and tone, how they respond to remarks \
 (argue with facts, agree and fix, answer with screenshots, defer to someone), what helps them \
 understand a remark. Take this from their own messages first.
+- Whether their fixes address the point of a remark or only its letter, and whether a kind of \
+mistake came back after it was fixed: this tells the reviewer how much to explain. Judge it by \
+the code; a silent fix alone shows neither understanding nor its lack.
 - Code habits: only patterns seen in at least two different MRs. A single slip is not a habit.
 - Strengths and areas: modules and technologies they clearly know.
 - One atomic fact per line: one short sentence, at most {MAX_FACT_CHARS} characters including the MRs \
