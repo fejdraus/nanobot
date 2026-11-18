@@ -64,13 +64,14 @@ async def test_every_published_text_starts_with_the_ai_mark() -> None:
     await api.create_note(42, "- первое\n- второе")
     await api.reply(42, "d1", AI_MARK + " Уже помечено")
     await api.reply(42, "d2", "[AI] Модель поставила метку сама")
+    await api.reply(42, "d3", "🤖 [AI] Старая метка")
     await api.approve(42, "sha")
     bodies = [args.get("body") for _, args in mcp.calls]
-    assert AI_MARK.startswith("🤖 ") and "[AI]" in AI_MARK
     assert bodies == [
         AI_MARK + " Поле не учитывает отмену",
         AI_MARK + "\n\n- первое\n- второе",
         AI_MARK + " Уже помечено",
         AI_MARK + " Модель поставила метку сама",
+        AI_MARK + " Старая метка",
         None,
     ]
