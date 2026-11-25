@@ -249,7 +249,7 @@ Internal variables such as `NANOBOT_RESTART_*` and `NANOBOT_PATH_*` are set by n
 
 ## Langfuse Observability
 
-Use Langfuse to trace OpenAI-compatible model calls and Codex OAuth calls. Configure it with environment variables, not `config.json`.
+Use Langfuse to trace OpenAI-compatible model calls and Codex OAuth calls. Keep the credentials and service URL in the environment. In WebUI Settings → System, turn Langfuse off and restart nanobot to stop sending model inputs and outputs without removing the keys. Turn it back on and restart to resume. The switch defaults to on for existing environment-based setups.
 
 Install the optional package in the same Python environment that runs nanobot:
 
@@ -273,7 +273,7 @@ $env:LANGFUSE_PUBLIC_KEY = "pk-lf-..."
 $env:LANGFUSE_BASE_URL = "https://cloud.langfuse.com"
 ```
 
-When `LANGFUSE_SECRET_KEY` is set and the `langfuse` package is installed, tracing is enabled for OpenAI-compatible providers and the Codex OAuth provider (`openai_codex`). If the package is missing, nanobot logs a warning and model calls continue without tracing.
+With the switch on, `LANGFUSE_SECRET_KEY` set, and the `langfuse` package installed, tracing is enabled for OpenAI-compatible providers and the Codex OAuth provider (`openai_codex`). If the package is missing, nanobot logs a warning and model calls continue without tracing.
 
 Use the Langfuse region or self-hosted URL that matches your project. The [Langfuse OpenAI SDK docs](https://langfuse.com/integrations/model-providers/openai-py) use `LANGFUSE_BASE_URL` for cloud regions and self-hosted instances.
 
@@ -306,6 +306,8 @@ A Base URL is the service address nanobot sends model requests to. Change it onl
 > - **Kimi Coding Plan**: Use `providers.kimiCoding` with `provider: "kimi_coding"` for Kimi's dedicated Anthropic Messages API endpoint. The endpoint requires a Claude-compatible `User-Agent`; nanobot sends `claude-code/0.1.0` by default, and you can override it with `extraHeaders.User-Agent` if your account requires a different value.
 > - **VolcEngine / BytePlus Coding Plan**: Subscription endpoints are configured through dedicated providers `volcengineCodingPlan` or `byteplusCodingPlan`, separate from the pay-per-use `volcengine` / `byteplus` providers.
 > - **OpenCode Zen / Go**: `providers.opencode` (canonical Zen), the legacy-compatible `providers.opencodeZen`, and `providers.opencodeGo` use the same `OPENCODE_API_KEY`, but route to different OpenCode gateways. These providers use OpenCode's OpenAI-compatible `chat/completions` endpoints; choose model IDs from that endpoint family.
+> - **ShengSuanYun (胜算云)**: Select **ShengSuanYun Router** in **Settings → Models → Add provider** or in the Quick Start wizard (`nanobot onboard --wizard`). The built-in connection `providers.shengsuanyun` uses the [Router API URL](https://lean.shengsuanyun.com/apidocs/guides/quick-start). Use the full model ID, such as `deepseek/deepseek-v4-flash`. The default is Chat Completions; select Responses only for models that support it.
+>   An existing `shengsuanyun` connection with a custom API declaration, name, thinking style, alternate API URL, or an explicit URL without a key continues to use its custom settings. To add the built-in connection alongside it, rename the custom key and update its matching provider references and any model IDs prefixed with `shengsuanyun/`. Custom connections created through the WebUI already use distinct keys.
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, open the zhipu connection in **Settings → Models** and set its base URL to `https://open.bigmodel.cn/api/coding/paas/v4`.
 > - **Alibaba Cloud BaiLian**: The built-in `dashscope` provider already defaults to `https://dashscope.aliyuncs.com/compatible-mode/v1`; no endpoint override is needed for that service.
 > - **ModelScope**: The built-in `modelscope` provider already defaults to `https://api-inference.modelscope.cn/v1`; no endpoint override is needed for that service.
@@ -819,7 +821,9 @@ nanobot agent -m "Hello!"
 
 The WebUI model selector loads the models available to the signed-in account from Codex's online catalog. Context-window and reasoning-effort metadata come from that response; if discovery is unavailable, nanobot keeps a small built-in fallback instead of emptying the selector.
 
-Codex Fast mode can be enabled from the WebUI provider settings, or with:
+In **Settings → Models**, open a Codex preset and select the single lightning button for Fast or the double lightning button for Ultrafast where supported. Select the active button again to turn the speed boost off. The control shows the provider's current speed if the preset does not specify one. The config field is `modelPresets.<name>.codexFastMode` (`true`, `false`, or `"ultrafast"`); omit the field to use the provider default below. A topic's explicit speed choice overrides its preset.
+
+Set the connection-wide default in the WebUI provider settings or in `extraBody`:
 
 ```json
 {
@@ -833,7 +837,7 @@ Codex Fast mode can be enabled from the WebUI provider settings, or with:
 }
 ```
 
-The switch sends the Responses API `service_tier: "priority"` value. It only works for models and accounts that support Fast mode; turn the switch off to return to standard processing. Fast mode consumes Codex credits at a higher rate. See the [OpenAI Codex rate card](https://help.openai.com/en/articles/20001106) for current details.
+Fast sends `service_tier: "priority"`; Ultrafast sends `service_tier: "ultrafast"`; explicitly turning the speed boost off removes the tier from the request. Fast and Ultrafast consume Codex credits at higher rates, and Ultrafast also requires a supported model and an eligible account or workspace. See the [Codex speed options](https://learn.chatgpt.com/docs/agent-configuration/speed.md) for current availability.
 
 For proxy, remote/headless login, model-name, or config-key errors, see [`troubleshooting.md`](./troubleshooting.md#provider-and-model-problems).
 
@@ -1576,6 +1580,8 @@ OpenAI Codex, xAI Grok subscriptions, and Azure OpenAI use Responses; Anthropic 
 **Advanced options** opens in a separate dialog; closing it returns to the preset editor. Changing a preset's model or provider resets its API selection to Auto unless the same update supplies a new declaration. Each fallback preset keeps its own API settings. Existing `agents.defaults.api` and inline fallback `api` values are preserved when converting to named presets.
 
 Use the **Image input** switch in each preset to match the model's image capability. It is enabled by default; turn it off for text-only models. Requests containing images follow the configured primary and fallback order, using presets with **Image input** enabled. Text-only requests use the full configured order. If every candidate is text-only, nanobot returns an image-input error before sending the request.
+
+In WebUI, if **Image input** is off and no fallback accepts images, the composer keeps the draft. Select **View preset** in the toast to check the switch. Turning it on lets nanobot send images, but the model must support them. If the provider rejects a request containing images before any work is saved, the toast also takes you to the preset.
 
 For manual configuration, set `supportsImages` on a named preset, the implicit `agents.defaults` preset, or an inline fallback. Each defaults independently to `true`; use `false` for a text-only model. Transient retries preserve the original messages and images, and API validation errors are returned directly.
 
@@ -2625,6 +2631,8 @@ The model may explicitly request a different hard runtime up to `maxRuntimeLimit
 For existing configurations, `timeout` remains a hard-runtime alias: `"timeout": 60` still stops a command after 60 seconds, and `"timeout": 0` still means no hard deadline. Use either `timeout` or `maxRuntime`, not both.
 
 `exec` waits up to 1 second by default, then returns an active session ID if the command is still running. Use `exec_session` with that ID to read further output, wait, or stop the command; do not launch the command again just because it is still running. `yield_time_ms` changes the initial wait (0–30000 ms), not the command's runtime budget. Omitting it keeps stdin closed; set it explicitly when the command needs interactive input. `exec_session` waits are also bounded by `timeout_ms`, including `until_exit: true`; an expired wait leaves the command running. Direct `!` shell commands still wait for their completed result.
+
+If too many commands are running in the background, starting another may stop the oldest one. Before rerunning it, check what it already changed.
 
 The tool result distinguishes a hard-runtime termination from inactivity. With `idleAction: "report"`, a silent command continues running under its hard-runtime limit. With `idleAction: "terminate"`, inactivity stops the command and the result reports that reason. Both limits apply without polling. Commands are cleaned up when they finish, reach an enforced limit, or their owning session is cancelled or deleted; normal operation does not require manual process management. `yield_time_ms` and an `exec_session` wait timeout only control how long a tool call waits before returning; neither stops the command nor resets its runtime or inactivity clock.
 

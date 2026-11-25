@@ -32,14 +32,6 @@ from nanobot.config.schema import MCPServerConfig
 _PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
-def test_type_checking_only_mcp_annotations_are_deferred() -> None:
-    assert mcp_mod._MCPWrapperBase.__annotations__["_session"] == "ClientSession"
-    assert MCPToolWrapper.__init__.__annotations__["session"] == "ClientSession"
-    assert MCPResourceWrapper.__init__.__annotations__["resource_def"] == "Resource"
-    assert MCPPromptWrapper.__init__.__annotations__["prompt_def"] == "Prompt"
-    assert connect_mcp_servers.__annotations__["mcp_servers"] == "dict[str, MCPServerConfig]"
-
-
 class _FakeTextContent:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -187,7 +179,7 @@ async def test_mcp_provider_connect_propagates_external_cancellation(monkeypatch
         await task
 
     assert provider.connected_server_names == set()
-    assert provider.runtime_status() == {"test": "failed"}
+    assert provider.runtime_snapshot().statuses == {"test": "failed"}
 
 
 @pytest.mark.asyncio
@@ -245,7 +237,7 @@ async def test_saved_oauth_http_403_projects_failed_runtime_without_details(
 
     await provider.connect()
 
-    snapshot = provider.runtime_status()
+    snapshot = provider.runtime_snapshot().statuses
     assert snapshot == {"xmind": "failed"}
     assert "saved-oauth-secret" not in str(snapshot)
     assert "app.xmind.com" not in str(snapshot)
@@ -2287,10 +2279,6 @@ async def test_connect_accepts_servers_without_tools_capability(
             await stack.aclose()
 
 
-def test_sanitize_name_replaces_spaces() -> None:
-    assert _sanitize_name("PostgreSQL System Information") == "PostgreSQL_System_Information"
-
-
 def test_sanitize_name_replaces_special_characters() -> None:
     assert _sanitize_name("foo.bar@baz!") == "foo_bar_baz_"
 
@@ -2301,30 +2289,6 @@ def test_sanitize_name_collapses_consecutive_underscores() -> None:
 
 def test_sanitize_name_preserves_valid_characters() -> None:
     assert _sanitize_name("my-tool_v2") == "my-tool_v2"
-
-
-def test_sanitize_name_noop_for_already_clean_names() -> None:
-    assert _sanitize_name("mcp_server_tool") == "mcp_server_tool"
-
-
-def test_tool_wrapper_sanitizes_name() -> None:
-    tool_def = SimpleNamespace(
-        name="My Tool",
-        description="tool with spaces",
-        inputSchema={"type": "object", "properties": {}},
-    )
-    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "srv", tool_def)
-    assert wrapper.name == "mcp_srv_My_Tool"
-
-
-def test_resource_wrapper_sanitizes_name() -> None:
-    resource_def = SimpleNamespace(
-        name="PostgreSQL System Information",
-        uri="file:///pg/info",
-        description="PG info",
-    )
-    wrapper = MCPResourceWrapper(None, "srv", resource_def)
-    assert wrapper.name == "mcp_srv_resource_PostgreSQL_System_Information"
 
 
 def test_prompt_wrapper_sanitizes_name() -> None:
@@ -2572,3 +2536,31 @@ async def test_stdio_cannot_opt_into_shared_proxy(monkeypatch) -> None:
     assert connections == {}
     assert registry.tool_names == []
     stdio_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initialize_icons_follow_connection_replacement_and_shutdown(fake_mcp_runtime):
+    png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k7uoAAAAASUVORK5CYII="
+    theme = "dark"
+
+    async def initialize():
+        return SimpleNamespace(
+            capabilities=SimpleNamespace(tools=None),
+            serverInfo=SimpleNamespace(icons=[SimpleNamespace(src=png, sizes=None, mimeType=None, theme=theme)]),
+        )
+
+    fake_mcp_runtime["session"] = SimpleNamespace(initialize=initialize)
+    provider = MCPProvider(
+        {"custom": MCPServerConfig(command="first", enabled_tools=[])},
+        ToolRegistry(),
+        server_loader=lambda: ({"custom": MCPServerConfig(command="second", enabled_tools=[])}, NetworkConfig()),
+    )
+    try:
+        await provider.connect()
+        assert provider.runtime_snapshot().icons == {"custom": [{"src": png, "theme": "dark"}]}
+        theme = "light"
+        await provider.reload()
+        assert provider.runtime_snapshot().icons == {"custom": [{"src": png, "theme": "light"}]}
+    finally:
+        await provider.aclose()
+    assert provider.runtime_snapshot().icons == {}

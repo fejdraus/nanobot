@@ -8,6 +8,7 @@ import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { activateReloadCache, clearReloadCache, writeReloadCache } from "@/lib/reload-cache";
 import { ClientProvider } from "@/providers/ClientProvider";
 import { canonicalThreadPayload } from "./thread-test-payload";
+import type { WebuiThreadPersistedPayload } from "@/lib/types";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -21,6 +22,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
 
 function fakeClient() {
   const sessionUpdateHandlers = new Set<(chatId: string, scope?: string) => void>();
+  const archiveHandlers = new Set<() => void>();
   return {
     status: "open" as const,
     defaultChatId: null as string | null,
@@ -32,11 +34,17 @@ function fakeClient() {
       sessionUpdateHandlers.add(handler);
       return () => sessionUpdateHandlers.delete(handler);
     },
+    onSessionsChanged: (handler: () => void) => {
+      archiveHandlers.add(handler);
+      return () => archiveHandlers.delete(handler);
+    },
+    emitSessionsChanged: () => archiveHandlers.forEach(handler => handler()),
     emitSessionUpdate: (chatId: string, scope?: string) => {
       for (const handler of sessionUpdateHandlers) handler(chatId, scope);
     },
     sendMessage: vi.fn(),
     newChat: vi.fn(),
+    sendSystemCommand: vi.fn(),
     forkChat: vi.fn(),
     attach: vi.fn(),
     connect: vi.fn(),
@@ -66,20 +74,22 @@ describe("useSessions", () => {
   it("distinguishes initial loading from revalidating a successfully loaded empty list", async () => {
     let finish!: (rows: Awaited<ReturnType<typeof api.listSessions>>) => void;
     vi.mocked(api.listSessions).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
-    const { result } = renderHook(() => useSessions(), { wrapper: wrap(fakeClient()) });
+    const { result, rerender } = renderHook((full: boolean) => useSessions(full), { initialProps: false, wrapper: wrap(fakeClient()) });
     expect(result.current.initialLoading).toBe(true);
     await act(async () => finish([]));
     expect(result.current.initialLoading).toBe(false);
-    let refresh!: Promise<void>;
-    act(() => { refresh = result.current.refresh(); });
+    expect(api.listSessions).toHaveBeenLastCalledWith("tok", false);
+    rerender(true);
     expect(result.current.loading).toBe(true);
     expect(result.current.initialLoading).toBe(false);
-    await act(async () => { finish([]); await refresh; });
+    expect(api.listSessions).toHaveBeenLastCalledWith("tok", undefined);
+    await act(async () => finish([{ key: "websocket:a", chatId: "a", channel: "websocket", archived: true, preview: "A", createdAt: null, updatedAt: null }]));
+    expect(result.current.archivedKeys).toEqual(["websocket:a"]);
   });
 
   it("shows tab-cached sessions while revalidating and removes server-deleted rows", async () => {
     activateReloadCache("ws://localhost:8765/");
-    writeReloadCache("sessions", [{
+    writeReloadCache("activeSessions", [{
       key: "websocket:cached", channel: "websocket", chatId: "cached", preview: "Saved answer",
       createdAt: null, updatedAt: null,
     }]);
@@ -111,7 +121,8 @@ describe("useSessions", () => {
     try {
       for (let index = 0; index < 20; index++) {
         await act(async () => {
-          client.emitSessionUpdate("burst");
+          if (index % 2) client.emitSessionsChanged();
+          else client.emitSessionUpdate("burst");
           await vi.advanceTimersByTimeAsync(10);
         });
       }
@@ -433,10 +444,31 @@ describe("useSessions", () => {
     expect(result.current.sessions[0]?.workspaceScope).toEqual(workspaceScope);
   });
 
-  it("stores an optimistic model preset when creating a chat", async () => {
+  it.each(["host", "project", "access"])("does not reuse a failed draft after a %s change", async (change) => {
+    vi.mocked(api.listSessions).mockResolvedValue([]);
+    const local = fakeClient();
+    const remote = fakeClient();
+    local.newChat.mockResolvedValueOnce("failed").mockResolvedValueOnce("other-scope");
+    remote.newChat.mockResolvedValue("other-host");
+    local.sendSystemCommand.mockRejectedValue(new Error("Rejected"));
+    remote.sendSystemCommand.mockRejectedValue(new Error("Rejected"));
+    let owner = local;
+    const { result, rerender } = renderHook(() => useSessions(), { wrapper: (props) => wrap(owner)(props) });
+    const scope = { project_path: "/project", access_mode: "restricted" as const };
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await expect(result.current.createChat(scope, "fast")).rejects.toThrow("Rejected");
+    if (change === "host") { owner = remote; rerender(); }
+    const nextScope = change === "project" ? { ...scope, project_path: "/another" }
+      : change === "access" ? { ...scope, access_mode: "full" as const } : scope;
+    await expect(result.current.createChat(nextScope, "fast")).rejects.toThrow("Rejected");
+    expect(owner.sendSystemCommand).toHaveBeenLastCalledWith(change === "host" ? "other-host" : "other-scope", "/model fast");
+  });
+
+  it("stores the confirmed model preset when creating a chat", async () => {
     vi.mocked(api.listSessions).mockResolvedValue([]);
     const client = fakeClient();
     client.newChat.mockResolvedValue("chat-fast");
+    client.sendSystemCommand.mockResolvedValue({ command_result: { command: "/model", switched_preset: "fast" } });
 
     const { result } = renderHook(() => useSessions(), {
       wrapper: wrap(client),
@@ -1166,6 +1198,49 @@ describe("useSessions", () => {
     expect(api.fetchWebuiThread).toHaveBeenLastCalledWith("tok", "websocket:empty-tail",
       expect.objectContaining({ before: "inside", limit: 120 }));
     expect(result.current.hasMoreBefore).toBe(false);
+  });
+
+  it("keeps one pull pending through telemetry pages and retries from its failed continuation", async () => {
+    const initial: WebuiThreadPersistedPayload = {
+      schemaVersion: 3, projection: "events",
+      events: [{ event: "message", chat_id: "ready", projection_id: "answer", turn_id: "turn", turn_seq: 1, text: "Visible answer" }],
+      page: { before_cursor: "telemetry", has_more_before: true },
+    };
+    let fail!: (error: Error) => void;
+    vi.mocked(api.fetchWebuiThread).mockResolvedValueOnce(initial).mockResolvedValueOnce({
+      ...initial, events: [
+        { event: "model_request", chat_id: "ready", projection_id: "request", turn_id: "turn", turn_seq: 2,
+          request_id: "request", run_id: "run", sequence: 1, phase: "completed" },
+        { event: "turn_end", chat_id: "ready", projection_id: "end", turn_id: "turn", turn_seq: 3, latency_ms: 1000 },
+      ], page: { before_cursor: "content", has_more_before: true },
+    }).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+    const loading: boolean[] = [];
+    const { result } = renderHook(() => {
+      const history = useSessionHistory("websocket:ready");
+      loading.push(history.loadingOlder);
+      return history;
+    }, { wrapper: wrap(fakeClient()) });
+    await waitFor(() => expect(result.current.messages[0]?.content).toBe("Visible answer"));
+    loading.length = 0;
+    let finished = false;
+    act(() => { void result.current.loadOlder().then(() => { finished = true; }); });
+    await waitFor(() => expect(api.fetchWebuiThread).toHaveBeenCalledTimes(3));
+    expect(finished).toBe(false);
+    expect(result.current.loadingOlder).toBe(true);
+    expect(loading).not.toContain(false);
+    expect(result.current.messages.map((row) => row.content)).toEqual(["Visible answer"]);
+    await act(async () => { fail(new Error("offline")); });
+    expect(finished).toBe(true);
+    expect(result.current.olderError).toBe("offline");
+    vi.mocked(api.fetchWebuiThread).mockResolvedValueOnce({ ...initial,
+      events: [{ event: "user_message", chat_id: "ready", projection_id: "old", text: "Earlier question", starts_turn: true }],
+      page: { before_cursor: null, has_more_before: false },
+    });
+    await act(async () => { await result.current.loadOlder(); });
+    expect(api.fetchWebuiThread).toHaveBeenLastCalledWith("tok", "websocket:ready", expect.objectContaining({ before: "content" }));
+    expect(result.current.messages.map((row) => row.content)).toEqual(["Earlier question", "Visible answer"]);
+    expect(result.current.loadingOlder).toBe(false);
+    expect(result.current.olderError).toBeNull();
   });
 
   it("keeps older-history failures separate and retries them explicitly", async () => {

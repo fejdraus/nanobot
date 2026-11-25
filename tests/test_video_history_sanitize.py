@@ -18,7 +18,8 @@ def _sanitize(content):
     that one attribute exercises the real code path.
     """
     stub = SimpleNamespace(max_tool_result_chars=16_000)
-    return AgentLoop._sanitize_persisted_blocks(stub, content)
+    stub._redact_inline_videos = AgentLoop._redact_inline_videos
+    return AgentLoop._redact_persisted_tool_images(stub, content)
 
 
 def test_video_placeholder_carries_the_path():
@@ -80,3 +81,16 @@ def test_remote_video_url_is_left_alone():
     out = _sanitize([block])
 
     assert out[0] == block
+
+
+def test_user_message_video_is_replaced_and_image_kept():
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+    video = {
+        "type": "video_url",
+        "video_url": {"url": "data:video/mp4;base64,AAAA"},
+        "_meta": {"path": "/cache/clip.mp4"},
+    }
+
+    out = AgentLoop._redact_inline_videos([image, video])
+
+    assert out == [image, {"type": "text", "text": "[video: /cache/clip.mp4]"}]

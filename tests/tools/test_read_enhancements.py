@@ -39,13 +39,6 @@ def _document_source(text: str) -> DocumentLineSource:
     return DocumentLineSource(lines)
 
 
-class TestReadDescriptionFix:
-
-    def test_description_mentions_image_support(self):
-        tool = ReadFileTool()
-        assert "image" in tool.description.lower()
-
-
 class TestReadDedup:
 
     @pytest.fixture()
@@ -110,7 +103,7 @@ class TestReadDedup:
                 return self.stream.seek(*args)
 
         monkeypatch.setattr(
-            "nanobot.agent.tools.filesystem.os.fdopen",
+            "nanobot.execution.files.os.fdopen",
             lambda *args, **kwargs: CountingStream(real_fdopen(*args, **kwargs)),
         )
         visible = {} if case == "not_visible" else {"read-1": first}
@@ -443,14 +436,8 @@ class TestFileStateHashFallback:
         assert "unchanged" not in second.lower()
 
 
-# Line-ending normalization
-# ReadFileTool normalizes CRLF -> LF before line-splitting. This primarily
-# helps Windows users whose checkouts carry CRLF line endings and whose
-# subsequent StrReplace edits would otherwise miss on `\r` boundaries. The
-# normalization applies on all platforms; these tests lock that in so the
-# behavior is intentional and discoverable, not accidental.
-
 class TestReadFileLineEndingNormalization:
+    """Edits must match text read from Windows checkouts."""
 
     @pytest.fixture()
     def tool(self, tmp_path):
@@ -653,14 +640,6 @@ class TestOfficeDocTruncation:
         assert "truncated" not in result
 
 
-class TestReadFileDescription:
-
-    def test_description_mentions_documents(self):
-        tool = ReadFileTool()
-        desc = tool.description.lower()
-        assert "document" in desc or "docx" in desc or "xlsx" in desc or "pptx" in desc
-
-
 class TestBoundedTextReads:
 
     @pytest.mark.asyncio
@@ -807,7 +786,7 @@ class TestBoundedTextReads:
                 return chunk
 
         monkeypatch.setattr(
-            "nanobot.agent.tools.filesystem.os.fdopen",
+            "nanobot.execution.files.os.fdopen",
             lambda *args, **kwargs: GrowingStream(real_fdopen(*args, **kwargs)),
         )
         result = await tool.execute(path=str(f))
@@ -886,7 +865,7 @@ class TestBoundedTextReads:
                 return chunk
 
         monkeypatch.setattr(
-            "nanobot.agent.tools.filesystem.os.fdopen",
+            "nanobot.execution.files.os.fdopen",
             lambda *args, **kwargs: ChangeAfterPrecheck(real_fdopen(*args, **kwargs)),
         )
         with file_state.file_read_context("read-2", lambda: {"read-1": first}):
@@ -932,7 +911,7 @@ class TestBoundedTextReads:
                 return chunk
 
         monkeypatch.setattr(
-            "nanobot.agent.tools.filesystem.os.fdopen",
+            "nanobot.execution.files.os.fdopen",
             lambda *args, **kwargs: ChangeAfterPrecheck(real_fdopen(*args, **kwargs)),
         )
         tracemalloc.start()
@@ -972,7 +951,7 @@ class TestBoundedTextReads:
                 return chunk
 
         monkeypatch.setattr(
-            "nanobot.agent.tools.filesystem.os.fdopen",
+            "nanobot.execution.files.os.fdopen",
             lambda *args, **kwargs: GrowingStream(real_fdopen(*args, **kwargs)),
         )
         with file_state.file_read_context("read-2", lambda: {"read-1": first}):
@@ -1013,7 +992,7 @@ class TestBoundedTextReads:
         tool = ReadFileTool()
         try:
             with monkeypatch.context() as scoped:
-                scoped.setattr("nanobot.agent.tools.filesystem.os.open", open_replacement)
+                scoped.setattr("nanobot.execution.files.os.open", open_replacement)
                 result = await tool.execute(path=str(f))
         finally:
             try:

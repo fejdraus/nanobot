@@ -10,7 +10,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from loguru import logger
 
@@ -24,7 +24,8 @@ from nanobot.security.workspace_access import (
     default_workspace_scope,
     validate_workspace_scope_payload,
 )
-from nanobot.session.webui_turns import websocket_turn_wall_started_at
+from nanobot.session.webui_turns import latest_live_websocket_turn
+from nanobot.webui.metadata import WEBUI_PRESET_DRAFT_KEY
 from nanobot.webui.session_identity import webui_session_key
 
 if TYPE_CHECKING:
@@ -492,14 +493,17 @@ class WebUIWorkspaceController:
         scope: WorkspaceScope,
         *,
         expected_generation: str | None = None,
+        model_control: bool = False,
     ) -> tuple[str | None, bool]:
         async with self._scope_lock(chat_id):
             return await self._persist_scope(
                 webui_session_key(chat_id), scope, expected_generation,
+                admission="model_control" if model_control else "message",
             )
 
     async def _persist_scope(
         self, session_key: str, scope: WorkspaceScope, expected_generation: str | None = None,
+        *, admission: Literal["message", "model_control"] | None = None,
     ) -> tuple[str | None, bool]:
         generation = expected_generation
         created = False
@@ -509,6 +513,8 @@ class WebUIWorkspaceController:
                 {"webui": True, WORKSPACE_SCOPE_METADATA_KEY: scope.metadata()},
                 expected_generation=generation,
                 validate_existing=lambda metadata: self._validate_existing_project(metadata, scope),
+                on_create={WEBUI_PRESET_DRAFT_KEY: True} if admission == "model_control" else None,
+                remove=(WEBUI_PRESET_DRAFT_KEY,) if admission == "message" else (),
             )
         self._draft_scopes.pop(session_key, None)
         remember_webui_project(scope.project_path)
@@ -532,7 +538,7 @@ class WebUIWorkspaceController:
     async def stage_scope(self, chat_id: str, scope: WorkspaceScope) -> WorkspaceScope:
         """Keep a new chat's scope transient until its first accepted message."""
         async with self._scope_lock(chat_id):
-            if websocket_turn_wall_started_at(chat_id) is not None:
+            if latest_live_websocket_turn(chat_id) is not None:
                 raise WorkspaceScopeError("chat_running", status=409)
             session_key = webui_session_key(chat_id)
             if (

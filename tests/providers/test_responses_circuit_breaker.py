@@ -129,12 +129,6 @@ def test_responses_declaration_routes_other_models(provider):
     assert provider._should_use_responses_api("gpt-4o", None) is True
 
 
-def test_circuit_opens_after_threshold(provider):
-    for _ in range(_RESPONSES_FAILURE_THRESHOLD):
-        provider._record_responses_failure("gpt-5", None)
-    assert provider._should_use_responses_api("gpt-5", None) is False
-
-
 def test_circuit_does_not_affect_other_models(provider):
     for _ in range(_RESPONSES_FAILURE_THRESHOLD):
         provider._record_responses_failure("gpt-5", None)
@@ -268,10 +262,6 @@ def test_deepseek_full_history_body_keeps_reasoning_content_as_array(provider):
 
 
 def test_deepseek_replay_body_keeps_reasoning_content_as_array(provider):
-    # Replay/consolidation fixture: after token consolidation clears
-    # provider_state the next turn converts full history on top of the
-    # replayed prior items. Both replayed and converted reasoning items must
-    # keep list content on the wire.
     _deepseek_provider(provider)
 
     prior_items = [

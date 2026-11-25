@@ -82,4 +82,4 @@ def test_images_still_work_alongside_video(tmp_path):
 
     assert isinstance(content, list)
     kinds = [b["type"] for b in content]
-    assert kinds == ["text", "image_url", "video_url", "text"]
+    assert kinds == ["image_url", "video_url", "text"]

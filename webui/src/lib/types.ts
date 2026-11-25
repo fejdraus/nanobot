@@ -17,6 +17,7 @@ export interface UIContextCompaction extends ContextCompaction {
 
 export type UITurnPhase = "user" | "reasoning" | "activity" | "answer" | "complete";
 export type MessageDeliveryStatus = "sending" | "accepted" | "failed";
+export type InputProcessingStatus = "pending" | "consumed";
 export type MessageDeliveryErrorKind =
   | "message_too_big"
   | "workspace_scope_rejected"
@@ -118,6 +119,7 @@ export interface UIMessage {
   content: string;
   /** Literal output bypasses Markdown and content-based reply recognition. */
   renderAs?: "text";
+  sideChannel?: true;
   /** Invocation-time snapshots, never resolved from today's model presets. */
   responseSources?: ResponseSource[];
   /** Stable input identity, independent of its arrival or execution turn. */
@@ -143,8 +145,6 @@ export interface UIMessage {
   activityKind?: "model";
   /** Context-compaction lifecycle rendered as a standalone channel notice. */
   compaction?: UIContextCompaction;
-  /** Display-only localization marker for fixed /compact command replies. */
-  compactReply?: "empty" | "failed";
   /** User turn: optimistic blob URLs for preview. Replay: placeholder chips. */
   images?: UIImage[];
   media?: UIMediaAttachment[];
@@ -184,7 +184,10 @@ export interface UIMessage {
   reasoningStreamId?: string;
   /** Ephemeral delivery lifecycle for optimistic user messages. */
   deliveryStatus?: MessageDeliveryStatus;
+  /** Live UI hint; not part of the persisted transcript. */
+  processingStatus?: InputProcessingStatus;
   deliveryErrorKind?: MessageDeliveryErrorKind;
+  deliveryErrorDetail?: string;
 }
 
 /** Turn-owned telemetry, not a transcript row or body-history source. */
@@ -488,7 +491,21 @@ export interface UIFileEdit {
   diff?: UIFileDiff;
 }
 
+export type CodexFastMode = boolean | "ultrafast";
+
+export interface SessionModelOptions {
+  /** Null explicitly inherits the preset/provider value. */
+  reasoning_effort: string | null;
+  codex_fast_mode: CodexFastMode | null;
+}
+
+export interface ModelOptionsCapability {
+  reasoning_effort: { default: string | null; values: string[] };
+  codex_fast_mode?: { default: CodexFastMode; ultrafast_supported?: boolean };
+}
+
 export interface ChatSummary {
+  archived?: boolean;
   /** Server-side session key, e.g. ``websocket:abcd-...``. */
   key: string;
   /** Local channel + chat_id parts derived from ``key`` for convenience. */
@@ -500,6 +517,7 @@ export interface ChatSummary {
   preview: string;
   /** Model preset persisted for this session; null means it still follows the global default. */
   modelPreset?: string | null;
+  modelOptions?: SessionModelOptions;
   /** Unix epoch seconds when this session currently has a turn in flight. */
   runStartedAt?: number | null;
   /** Durable recovery state that needs attention after an interrupted turn. */
@@ -587,7 +605,6 @@ export interface SidebarViewState {
 export interface SidebarStatePayload {
   schema_version: number;
   pinned_keys: string[];
-  archived_keys: string[];
   session_order: string[];
   title_overrides: Record<string, string>;
   project_name_overrides: Record<string, string>;
@@ -773,6 +790,8 @@ export interface SettingsPayload {
     temperature: number;
     reasoning_effort: string | null;
     reasoning_effort_values?: string[];
+    codex_fast_mode?: CodexFastMode | null;
+    model_options?: ModelOptionsCapability;
     supports_images?: boolean;
     api?: ModelAPIConfig | null;
     extra_headers?: Record<string, string> | null;
@@ -781,6 +800,7 @@ export interface SettingsPayload {
   }>;
   model_call_order: string[];
   model_call_order_editable: boolean;
+  image_fallback_configured?: boolean;
   /** Whether an actual legacy model configuration is available to convert. */
   model_configuration_migratable?: boolean;
   /** Host can resolve the default request API for an unsaved model configuration. */
@@ -806,6 +826,8 @@ export interface SettingsPayload {
     request_apis?: ProviderRequestAPI[];
     adapter_request_apis?: ProviderRequestAPI[];
     provider_api_configurable?: boolean;
+    codex_fast_mode_supported?: boolean;
+    codex_ultrafast_models?: string[];
     api?: ModelAPIConfig | null;
     oauth_account?: string | null;
     oauth_expires_at?: number | null;
@@ -1292,7 +1314,15 @@ interface McpPresetField {
   env_var?: string | null;
 }
 
+export interface McpServerIcon {
+  src: string;
+  mimeType?: string;
+  sizes?: string[];
+  theme?: "light" | "dark";
+}
+
 export interface McpPresetInfo {
+  icons?: McpServerIcon[];
   name: string;
   display_name: string;
   category: string;
@@ -1320,6 +1350,7 @@ export interface McpPresetInfo {
   error?: string | null;
   enabled_tools?: string[];
   source?: "preset" | "custom" | string;
+  managed_by_cli?: string | null;
   manifest?: AppManifest;
 }
 
@@ -1348,6 +1379,7 @@ export interface McpOAuthFlowPayload {
 }
 
 export interface McpPresetsPayload {
+  plugin_server_icons?: Record<string, McpServerIcon[]>;
   presets: McpPresetInfo[];
   proxy_configured?: boolean;
   installed_count: number;
@@ -1409,6 +1441,7 @@ export interface ModelConfigurationCreate {
   contextWindowTokens?: number;
   temperature?: number;
   reasoningEffort?: string | null;
+  codexFastMode?: CodexFastMode | null;
   supportsImages?: boolean;
   api?: ModelAPIConfig | null;
   extraHeaders?: string;
@@ -1425,6 +1458,7 @@ export interface ModelConfigurationUpdate {
   contextWindowTokens?: number;
   temperature?: number;
   reasoningEffort?: string | null;
+  codexFastMode?: CodexFastMode | null;
   supportsImages?: boolean;
   api?: ModelAPIConfig | null;
   extraHeaders?: string;
@@ -1541,6 +1575,7 @@ export type InboundEvent =
       chat_id: string;
       request_id?: string;
       temporary?: boolean;
+      live_turn_ids?: string[];
       recovery_state?: RecoveryState;
       usage?: TurnUsage;
     }
@@ -1548,6 +1583,7 @@ export type InboundEvent =
       event: "message_accepted";
       chat_id: string;
       turn_id: string;
+      waiting_for_model?: true;
       media_urls?: UIMediaAttachment[];
       starts_turn?: boolean;
       active_turn_id?: string;
@@ -1557,6 +1593,7 @@ export type InboundEvent =
       event: "user_message";
       chat_id: string;
       text: string;
+      waiting_for_model?: true;
       turn_id?: string;
       active_turn_id?: string;
       starts_turn: boolean;
@@ -1573,6 +1610,8 @@ export type InboundEvent =
       event: "message";
       chat_id: string;
       text: string;
+      side_channel?: true;
+      command_result?: { command: "/model"; switched_preset: string };
       render_as?: "text";
       reply_to?: string;
       media?: string[];
@@ -1661,6 +1700,8 @@ export type InboundEvent =
       run_id: string;
       sequence: number;
       phase: "started" | "completed" | "failed" | "cancelled";
+      /** Inputs being answered by this request; present on started when identified. */
+      response_input_ids?: string[];
       usage?: TurnUsage;
       round_usages?: RoundUsage[];
       context_window_tokens?: number;
@@ -1699,6 +1740,7 @@ export type InboundEvent =
       scope?: "metadata" | "thread" | string;
       workspace_scope?: WorkspaceScopePayload;
     }
+  | { event: "sessions_changed" }
   | {
       event: "sidebar_state_updated";
       state: SidebarStatePayload;
@@ -1879,6 +1921,7 @@ export type Outbound =
       type: "message";
       chat_id: string;
       content: string;
+      locale?: string;
       media?: import("../../../packages/client-events/attachments").AttachmentReference[];
       cli_apps?: OutboundCliAppMention[];
       mcp_presets?: OutboundMcpPresetMention[];
@@ -1886,6 +1929,7 @@ export type Outbound =
       quoted_context?: string;
       intent?: "create_automation";
       user_shell?: true;
+      model_options?: SessionModelOptions;
       workspace_scope?: WorkspaceScopePayload;
       turn_id?: string;
       /** Marks messages sent by the embedded WebUI, without changing the

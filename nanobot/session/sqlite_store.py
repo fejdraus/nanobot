@@ -24,8 +24,9 @@ from nanobot.session.manager import (
     message_preview_text,
     metadata_title,
 )
+from nanobot.session.model_selection import SESSION_MODEL_KEYS, SessionModelPreset
 from nanobot.session.summary import is_summary_checkpoint
-from nanobot.session.types import PARENT_SESSION_KEY, SESSION_TYPE_KEY
+from nanobot.session.types import CONVERSATION, PARENT_SESSION_KEY, SESSION_TYPE_KEY
 
 _CHECKPOINT = "runtime_checkpoint"
 _INPUTS = ("pending_user_followups",)
@@ -473,6 +474,24 @@ class SqliteSessionStore:
             self._write_metadata(db, key, {**payload["metadata"], **updates})
             return True
 
+    def rename_model_preset(self, old_name: str, new_name: str) -> list[str]:
+        changed: list[str] = []
+        with self.transaction():
+            for row in self.list_metadata():
+                metadata = row["metadata"]
+                try:
+                    selection = SessionModelPreset.from_metadata(metadata)
+                except ValueError:
+                    continue
+                if selection.base_preset != old_name:
+                    continue
+                for key in SESSION_MODEL_KEYS:
+                    metadata.pop(key, None)
+                metadata.update(SessionModelPreset(new_name, selection.overrides).metadata_update())
+                self.replace_metadata(row["key"], metadata)
+                changed.append(row["key"])
+        return changed
+
     def replace_metadata(
         self, key: str, metadata: dict[str, Any], *, updated_at: datetime | None = None,
     ) -> None:
@@ -494,6 +513,45 @@ class SqliteSessionStore:
                 return None
             return {"key": key, "created_at": row[0], "updated_at": row[1],
                     "metadata": self._metadata(db, key, row[2])}
+
+    def recovery_candidates(self, key_prefix: str) -> list[tuple[str, bool]]:
+        """Return (key, unfinished display tail) in the same order as list_sessions.
+
+        The turn and entry primary keys locate the last ordinal and its last
+        decisive fact. Fork/telemetry facts do not settle activity. As in the
+        transcript reader, an incomplete marker *anywhere in that ordinal*
+        takes precedence, including on imported records. The append cursor's
+        `completed` flag alone cannot answer either question.
+        """
+        with self.transaction(write=False) as db:
+            rows = db.execute("""
+                WITH scan AS (
+                    SELECT s.key, s.updated_at, s.rowid AS tie,
+                           json_type(s.metadata, '$.pending_user_turn')='true'
+                           OR (json_extract(s.metadata, '$.webui_recovery.status')
+                                   IN ('resuming', 'awaiting_user', 'failed')
+                               AND json_type(s.metadata, '$.webui_recovery.recovery_id')='text')
+                           OR EXISTS (SELECT 1 FROM checkpoints WHERE session_key=s.key)
+                           OR EXISTS (SELECT 1 FROM pending_inputs WHERE session_key=s.key
+                                      AND kind='pending_user_followups') AS journaled,
+                           (SELECT CASE WHEN
+                                (SELECT e.kind NOT IN ('input', 'answer', 'completion')
+                                 FROM history_entries e WHERE e.session_key=t.session_key
+                                 AND e.turn_ordinal=t.ordinal
+                                 AND e.kind NOT IN ('fork_boundary', 'compaction', 'model_request')
+                                 ORDER BY e.position DESC LIMIT 1)
+                                THEN 1 ELSE EXISTS (
+                                    SELECT 1 FROM history_entries e WHERE e.session_key=t.session_key
+                                    AND e.turn_ordinal=t.ordinal
+                                    AND json_type(e.record, '$.content.transcript_incomplete')='true'
+                                ) END
+                            FROM history_turns t WHERE t.session_key=s.key
+                            ORDER BY t.ordinal DESC LIMIT 1) AS unfinished
+                    FROM sessions s WHERE s.key GLOB ?
+                )
+                SELECT key, unfinished FROM scan WHERE journaled OR unfinished ORDER BY updated_at DESC, tie
+            """, (f"{key_prefix}*",))
+            return [(key, bool(unfinished)) for key, unfinished in rows]
 
     def read_history_header(self, key: str) -> SessionHistoryPayload | None:
         """Read search identity and metadata without runtime checkpoints or inputs."""
@@ -530,6 +588,19 @@ class SqliteSessionStore:
                 return project(header, messages)
             finally:
                 rows.close()
+
+    def list_handle_metadata(self) -> list[dict[str, Any]]:
+        """Read just the allocation headers, irrespective of archive membership."""
+        with self.transaction(write=False) as db:
+            rows = db.execute(f"""
+                SELECT key, created_at, json_extract(metadata, '$.session_handle'),
+                    CASE WHEN json_type(metadata, '$.{SESSION_TYPE_KEY}') IS NULL THEN ?
+                         ELSE json_extract(metadata, '$.{SESSION_TYPE_KEY}') END
+                FROM sessions
+            """, (CONVERSATION.name,))
+            return [{"key": key, "created_at": created,
+                     "metadata": {"session_handle": name, SESSION_TYPE_KEY: kind}}
+                    for key, created, name, kind in rows]
 
     def project_session_handle_names(
         self, project: Callable[[Iterator[tuple[str, object]]], _T],
@@ -689,28 +760,20 @@ class SqliteSessionStore:
 
     def import_archives(self, keys: list[str]) -> list[str]:
         with self.transaction() as db:
-            if self.archives_imported():
-                return self.archived_keys()
-            imported = self.set_archived_keys(keys)
-            db.execute("INSERT INTO storage_meta (key, value) VALUES ('session_archives_imported', '1')")
-            return imported
+            if db.execute("INSERT OR IGNORE INTO storage_meta (key, value) VALUES ('session_archives_imported', '1')").rowcount:
+                self.set_archived(keys, True)
+            return self.archived_keys()
 
-    def set_archived_keys(self, keys: list[str]) -> list[str]:
+    def set_archived(self, keys: list[str], archived: bool) -> None:
         with self.transaction() as db:
-            current = set(self.archived_keys())
-            requested = set(keys)
-            # Existing memberships are valid by FK; only new keys need validation.
-            added = requested - current
-            if added:
-                added = {row[0] for row in db.execute(
-                    "SELECT key FROM sessions WHERE key IN (SELECT value FROM json_each(?))",
-                    (_encode(list(added)),),
-                )}
-            target = (requested & current) | added
-            db.executemany("DELETE FROM session_archives WHERE key=?", ((key,) for key in current - target))
-            now = datetime.now().isoformat()
-            db.executemany("INSERT INTO session_archives (key, archived_at) VALUES (?, ?)", ((key, now) for key in target - current))
-            return sorted(target)
+            if archived:
+                db.execute("""
+                    INSERT INTO session_archives (key, archived_at)
+                    SELECT key, ? FROM sessions WHERE key IN (SELECT value FROM json_each(?))
+                    ON CONFLICT(key) DO NOTHING
+                """, (datetime.now().isoformat(), _encode(keys)))
+            else:
+                db.execute("DELETE FROM session_archives WHERE key IN (SELECT value FROM json_each(?))", (_encode(keys),))
 
     def delete(self, key: str, *, preserve_archive: bool = False) -> bool:
         with self.transaction() as db:
@@ -735,6 +798,14 @@ class SqliteSessionStore:
                     AND json_type(metadata, '$.{PARENT_SESSION_KEY}')='text'
                     ORDER BY updated_at DESC""",
                 (parent_key,),
+            )]
+
+    def typed_session_headers(self, session_type: str) -> list[tuple[str, dict[str, Any]]]:
+        """Read just this owner's metadata, without rehydrating messages, checkpoints or inputs."""
+        with self.transaction(write=False) as db:
+            return [(key, _object(metadata)) for key, metadata in db.execute(
+                f"""SELECT key, metadata FROM sessions WHERE json_extract(metadata, '$.{SESSION_TYPE_KEY}')=?
+                    ORDER BY updated_at DESC, rowid""", (session_type,),
             )]
 
     def list_child_session_metadata(self, parent_key: str) -> list[SessionMetadataPayload]:
@@ -780,20 +851,25 @@ class SqliteSessionStore:
                         (_encode(keys), parent_key),
                     )]
 
-    def list_metadata(self) -> list[dict[str, Any]]:
+    def list_metadata(self, *, archived: bool | None = None) -> list[dict[str, Any]]:
+        archive_join = "JOIN" if archived is True else "LEFT JOIN"
+        archive_filter = "WHERE session_archives.key IS NULL" if archived is False else ""
         with self.transaction(write=False) as db:
             # Fetch one value so a large list does not cross the Python/SQLite
             # iterator boundary for every session while other workers are busy.
-            encoded = db.execute("""
+            encoded = db.execute(f"""
                 SELECT json_group_array(json_object(
                     'key', key, 'created_at', created_at, 'updated_at', updated_at,
-                    'title', title, 'preview', preview, 'visible_updated_at', visible_updated_at,
+                    'archived', archived, 'title', title, 'preview', preview, 'visible_updated_at', visible_updated_at,
                     'metadata', metadata, 'history_updated_at_ms', history_updated_at_ms,
                     'history_preview', history_preview
                 )) FROM (
-                    SELECT sessions.*, coalesce(history_heads.updated_at_ms, 0) AS history_updated_at_ms,
+                    SELECT sessions.*, session_archives.key IS NOT NULL AS archived,
+                           coalesce(history_heads.updated_at_ms, 0) AS history_updated_at_ms,
                            coalesce(nullif(history_heads.user_preview, ''), history_heads.preview, '') AS history_preview
-                    FROM sessions LEFT JOIN history_heads ON history_heads.session_key=sessions.key
+                    FROM sessions {archive_join} session_archives ON session_archives.key=sessions.key
+                    LEFT JOIN history_heads ON history_heads.session_key=sessions.key
+                    {archive_filter}
                     ORDER BY sessions.updated_at DESC
                 )
             """).fetchone()[0]

@@ -13,6 +13,7 @@ import { ArrowDown } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { PromptRail } from "@/components/thread/PromptRail";
+import { matchHistoryRow, type HistoryRowIdentity } from "@/components/thread/history-row-identity";
 import { SubagentThreadMessages } from "@/components/thread/SubagentTaskResults";
 import { DiagramScope } from "@/components/markdown-diagrams/context";
 import { DiffViewportContext } from "./activity/DiffViewportContext";
@@ -47,6 +48,7 @@ interface ThreadViewportProps {
   runStartedAt?: number | null;
   retryStatus?: RetryStatus | null;
   composer?: ReactNode;
+  toastViewport?: ReactNode;
   onComposerLayoutChange?: () => void;
   navigationFrame?: HTMLElement | null;
   emptyState?: ReactNode;
@@ -55,7 +57,7 @@ interface ThreadViewportProps {
   onRetryInitial?: () => void;
   scrollToBottomSignal?: number;
   activeTurnId?: string | null;
-  activeTurnStartedHere?: boolean;
+  submittedPromptTurnId?: string | null;
   conversationKey?: string | null;
   /** Override when message ownership changes after the selected conversation. */
   messagesKey?: string | null;
@@ -93,28 +95,28 @@ export const INITIAL_HISTORY_WINDOW = 120;
 export const HISTORY_WINDOW_INCREMENT = 120;
 
 interface HistoryScrollAnchor {
-  sources: string[];
-  fallback?: string;
+  identity: HistoryRowIdentity;
   offsetTop: number;
   scrollTop: number;
 }
 
 const THREAD_DISPLAY_UNIT_SELECTOR = "[data-thread-display-unit]";
 
-function scrollSourceKind(source: string): string {
-  return (JSON.parse(source) as string[])[1];
-}
-
-function scrollSourcesDisagree(left: string[], right: string[], kind: string): boolean {
-  const leftKeys = left.filter((source) => scrollSourceKind(source) === kind);
-  const rightKeys = right.filter((source) => scrollSourceKind(source) === kind);
-  return leftKeys.length > 0 && rightKeys.length > 0
-    && !leftKeys.some((source) => rightKeys.includes(source));
-}
-
 function promptTopInset(scroller: HTMLElement): number {
   const padding = Number.parseFloat(getComputedStyle(scroller).scrollPaddingTop);
   return Number.isFinite(padding) ? padding : PROMPT_TOP_INSET_PX;
+}
+
+function submittedPromptInset(scroller: HTMLElement, prompt: HTMLElement): number {
+  const inset = promptTopInset(scroller);
+  const previous = prompt.previousElementSibling;
+  let previousUnit = previous;
+  while (previousUnit && !previousUnit.hasAttribute("data-thread-display-unit")) {
+    previousUnit = previousUnit.previousElementSibling;
+  }
+  if (!previous || !previousUnit) return inset;
+  const gap = prompt.getBoundingClientRect().top - previous.getBoundingClientRect().bottom;
+  return Math.max(0, Math.min(inset, gap));
 }
 
 function historyPrefetchDistance(scroller: HTMLElement): number {
@@ -276,6 +278,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   runStartedAt = null,
   retryStatus = null,
   composer,
+  toastViewport,
   onComposerLayoutChange,
   navigationFrame,
   emptyState,
@@ -284,7 +287,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   onRetryInitial,
   scrollToBottomSignal = 0,
   activeTurnId: liveTurnId = null,
-  activeTurnStartedHere = false,
+  submittedPromptTurnId = null,
   conversationKey = null,
   messagesKey = conversationKey,
   conversationReady = true,
@@ -321,6 +324,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   const contentRef = useRef<HTMLDivElement>(null);
   const messageRegionRef = useRef<HTMLDivElement | null>(null);
   const messageContentRef = useRef<HTMLDivElement>(null);
+  const [historyRows] = useState(() => new WeakMap<HTMLElement, HistoryRowIdentity>());
   const diffViewport = useMemo(() => ({ scroller: messageRegionRef, content: messageContentRef }), []);
   const emptyStateRef = useRef<HTMLDivElement>(null);
   const composerDockRef = useRef<HTMLDivElement>(null);
@@ -328,7 +332,12 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   composerLayoutChangeRef.current = onComposerLayoutChange;
   const bottomRef = useRef<HTMLDivElement>(null);
   const endGapRef = useRef<HTMLDivElement>(null);
-  const lastConversationKeyRef = useRef<string | null>(conversationKey);
+  const anchoredTurnIdRef = useRef<string | null>(null);
+  const anchoredPromptIdRef = useRef<string | null>(null);
+  const openingMessagesRef = useRef<UIMessage[] | null>(null);
+  const finishOpeningAfterLayoutRef = useRef(false);
+  const conversationIdentity = conversationKey ?? messagesKey;
+  const lastConversationKeyRef = useRef<string | null>(conversationIdentity);
   const conversationHandoffPendingRef = useRef(false);
   const conversationHandoffAnimationRef = useRef<Animation | null>(null);
   const pendingConversationScrollRef = useRef(true);
@@ -420,14 +429,32 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     });
     threadMotionRef.current = new ThreadMotionCoordinator({
       camera,
-      measure: (promptId) => {
+      measure: (promptId, submitted = false) => {
         const scrollEl = scrollRef.current;
         const composerDock = composerDockRef.current;
         if (!scrollEl) return null;
         const composerHeight = composerDock
           ? composerDock.getBoundingClientRect().height || composerDock.offsetHeight
           : 0;
+        const anchor = anchoredPromptIdRef.current
+          ? findPromptElement(scrollEl, anchoredPromptIdRef.current) : null;
+        const content = messageContentRef.current;
+        if (content) {
+          // Reserve space in the content itself so layout maintains the minimum
+          // height even when a waiting indicator is replaced by a shorter reply.
+          if (anchor) {
+            const anchorOffset = anchor.getBoundingClientRect().top - content.getBoundingClientRect().top;
+            const fadeGap = endGapRef.current?.getBoundingClientRect().height ?? 0;
+            const height = Math.ceil(Math.max(0, anchorOffset + scrollEl.clientHeight - submittedPromptInset(scrollEl, anchor) - fadeGap - 1));
+            content.style.minHeight = `${height}px`;
+          } else {
+            content.style.removeProperty("min-height");
+          }
+        }
         const prompt = promptId ? findPromptElement(scrollEl, promptId) : null;
+        const targetTop = prompt
+          ? promptTop(scrollEl, prompt) - (submitted ? submittedPromptInset(scrollEl, prompt) : promptTopInset(scrollEl))
+          : null;
         const scrollHeight = scrollEl.scrollHeight;
         const clientHeight = scrollEl.clientHeight;
         const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
@@ -437,11 +464,8 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
           clientHeight,
           maxScrollTop,
           composerHeight,
-          promptTop: prompt
-            ? Math.min(
-                maxScrollTop,
-                Math.max(0, promptTop(scrollEl, prompt) - promptTopInset(scrollEl)),
-              )
+          promptTop: targetTop !== null
+            ? Math.min(maxScrollTop, Math.max(0, submitted ? Math.ceil(targetTop) : targetTop))
             : null,
         };
       },
@@ -450,6 +474,16 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
         updateContentVisibility();
       },
       onGeometry: (geometry: ThreadMotionGeometry) => {
+        const frameHeight = viewportFrameRef.current?.clientHeight ?? 0;
+        if (finishOpeningAfterLayoutRef.current && geometry.clientHeight > 0
+          && frameHeight > 0 && geometry.clientHeight <= frameHeight) {
+          finishOpeningAfterLayoutRef.current = false;
+          const motion = threadMotionRef.current;
+          if (motion?.snapshot().mode === "follow-latest") {
+            motion.jumpTo(geometry.maxScrollTop);
+            motion.finishOpeningLayout();
+          }
+        }
         composerLayoutChangeRef.current?.();
         if (Math.abs(composerDockHeightRef.current - geometry.composerHeight) >= 1) {
           composerDockHeightRef.current = geometry.composerHeight;
@@ -516,26 +550,20 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     }
     const viewport = scroller.getBoundingClientRect();
     const element = visibleHistoryUnit(content, viewport);
-    if (!element?.dataset.threadScrollSources) {
-      historyScrollAnchorRef.current = null;
-      return false;
-    }
-    const sources = JSON.parse(element.dataset.threadScrollSources) as string[];
-    const fallback = element.dataset.threadScrollFallback;
-    if (sources.length === 0 && !fallback) {
+    const identity = element ? historyRows.get(element) : undefined;
+    if (!element || !identity || (identity.sources.length === 0 && !identity.fallback)) {
       historyScrollAnchorRef.current = null;
       return false;
     }
     historyScrollAnchorRef.current = {
-      sources,
-      fallback,
+      identity,
       scrollTop: scroller.scrollTop,
       // Normalize out the reveal lease, even when reading above its inline slot.
       offsetTop: element.getBoundingClientRect().top - viewport.top
         - (historySlotRef.current ? HISTORY_HOLD_PX : 0),
     };
     return true;
-  }, []);
+  }, [historyRows]);
 
   const reconcileHistoryScrollAnchor = useCallback(() => {
     const scroller = scrollRef.current;
@@ -546,26 +574,9 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     if (Math.abs(scroller.scrollTop - Math.min(anchor.scrollTop, maxScrollTop)) >= 0.5) {
       return captureHistoryScrollAnchor();
     }
-    const candidates = Array.from(content.querySelectorAll<HTMLElement>(THREAD_DISPLAY_UNIT_SELECTOR));
-    const bySource = new Map<string, { element: HTMLElement; sources: string[] }>();
-    for (const candidate of candidates) {
-      const sources = JSON.parse(candidate.dataset.threadScrollSources ?? "[]") as string[];
-      for (const source of sources) bySource.set(source, { element: candidate, sources });
-    }
-    let element: HTMLElement | undefined;
-    for (const source of anchor.sources) {
-      const candidate = bySource.get(source);
-      if (!candidate) continue;
-      const kind = scrollSourceKind(source);
-      // An index-generated replay id can be reused by a different message.
-      if (kind !== "stream" && scrollSourcesDisagree(anchor.sources, candidate.sources, "stream")) continue;
-      if (kind === "id" && scrollSourcesDisagree(anchor.sources, candidate.sources, "sequence")) continue;
-      element = candidate.element;
-      break;
-    }
-    if (!element && anchor.fallback) {
-      element = candidates.find((candidate) => candidate.dataset.threadScrollFallback === anchor.fallback);
-    }
+    const element = matchHistoryRow(
+      anchor.identity, content.querySelectorAll<HTMLElement>(THREAD_DISPLAY_UNIT_SELECTOR), historyRows,
+    );
     if (!element) {
       historyScrollAnchorRef.current = null;
       return false;
@@ -577,11 +588,14 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
       - (historySlotRef.current ? HISTORY_HOLD_PX : 0);
     const delta = nextOffset - anchor.offsetTop;
     if (Math.abs(delta) < 0.5) return true;
-    const nextTop = Math.min(maxScrollTop, Math.max(0, scroller.scrollTop + delta));
+    const requestedTop = scroller.scrollTop + delta;
+    const nextTop = Math.min(maxScrollTop, Math.max(0, requestedTop));
     threadMotionRef.current?.jumpTo(nextTop);
     anchor.scrollTop = scroller.scrollTop;
+    // A clamped layout is the new reading position, not space owed by a later prepend.
+    anchor.offsetTop += requestedTop - nextTop;
     return true;
-  }, [captureHistoryScrollAnchor]);
+  }, [captureHistoryScrollAnchor, historyRows]);
 
   const resetHistoryHeader = useCallback(() => {
     setHistorySlotKey(null);
@@ -719,8 +733,8 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   }, [navigation?.target]);
 
   useEffect(() => {
-    if (activeTurnStartedHere && liveTurnId) navigation?.latest();
-  }, [activeTurnStartedHere, liveTurnId, navigation?.latest]);
+    if (submittedPromptTurnId) navigation?.latest();
+  }, [submittedPromptTurnId, navigation?.latest]);
 
   const cancelAutoScroll = useCallback(() => {
     threadMotionRef.current?.takeUserControl();
@@ -749,11 +763,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
       setKeyboardInsetBottom((current) =>
         Math.abs(current - next) < 1 ? current : next,
       );
-      if (composerFocused) {
-        // Focusing the composer establishes a new reference frame at the
-        // latest message. This is one immediate positioning command; viewport
-        // events may issue a fresh command, but no command survives into a
-        // later render as a train of retry frames.
+      if (composerFocused && !isStreaming && !anchoredTurnIdRef.current) {
         scrollToBottom(false, { force: true });
       }
     };
@@ -771,7 +781,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
       document.removeEventListener("focusin", updateKeyboardInset);
       document.removeEventListener("focusout", updateKeyboardInset);
     };
-  }, [hasMessages, scrollToBottom]);
+  }, [hasMessages, isStreaming, scrollToBottom]);
 
   useEffect(() => {
     if (scrollToBottomSignal <= 0) return;
@@ -779,8 +789,8 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   }, [scrollToBottomSignal, scrollToBottom]);
 
   useLayoutEffect(() => {
-    if (lastConversationKeyRef.current === conversationKey) return;
-    lastConversationKeyRef.current = conversationKey;
+    if (lastConversationKeyRef.current === conversationIdentity) return;
+    lastConversationKeyRef.current = conversationIdentity;
     clearHistoryTouchTarget();
     historyTouchRef.current = null;
     historyInputRef.current = "other";
@@ -791,6 +801,11 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     pendingConversationScrollRef.current = true;
     historyScrollAnchorRef.current = null;
     restoreScrollAfterPrependRef.current = null;
+    anchoredTurnIdRef.current = null;
+    anchoredPromptIdRef.current = null;
+    openingMessagesRef.current = null;
+    finishOpeningAfterLayoutRef.current = false;
+    messageContentRef.current?.style.removeProperty("min-height");
     threadMotionRef.current?.reset();
     setNavigatingToBottom(false);
     setShowHistoryExhausted(false);
@@ -808,50 +823,42 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
         fill: "forwards",
       },
     );
-  }, [clearHistoryTouchTarget, conversationKey, hasMessages, resetHistoryHeader]);
+  }, [clearHistoryTouchTarget, conversationIdentity, hasMessages, resetHistoryHeader]);
 
   useLayoutEffect(() => {
     if (!conversationReady) {
       threadMotionRef.current?.reset();
       return;
     }
-    if (!activeTurnId) {
-      threadMotionRef.current?.completeTurn();
-      return;
+    if (openingMessagesRef.current && openingMessagesRef.current !== messages) {
+      openingMessagesRef.current = null;
+      const frameHeight = viewportFrameRef.current?.clientHeight ?? 0;
+      const scrollHeight = scrollRef.current?.clientHeight ?? 0;
+      // The grid can briefly size the scrollport to the full transcript while
+      // transitioning from the welcome layout. Wait for usable geometry before
+      // ending the initial tail placement, even if a new message arrives first.
+      if (frameHeight > 0 && scrollHeight > frameHeight) {
+        finishOpeningAfterLayoutRef.current = true;
+      } else {
+        threadMotionRef.current?.finishOpeningLayout();
+      }
     }
-
-    const promptIndex = messages.findIndex(
-      (message) => message.role === "user" && message.turnId === activeTurnId,
-    );
-    if (
-      activeTurnStartedHere
-      && promptIndex >= 0
-      && threadMotionRef.current?.snapshot().turnId !== activeTurnId
-    ) {
-      // A turn submitted in this mounted viewport establishes a new prompt
-      // origin. A restored turn must first complete open-at-bottom instead.
+    threadMotionRef.current?.updateTurn(activeTurnId);
+    const turnId = submittedPromptTurnId ?? anchoredTurnIdRef.current;
+    const prompt = messages.find((message) => message.role === "user" && message.turnId === turnId);
+    anchoredPromptIdRef.current = prompt?.id ?? null;
+    if (submittedPromptTurnId && prompt && anchoredTurnIdRef.current !== submittedPromptTurnId) {
+      anchoredTurnIdRef.current = submittedPromptTurnId;
+      historyScrollAnchorRef.current = null;
+      restoreScrollAfterPrependRef.current = null;
       pendingConversationScrollRef.current = false;
+      finishOpeningAfterLayoutRef.current = false;
+      resetHistoryHeader();
+      threadMotionRef.current?.anchorSubmittedPrompt(prompt.id);
+    } else if (prompt && anchoredTurnIdRef.current === turnId) {
+      threadMotionRef.current?.updateSubmittedPromptId(prompt.id);
     }
-    const prompt = promptIndex >= 0 ? messages[promptIndex] : null;
-    const hasOutput = promptIndex >= 0
-      ? messages
-          .slice(promptIndex + 1)
-          .some(
-            (message) =>
-              message.role !== "user"
-              && (!message.turnId || message.turnId === activeTurnId),
-          )
-      : !activeTurnStartedHere && messages.some(
-          (message) =>
-            message.role !== "user" && message.turnId === activeTurnId,
-        );
-    threadMotionRef.current?.updateTurn({
-      id: activeTurnId,
-      promptId: prompt?.id ?? null,
-      hasOutput,
-      entry: activeTurnStartedHere ? "submitted" : "restored",
-    });
-  }, [activeTurnId, activeTurnStartedHere, conversationReady, messages]);
+  }, [activeTurnId, conversationReady, messages, resetHistoryHeader, submittedPromptTurnId]);
 
   useLayoutEffect(() => {
     const wasLoading = previousLoadingOlderRef.current;
@@ -903,12 +910,20 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     scrollToBottom(false, { force: true });
     if (!hasMessages) return;
     pendingConversationScrollRef.current = false;
+    if (activeTurnId && !submittedPromptTurnId) {
+      // Let the opened transcript's lazy layout settle at the tail, but stop
+      // as soon as a new message arrives or the reader takes control.
+      openingMessagesRef.current = messages;
+      threadMotionRef.current?.followOpeningLayout();
+    }
   }, [
+    activeTurnId,
     conversationKey,
     conversationReady,
     hasMessages,
     messages,
     scrollToBottom,
+    submittedPromptTurnId,
   ]);
 
   useLayoutEffect(() => {
@@ -985,6 +1000,8 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     if (content) observer?.observe(content);
     if (contentRegion) observer?.observe(contentRegion);
     if (messageContent) observer?.observe(messageContent);
+    // The reserved min-height can hide reflow inside a short transcript.
+    if (messageContent?.firstElementChild) observer?.observe(messageContent.firstElementChild);
     if (endGapRef.current) observer?.observe(endGapRef.current);
     if (composerDock) observer?.observe(composerDock);
     window.addEventListener("resize", invalidateGeometry);
@@ -992,7 +1009,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
       observer?.disconnect();
       window.removeEventListener("resize", invalidateGeometry);
     };
-  }, [hasMessages, reconcileHistoryScrollAnchor, refreshLastMessageRow, updateContentVisibility]);
+  }, [hasMessages, messagesKey, reconcileHistoryScrollAnchor, refreshLastMessageRow, updateContentVisibility]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -1252,6 +1269,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
 
   return (
     <div className="thread-viewport relative flex min-h-0 flex-1 overflow-hidden">
+      {toastViewport}
       <div
         ref={viewportFrameRef}
         className={cn(
@@ -1290,10 +1308,11 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
                 hasVerticalOverflow ? "overflow-y-auto" : "overflow-hidden",
               )}
             >
-              <div ref={messageContentRef} className="w-full">
+              <div ref={messageContentRef} className="w-full shrink-0">
                 <DiffViewportContext.Provider value={diffViewport}>
                 <DiagramScope identity={conversationKey}>
                 <SubagentThreadMessages
+                  historyRows={historyRows}
                   key={messagesKey}
                   messages={visibleMessages}
                   topInset={PROMPT_TOP_INSET_PX}

@@ -10,11 +10,13 @@ from loguru import logger
 
 from agent.session_helpers import run_session, save_completed_subagent, visible_message
 from nanobot.agent.context import ContextBuilder, TranscriptInput
+from nanobot.agent.dream import DreamResult
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
+    CommandResultEvent,
     GoalStatusEvent,
     StreamDeltaEvent,
     StreamedResponseEvent,
@@ -23,6 +25,7 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import TurnCompleted, TurnRunStatusChanged
+from nanobot.command.results import message_text
 from nanobot.cron.session_turns import CRON_HISTORY_META, CRON_TRIGGER_META
 from nanobot.goal.assembly import install_goal
 from nanobot.providers.base import (
@@ -266,6 +269,46 @@ async def test_persist_local_trigger_turn_uses_hidden_automation_marker(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", ["queued", "inline", "direct"])
+async def test_fast_dream_finishes_after_the_command_acknowledgement(tmp_path, monkeypatch, dispatch):
+    loop = _make_full_loop(tmp_path)
+    msg = InboundMessage("websocket", "user", "chat-1", "/dream")
+
+    async def no_history(*_args, **_kwargs):
+        return DreamResult(had_input=False)
+
+    publish = loop.bus.publish_outbound
+
+    async def slow_delivery(message):
+        # Exercise the race even when both the command and Dream do no I/O.
+        await asyncio.sleep(0)
+        await publish(message)
+
+    async def next_receipt():
+        while True:
+            message = await loop.bus.consume_outbound()
+            if isinstance(message.event, CommandResultEvent):
+                return message
+
+    monkeypatch.setattr("nanobot.agent.dream.run_dream", no_history)
+    monkeypatch.setattr(loop.bus, "publish_outbound", slow_delivery)
+    try:
+        if dispatch == "direct":
+            acknowledgement = await loop.process_direct("/dream")
+        else:
+            if dispatch == "queued":
+                await run_session(loop, msg)
+            else:
+                await loop._dispatch_command_inline(msg, msg.content, loop.commands.dispatch)
+            acknowledgement = await asyncio.wait_for(next_receipt(), timeout=2)
+        completion = await asyncio.wait_for(next_receipt(), timeout=2)
+        assert acknowledgement.event.parts[0]["key"] == "dream.started"
+        assert completion.event.parts[0]["key"] == "dream.no_input"
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_new_with_bot_suffix_does_not_persist_command(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
 
@@ -279,7 +322,7 @@ async def test_new_with_bot_suffix_does_not_persist_command(tmp_path: Path) -> N
     )
 
     assert response is not None
-    assert response.content == "New session started."
+    assert message_text(response) == "New session started."
     session = loop.sessions.get_or_create("websocket:chat-1")
     assert session.messages == []
 
@@ -315,7 +358,7 @@ async def test_invalid_slash_command_is_rejected_without_calling_provider(
     )
 
     assert response is not None
-    assert response.content == expected
+    assert message_text(response) == expected
     loop.provider.chat_stream_with_retry.assert_not_awaited()
     session = loop.sessions.get_or_create("websocket:chat-1")
     persisted = [
@@ -324,7 +367,7 @@ async def test_invalid_slash_command_is_rejected_without_calling_provider(
     ]
     assert persisted == [
         ("user", content, True),
-        ("assistant", response.content, True),
+        ("assistant", expected, True),
     ]
 
 
@@ -367,7 +410,11 @@ async def test_generate_webui_title_only_for_marked_webui_sessions(tmp_path: Pat
     )
     session = loop.sessions.get_or_create("websocket:chat-title")
     session.metadata[WEBUI_SESSION_METADATA_KEY] = True
-    session.add_message("user", "帮我优化一下 webui 的 sidebar")
+    caption = "帮我优化一下 webui 的 sidebar"
+    session.add_message("user", [
+        {"type": "image_attachment", "id": "a" * 64},
+        {"type": "text", "text": caption},
+    ])
     session.add_message("assistant", "可以，我会先调整布局和视觉层级。")
     loop.sessions.save(session)
 
@@ -382,6 +429,8 @@ async def test_generate_webui_title_only_for_marked_webui_sessions(tmp_path: Pat
     session = await loop.sessions.state.get(session.key)
     assert session.metadata[WEBUI_TITLE_METADATA_KEY] == "优化 WebUI 侧边栏"
     loop.provider.chat_stream_with_retry.assert_awaited_once()
+    title_prompt = loop.provider.chat_stream_with_retry.await_args.args[0][-1]["content"]
+    assert f"User: {caption}\nAssistant:" in title_prompt
     assert loop.provider.chat_stream_with_retry.await_args.kwargs["max_tokens"] == TITLE_GENERATION_MAX_TOKENS
     assert (
         loop.provider.chat_stream_with_retry.await_args.kwargs["reasoning_effort"]
@@ -530,7 +579,7 @@ def test_save_turn_commits_summary_boundary_without_rewriting_raw_history() -> N
     ]
 
 
-def test_save_turn_keeps_image_placeholder_and_runtime_context() -> None:
+def test_save_turn_keeps_user_image_and_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:image")
     block = RuntimeContextBlock(source="test", content="provider context")
@@ -545,33 +594,11 @@ def test_save_turn_keeps_image_placeholder_and_runtime_context() -> None:
         )],
         skip=0,
     )
-    assert session.messages[0]["content"] == [
-        {"type": "text", "text": "[image: /media/feishu/photo.jpg]"},
-        {"type": "text", "text": "provider context"},
-    ]
-    assert public_history_message(session.messages[0])["content"] == [
-        {"type": "text", "text": "[image: /media/feishu/photo.jpg]"}
-    ]
-
-
-def test_save_turn_keeps_image_placeholder_without_meta() -> None:
-    loop = _mk_loop()
-    session = Session(key="test:image-no-meta")
-    block = RuntimeContextBlock(source="test", content="provider context")
-
-    loop._save_turn(
-        session,
-        [_runtime_message(
-            [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ],
-            [block],
-        )],
-        skip=0,
-    )
-    assert session.messages[0]["content"] == [
+    content = session.get_history()[0]["content"]
+    assert content[0]["image_url"] == {"url": "data:image/png;base64,abc"}
+    assert content[1:] == [{"type": "text", "text": "provider context"}]
+    assert session.get_history(include_runtime_context=False)[0]["content"] == [
         {"type": "text", "text": "[image]"},
-        {"type": "text", "text": "provider context"},
     ]
 
 
@@ -1196,18 +1223,17 @@ async def test_process_message_persists_media_paths_on_user_turn(tmp_path: Path)
     loop.sessions.invalidate("websocket:c-media")
     persisted = loop.sessions.get_or_create("websocket:c-media")
     assert [m["role"] for m in persisted.messages] == ["user"]
-    assert public_history_message(persisted.messages[0])["content"] == "look"
+    assert persisted.get_history(include_runtime_context=False)[0]["content"] == [
+        {"type": "text", "text": "[image]"},
+        {"type": "text", "text": "[image]"},
+        {"type": "text", "text": "look"},
+    ]
     assert persisted.messages[0]["media"] == [str(img_a), str(img_b)]
 
 
 @pytest.mark.asyncio
 async def test_process_message_persists_media_only_turn_without_text(tmp_path: Path) -> None:
-    """A turn with images but no text still persists (previously silent-dropped).
-
-    The old early-persist gate skipped messages without text, leaving pure
-    image turns un-checkpointed. They now materialise as an empty-content
-    user row with ``media`` attached.
-    """
+    """The image-only input is replayable even if the first model call never finishes."""
     img = tmp_path / "only.png"
     img.write_bytes(_PNG_1X1)
 
@@ -1228,7 +1254,11 @@ async def test_process_message_persists_media_only_turn_without_text(tmp_path: P
     persisted = loop.sessions.get_or_create("websocket:c-images-only")
     assert len(persisted.messages) == 1
     assert persisted.messages[0]["role"] == "user"
-    assert public_history_message(persisted.messages[0])["content"] == ""
+    content = persisted.get_history()[0]["content"]
+    assert [block["type"] for block in content].count("image_url") == 1
+    assert persisted.get_history(include_runtime_context=False)[0]["content"] == [
+        {"type": "text", "text": "[image]"},
+    ]
     assert persisted.messages[0]["media"] == [str(img)]
 
 
@@ -1368,7 +1398,7 @@ async def test_stop_during_committed_goal_checkpoint_settles_queued_command(
         if calls == 4:
             assert "list-1" in str(kwargs["messages"]) and "list-3" in str(kwargs["messages"])
             return LLMResponse(content=None, tool_calls=[ToolCallRequest(
-                id="cancel", name="update_goal", arguments={"action": "cancel", "recap": "Stopped work."},
+                id="block", name="update_goal", arguments={"action": "block", "recap": "Waiting for user input."},
             )])
         assert calls == 5
         return LLMResponse(content="handled later")
@@ -1403,7 +1433,7 @@ async def test_stop_during_committed_goal_checkpoint_settles_queued_command(
 
     async def observe_stop_reply(message):
         await publish_outbound(message)
-        if message.metadata.get("message_id") == "stop-attempt" and message.content.startswith("Stopped "):
+        if message.metadata.get("message_id") == "stop-attempt" and message_text(message) == "Stopped.":
             stop_acknowledged.set()
 
     monkeypatch.setattr(loop.bus, "publish_outbound", observe_stop_reply)
@@ -1453,8 +1483,8 @@ async def test_stop_during_committed_goal_checkpoint_settles_queued_command(
         outbound = []
         while loop.bus.outbound_size:
             outbound.append(await loop.bus.consume_outbound())
-        stop_responses = [item.content for item in outbound if item.content.startswith("Stopped ")]
-        assert stop_responses == ["Stopped 1 task(s)."]
+        stop_responses = [message_text(item) for item in outbound if message_text(item) == "Stopped."]
+        assert stop_responses == ["Stopped."]
         endings = [item.event for item in outbound if isinstance(item.event, TurnEndEvent)]
         cancelled = [event for event in endings if event.outcome == "cancelled"]
         assert len(cancelled) == 1 and cancelled[0].goal_state["status"] == "active"
@@ -1475,6 +1505,10 @@ async def test_stop_during_committed_goal_checkpoint_settles_queued_command(
                 await asyncio.sleep(0)
         assert calls == 5 and loop.runner.run.await_count == 2
         assert msg.session_key not in loop._pending_queues
+        saved = await loop.sessions.state.read(msg.session_key)
+        assert saved.metadata[GOAL_STATE_KEY]["status"] == "blocked"
+        assert [event.outcome for event in completed
+                if event.context.metadata.get("message_id") == "independent-input"] == ["completed"]
         followup_outbound = []
         while loop.bus.outbound_size:
             followup_outbound.append(await loop.bus.consume_outbound())
@@ -1819,7 +1853,7 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
     stop_ctx = CommandContext(msg=stop_msg, session=None, key=stop_msg.session_key, raw="/stop", loop=loop)
     stop_result = await cmd_stop(stop_ctx)
 
-    assert "Stopped 1 task" in stop_result.content
+    assert message_text(stop_result) == "Stopped."
     assert task.done()
 
     loop.sessions.invalidate("feishu:c4")

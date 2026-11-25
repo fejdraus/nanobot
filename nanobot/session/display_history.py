@@ -135,6 +135,48 @@ class HistoryReader:
             (self.key, ordinal),
         )]
 
+    def latest_context_usage(self, generation: str) -> tuple[int, int, bool] | None:
+        """Read (tokens, window, estimated) from the latest request or compaction boundary."""
+        revision = self.revision
+        if revision is None or revision[0] != generation:
+            return None
+        rows = self._db.execute(
+            """SELECT kind, json_extract(record, '$.content.phase'),
+                      coalesce(json_extract(record, '$.content.request_usage.context_tokens'),
+                               json_extract(record, '$.content.request_usage.prompt_tokens')),
+                      json_extract(record, '$.content.context_window_tokens'),
+                      json_extract(record, '$.content.context_snapshot.estimated_tokens'),
+                      json_extract(record, '$.content.context_snapshot.context_window_tokens')
+               FROM history_entries WHERE session_key=? AND kind IN (?, ?)
+               ORDER BY turn_ordinal DESC, position DESC""",
+            (self.key, HistoryKind.MODEL_REQUEST, HistoryKind.COMPACTION),
+        )
+        for kind, phase, tokens, window, estimate, estimate_window in rows:
+            if kind == HistoryKind.COMPACTION and phase == "succeeded":
+                if isinstance(estimate, int) and estimate >= 0 and isinstance(estimate_window, int) and estimate_window > 0:
+                    return estimate, estimate_window, True
+                return None
+            if isinstance(tokens, int) and tokens >= 0 and isinstance(window, int) and window > 0:
+                return tokens, window, False
+        return None
+
+    def open_tail_sequences(self) -> dict[str, int]:
+        """Last sequence for each identity in an unclosed tail, in first-appearance order."""
+        ordinal = self.turn_count - 1
+        last = self._db.execute(
+            """SELECT kind FROM history_entries WHERE session_key=? AND turn_ordinal=?
+               ORDER BY position DESC LIMIT 1""", (self.key, ordinal),
+        ).fetchone()
+        if last is None or last[0] == HistoryKind.COMPLETION:
+            # Do not append over a terminal transcript_incomplete marker.
+            return {}
+        return {turn_id: sequence for turn_id, sequence in self._db.execute(
+            """SELECT json_extract(record, '$.turn_id') AS turn_id,
+                      max(coalesce(json_extract(record, '$.sequence'), 0))
+               FROM history_entries WHERE session_key=? AND turn_ordinal=?
+               GROUP BY turn_id ORDER BY min(position)""", (self.key, ordinal),
+        ) if turn_id}
+
     def read_entry_page(
         self, ordinal: int, *, start: int, end: int, reverse: bool,
         max_records: int, max_bytes: int, allow_oversized: bool = False,

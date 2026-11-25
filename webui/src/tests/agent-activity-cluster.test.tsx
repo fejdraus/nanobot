@@ -4,9 +4,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentActivityCluster } from "@/components/thread/AgentActivityCluster";
 import { ExecSessionCommandsContext } from "@/components/thread/activity/exec-session-context";
 import { preloadMarkdownText } from "@/components/MarkdownText";
+import { McpCatalogContext } from "@/hooks/useMcpPresetCatalog";
+import { getToolsCatalog } from "@/lib/tools-catalog-cache";
 import { setAppLanguage } from "@/i18n";
 import { DEFAULT_LOCAL_PREFS, LOCAL_PREFS_STORAGE_KEY, writeLocalPreferences } from "@/lib/local-preferences";
 import type { CliAppInfo, McpPresetInfo, UIMessage } from "@/lib/types";
+
+function openLiveActivity() {
+  fireEvent.click(screen.getByRole("button", { name: /^Working for / }));
+}
 
 // These DOM tests exercise disclosure/source contracts; the real shadow renderer runs in browser tests.
 vi.mock("@/components/thread/activity/DiffSyntaxHighlight", async (importOriginal) => {
@@ -45,7 +51,7 @@ const BROWSERBASE_MCP: McpPresetInfo = {
   configured: true,
   available: true,
   status: "configured",
-  logo_url: "https://example.invalid/browserbase.svg",
+  icons: [{ src: "https://example.invalid/browserbase.svg" }],
   brand_color: "#111827",
   required_fields: [],
   connection_summary: "https://mcp.browserbase.com/mcp",
@@ -126,11 +132,12 @@ describe("AgentActivityCluster", () => {
         <AgentActivityCluster messages={messages} isTurnStreaming hasBodyBelow={false} />
       </ExecSessionCommandsContext.Provider>,
     );
+    openLiveActivity();
     const rows = screen.getAllByTestId("activity-step").map((row) => row.textContent);
     expect(rows).toEqual([
-      "Command was still running at the last check npm test --token ••••",
+      "Command still running npm test --token ••••",
       "Read file README.md",
-      "Command failed (exit code 7) npm test --token ••••",
+      "Command failed (exit 7) npm test --token ••••",
     ]);
     expect(container.innerHTML).not.toContain(id);
     expect(container.innerHTML).not.toContain("secret-value");
@@ -144,6 +151,7 @@ describe("AgentActivityCluster", () => {
       traces: [line, legacy], createdAt: 1, toolEvents: [{ name: "exec_session", call_id: "check",
         arguments: { session_id: id }, phase: "end", result: "Exit code: 0\nElapsed: 2.0s" }] };
     render(<AgentActivityCluster messages={[message]} isTurnStreaming hasBodyBelow={false} />);
+    openLiveActivity();
     expect(screen.getAllByTestId("activity-step").map((row) => row.textContent)).toEqual([
       "Command completed", "Reading file later.txt",
     ]);
@@ -160,8 +168,9 @@ describe("AgentActivityCluster", () => {
         { name: "exec_session", call_id: "check-2", arguments: { session_id: id }, phase: "end", result: "Exit code: 0\nElapsed: 2.0s" },
       ] };
     render(<AgentActivityCluster messages={[message]} isTurnStreaming hasBodyBelow={false} />);
+    openLiveActivity();
     expect(screen.getAllByTestId("activity-step").map((row) => row.textContent)).toEqual([
-      "Command was still running at the last check", "Command completed", "Reading file later.txt",
+      "Command still running", "Command completed", "Reading file later.txt",
     ]);
   });
 
@@ -195,19 +204,20 @@ describe("AgentActivityCluster", () => {
       </ExecSessionCommandsContext.Provider>;
     };
     const { rerender, container } = render(view(10));
+    openLiveActivity();
     expect(screen.getAllByTestId("activity-step")).toHaveLength(5);
     expect(container).toHaveTextContent("Sent input test-a");
     expect(container).toHaveTextContent("Could not check command test-b");
     expect(container).toHaveTextContent("Command completed test-a");
     expect(container).not.toHaveTextContent("private");
-    fireEvent.click(screen.getByRole("button", { name: "Show earlier command checks (9)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show 9 earlier checks" }));
     expect(screen.getAllByTestId("activity-step")).toHaveLength(14);
-    expect(screen.getByRole("button", { name: "Hide earlier command checks (9)" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Hide 9 earlier checks" })).toHaveAttribute("aria-expanded", "true");
     rerender(view(11));
     expect(screen.getAllByTestId("activity-step")).toHaveLength(15);
-    fireEvent.click(screen.getByRole("button", { name: "Hide earlier command checks (10)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide 10 earlier checks" }));
     expect(screen.getAllByTestId("activity-step")).toHaveLength(5);
-    expect(screen.getByRole("button", { name: "Show earlier command checks (6)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show 6 earlier checks" })).toBeInTheDocument();
   });
 
   it("shows a generic session label until its source command becomes available", () => {
@@ -230,9 +240,9 @@ describe("AgentActivityCluster", () => {
     expect(container.innerHTML).not.toContain(id);
   });
 
-  it("honors the activity preference for standalone completed activity with manual overrides", () => {
-    render(<AgentActivityCluster messages={activityMessages()} isTurnStreaming={false} hasBodyBelow={false} />);
-    const disclosure = screen.getByRole("button", { name: /Worked/ });
+  it.each([false, true])("honors the activity preference and manual overrides (streaming: %s)", (isTurnStreaming) => {
+    render(<AgentActivityCluster messages={activityMessages()} isTurnStreaming={isTurnStreaming} hasBodyBelow={false} />);
+    const disclosure = screen.getByRole("button", { name: /^(Working|Worked)/ });
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     act(() => { writeLocalPreferences({ ...DEFAULT_LOCAL_PREFS, activityMode: "expanded" }); });
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
@@ -288,6 +298,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     expect(screen.getByText(`Searched files “${query}”`)).toBeInTheDocument();
     expect(screen.getByText(`Reading file ${path}`)).toBeInTheDocument();
     expect(screen.getByLabelText("Using Blender, --json --background scene.blend")).toBeInTheDocument();
@@ -297,11 +308,11 @@ describe("AgentActivityCluster", () => {
 
     await act(async () => setAppLanguage("zh-CN"));
 
-    expect(screen.getByText(`文件搜索完成 “${query}”`)).toBeInTheDocument();
+    expect(screen.getByText(`已搜索文件 “${query}”`)).toBeInTheDocument();
     expect(screen.getByText(`正在读取文件 ${path}`)).toBeInTheDocument();
     expect(screen.getByLabelText("正在使用 Blender, --json --background scene.blend")).toBeInTheDocument();
     expect(screen.getByLabelText("正在打开 example.com, Browserbase")).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "已编辑" })).toBeInTheDocument();
     expect(screen.getByTestId("activity-file-reference")).toHaveTextContent(path);
 
     await act(async () => setAppLanguage("ja"));
@@ -348,15 +359,15 @@ describe("AgentActivityCluster", () => {
   it.each([
     {
       locale: "en" as const,
-      waiting: "Connection failed Retrying in 5s",
-      retrying: "Connection failed Retrying",
-      exhausted: "Connection failed Ending turn",
+      waiting: "Connection failed. Retrying in 5s",
+      retrying: "Connection failed. Retrying",
+      exhausted: "Connection failed. Ending turn",
     },
     {
       locale: "zh-CN" as const,
-      waiting: "连接失败 5 秒后重试",
-      retrying: "连接失败 正在重试",
-      exhausted: "连接失败 正在结束本次任务",
+      waiting: "连接失败，5 秒后重试",
+      retrying: "连接失败，正在重试",
+      exhausted: "连接失败，正在结束本轮",
     },
   ])("shows localized model retry progress in the activity header ($locale)", async ({
     locale, waiting, retrying, exhausted,
@@ -416,6 +427,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     const block = screen.getByTestId("activity-model-message");
     await waitFor(() => expect(block.querySelector("strong")).not.toBeNull());
     expect(block.querySelector("strong")).toHaveTextContent("partial answer");
@@ -433,6 +445,7 @@ describe("AgentActivityCluster", () => {
     };
     const view = render(<AgentActivityCluster {...props} />);
     const header = screen.getByRole("button", { name: /^(Working|Worked)/ });
+    if (isTurnStreaming) fireEvent.click(header);
     const content = screen.getByTestId("agent-activity-content");
 
     expect(header).toHaveClass("h-7", "gap-1.5", "px-1.5");
@@ -474,6 +487,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     expect(screen.getByTestId("activity-reasoning-marker")).toHaveAttribute("data-state", "thinking");
 
     rerender(
@@ -494,8 +508,7 @@ describe("AgentActivityCluster", () => {
     await waitFor(() => expect(marker).toHaveClass("animate-in"));
   });
 
-  it("briefly shows completed activity, then auto-collapses before the answer", () => {
-    vi.useFakeTimers();
+  it("keeps untouched live details folded when work completes", () => {
     const liveReasoning: UIMessage = {
       id: "r-collapse",
       role: "assistant",
@@ -505,40 +518,25 @@ describe("AgentActivityCluster", () => {
       isStreaming: true,
       createdAt: 1,
     };
-    try {
-      const { rerender } = render(
-        <AgentActivityCluster
-          messages={[liveReasoning]}
-          isTurnStreaming
-          hasBodyBelow
-        />,
-      );
-      expect(screen.getByTestId("agent-activity-content")).toBeInTheDocument();
+    const { rerender } = render(
+      <AgentActivityCluster messages={[liveReasoning]} isTurnStreaming hasBodyBelow />,
+    );
+    expect(screen.getByRole("button", { name: /^Working for / })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("latest-activity-wheel")).toHaveTextContent("checking files");
 
-      rerender(
-        <AgentActivityCluster
-          messages={[{
-            ...liveReasoning,
-            reasoningStreaming: false,
-            isStreaming: false,
-          }]}
-          isTurnStreaming={false}
-          hasBodyBelow
-        />,
-      );
-
-      expect(screen.getByTestId("agent-activity-content")).toBeInTheDocument();
-      act(() => {
-        vi.advanceTimersByTime(301);
-      });
-      expect(screen.queryByTestId("agent-activity-content")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
-        "aria-expanded",
-        "false",
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    rerender(
+      <AgentActivityCluster
+        messages={[{ ...liveReasoning, reasoningStreaming: false, isStreaming: false }]}
+        isTurnStreaming={false}
+        hasBodyBelow
+      />,
+    );
+    expect(screen.queryByTestId("latest-activity-wheel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("agent-activity-content")).not.toBeInTheDocument();
+    const disclosure = screen.getByRole("button", { name: "Worked" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(disclosure);
+    expect(screen.getByTestId("agent-activity-content")).toHaveTextContent("checking files");
   });
 
 
@@ -691,6 +689,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     assertBetween(screen.getByRole("img", { name: "Editing" }));
 
     rerender(
@@ -774,7 +773,7 @@ describe("AgentActivityCluster", () => {
             retryStatus={{ state: "waiting", attempt: 1, max_attempts: 4, error_kind: "connection" }}
           />,
         );
-        expect(screen.getByRole("status", { name: "Connection failed Retrying" }))
+        expect(screen.getByRole("status", { name: "Connection failed. Retrying" }))
           .toBeVisible();
         unmount();
         render(<AgentActivityCluster messages={messages} isTurnStreaming={false} hasBodyBelow />);
@@ -949,7 +948,7 @@ describe("AgentActivityCluster", () => {
 
       const toggle = screen.getByTestId("file-edit-diff-toggle");
       expect(toggle).toHaveAttribute("aria-expanded", "false");
-      expect(toggle).toHaveTextContent(/^Expand changes$/);
+      expect(toggle).toHaveAccessibleName("Expand changes src/long.ts");
       expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
       expect(screen.queryByText("line-1")).not.toBeInTheDocument();
 
@@ -1037,7 +1036,7 @@ describe("AgentActivityCluster", () => {
 
       const toggle = screen.getByTestId("file-edit-diff-toggle");
       expect(toggle).toHaveAttribute("aria-expanded", "false");
-      expect(toggle).toHaveTextContent(/^View changes$/);
+      expect(toggle).toHaveAccessibleName("View changes src/app.tsx");
       expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
       expect(screen.queryByText("return <New />;")).not.toBeInTheDocument();
 
@@ -1094,7 +1093,7 @@ describe("AgentActivityCluster", () => {
 
       const toggle = screen.getByTestId("file-edit-diff-toggle");
       expect(toggle).toHaveAttribute("aria-expanded", "false");
-      expect(toggle).toHaveTextContent("Expand changes");
+      expect(toggle).toHaveAccessibleName("Expand changes /repo/src/app.tsx");
       expect(screen.queryByTestId("file-edit-diff-truncated")).not.toBeInTheDocument();
 
       fireEvent.click(toggle);
@@ -1323,6 +1322,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     const searchRow = screen.getByLabelText("Searched the web, nanobot architecture").closest('[data-testid="activity-step"]');
     const cliRow = screen.getByLabelText("Used Blender, --json project new").closest('[data-testid="activity-step"]');
     const fetchRow = screen.getByText("example.com/diagram").closest('[data-testid="activity-step"]');
@@ -1369,6 +1369,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    openLiveActivity();
     expect(screen.getByLabelText("Searched the web, agent frameworks")).toBeInTheDocument();
     expect(screen.queryByText("2 sources")).not.toBeInTheDocument();
 
@@ -1607,8 +1608,34 @@ describe("AgentActivityCluster", () => {
     expect(screen.getByLabelText("Opening example.com, Browserbase")).toBeInTheDocument();
     expect(screen.queryByText("Using")).not.toBeInTheDocument();
     expect(screen.queryByText(/browser_navigate/)).not.toBeInTheDocument();
-    expect(screen.getByTestId("activity-mcp-logo-browserbase")).toBeInTheDocument();
+    const mark = screen.getByTestId("activity-mcp-logo-browserbase");
+    expect(mark.querySelector("img")).toHaveAttribute("src", BROWSERBASE_MCP.icons![0].src);
+    act(() => writeLocalPreferences({ ...DEFAULT_LOCAL_PREFS, brandLogos: false }));
+    expect(mark.querySelector("svg")).toBeInTheDocument();
+    expect(mark.querySelector("img")).toBeNull();
     expect(screen.queryByText(/mcp_browserbase_browser_navigate/)).not.toBeInTheDocument();
+  });
+
+  it("rechecks connecting MCP metadata on activity demand and observes subsequent settings updates", async () => {
+    const catalog = getToolsCatalog({}, "token");
+    const preset = { ...BROWSERBASE_MCP, name: "team_docs", icons: [], runtime_status: "connecting" };
+    catalog.setMcpPresets({ installed_count: 1, presets: [preset] });
+    const connected = { ...preset, runtime_status: "connected", icons: [{ src: "https://docs.example/mark.png" }] };
+    const fetch = vi.spyOn(window, "fetch").mockResolvedValue(Response.json({ installed_count: 1, presets: [connected] }));
+    try {
+      const message: UIMessage = { id: "lookup", role: "tool", kind: "trace", content: "mcp_team_docs_find_page({})", createdAt: 1 };
+      const cluster = <AgentActivityCluster messages={[message]} isTurnStreaming hasBodyBelow={false} />;
+      render(<McpCatalogContext.Provider value={catalog}>{cluster}{cluster}</McpCatalogContext.Provider>);
+      const marks = () => screen.getAllByTestId("activity-mcp-logo-team_docs");
+      await waitFor(() => expect(marks().every(mark => mark.querySelector("img")?.src === connected.icons[0].src)).toBe(true));
+      expect(fetch).toHaveBeenCalledTimes(1);
+      act(() => catalog.setMcpPresets({ installed_count: 1, presets: [{ ...connected, icons: [] }] }));
+      expect(marks().every(mark => mark.querySelector('[data-product-icon="mcp"]'))).toBe(true);
+      await catalog.requestMcpPresets(false);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it("renders public web fetch traces with the site favicon", () => {
@@ -1732,7 +1759,8 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    expect(screen.getByText("File search complete *.tsx")).toBeInTheDocument();
+    openLiveActivity();
+    expect(screen.getByText("Found files *.tsx")).toBeInTheDocument();
     expect(screen.getByText("Listed files memory")).toBeInTheDocument();
     expect(screen.getByText("Searching files “dream_cursor”")).toBeInTheDocument();
     expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
@@ -1760,6 +1788,7 @@ describe("AgentActivityCluster", () => {
     const view = render(
       <AgentActivityCluster messages={messages} isTurnStreaming hasBodyBelow={false} />,
     );
+    openLiveActivity();
     const header = screen.getByText(/^Working for /);
     expect(header).toHaveAttribute("data-sheen-text", header.textContent);
     const tool = screen.getByText("Read file skills/weather/SKILL.md");
@@ -1902,7 +1931,7 @@ describe("AgentActivityCluster", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Worked" }));
 
-    expect(screen.getByLabelText("Ran command cat << 'EOF' | bash, script, 6 lines")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ran command cat << 'EOF' | bash, script (6 lines)")).toBeInTheDocument();
     expect(screen.queryByText(/SECRET_TOKEN/)).not.toBeInTheDocument();
     expect(screen.queryByText(/for id in/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Done$/)).not.toBeInTheDocument();
@@ -1925,7 +1954,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    expect(screen.getByText("Checking current time")).toBeInTheDocument();
+    expect(screen.getByText("Checking time")).toBeInTheDocument();
     expect(screen.queryByText(/%Y-%m-%d/)).not.toBeInTheDocument();
     expect(screen.queryByText("Web")).not.toBeInTheDocument();
   });
@@ -2304,6 +2333,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
     expect(screen.getByText("Generated image")).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: "generated.png" })).not.toBeInTheDocument();
   });
@@ -2460,6 +2490,9 @@ describe("AgentActivityCluster", () => {
     expect(container.innerHTML).not.toContain("mcp-private-value");
     expect(container.innerHTML).not.toContain("sk-proj-1234567890-secret");
     expect(container.innerHTML).not.toContain("private-payload");
+    expect(container.textContent).not.toMatch(/run_cli_app\(|browser_fill\(|third_party_sync\(/);
+    openLiveActivity();
+    expect(container.innerHTML).not.toMatch(/xoxb-1234567890-secret|mcp-private-value|sk-proj-1234567890-secret|private-payload/);
     expect(container.textContent).not.toMatch(/run_cli_app\(|browser_fill\(|third_party_sync\(/);
     expect(container.textContent).toMatch(/<redacted>|••••/);
   });

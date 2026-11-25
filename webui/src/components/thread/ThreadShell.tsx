@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { composerUsageSnapshots, type ComposerUsageSnapshot } from "@/lib/model-request";
@@ -11,6 +11,7 @@ import { FileActionsProvider } from "@/components/FileActions";
 import { createFilePreviewResource } from "@/lib/file-preview-resource";
 import { SessionHandleLabel } from "@/components/SessionHandleLabel";
 import { PromptNavigator } from "@/components/thread/PromptNavigator";
+import { useSessionModelOptions } from "@/hooks/useSessionModelOptions";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { ModelFallbackNotice } from "@/components/thread/ModelFallbackNotice";
 import { SandboxNotice } from "@/components/thread/SandboxNotice";
@@ -37,6 +38,8 @@ import { ThreadHeader } from "@/components/thread/ThreadHeader";
 import { GoalIsland } from "@/components/thread/GoalIsland";
 import { ThreadLoadingSkeleton } from "@/components/thread/ThreadLoadingSkeleton";
 import { StreamErrorNotice } from "@/components/thread/StreamErrorNotice";
+import { LocalToastViewport, PersistentToast, ThreadToastViewport, ToastProvider, useToast } from "@/components/ui/toast";
+import { emptyFinalMessageKey, isImageRequestFailure, resolveModelRequestFailureCopy } from "@/lib/model-request-failure";
 import { ThreadViewport, type ThreadViewportHandle } from "@/components/thread/ThreadViewport";
 import { ExecSessionCommandsContext } from "@/components/thread/activity/exec-session-context";
 import { execSessionCommands } from "@/components/thread/activity/exec-session-model";
@@ -48,7 +51,6 @@ import {
   fetchFilePreview,
   fetchFileReferenceMetadata,
   fetchInstalledCliApps,
-  fetchMcpPresets,
   fetchSettings,
   fetchWorkspaces,
   fetchWorkspaceDirectories,
@@ -59,11 +61,9 @@ import {
   installedCliAppsFromPayload,
   isCliAppsPayload,
 } from "@/lib/cli-app-events";
-import {
-  MCP_PRESETS_CHANGED_EVENT,
-  installedMcpPresetsFromPayload,
-  isMcpPresetsPayload,
-} from "@/lib/mcp-preset-events";
+import { McpCatalogContext, useMcpPresetCatalog } from "@/hooks/useMcpPresetCatalog";
+import { installedMcpPresetsFromPayload } from "@/lib/mcp-preset-events";
+import { getToolsCatalog } from "@/lib/tools-catalog-cache";
 import type { StreamError } from "@/lib/nanobot-client";
 import { isLocalAttachment } from "../../../../packages/client-events/attachments";
 import type {
@@ -81,9 +81,12 @@ import type {
 } from "@/lib/types";
 import { projectThreadEvents } from "@/lib/thread-event-projection";
 import { projectWebuiThreadMessages } from "@/lib/thread-display-projection";
+import { switchModelPreset } from "@/lib/switch-model-preset";
 import { ThreadMessageCache } from "@/lib/thread-message-cache";
 import { providerDisplayLabel } from "@/lib/provider-brand";
 import { cn } from "@/lib/utils";
+import { useFilePreviewResize } from "@/hooks/useFilePreviewResize";
+import { hasAnyOverlayMounted } from "@/lib/dom-overlays";
 import { composerContextSnapshots } from "@/lib/context-graph";
 import { useClient } from "@/providers/ClientProvider";
 
@@ -184,10 +187,6 @@ function hasInlineDeliveryError(
   ));
 }
 
-const FILE_PREVIEW_DEFAULT_WIDTH = 544;
-const FILE_PREVIEW_MIN_WIDTH = 360;
-const FILE_PREVIEW_MAX_WIDTH = 860;
-const FILE_PREVIEW_MIN_MAIN_WIDTH = 420;
 const FILE_PREVIEW_CLOSE_ANIMATION_MS = 320;
 
 type FilePreviewAvailabilityCacheEntry = {
@@ -195,20 +194,6 @@ type FilePreviewAvailabilityCacheEntry = {
   promise: Promise<boolean>;
   revision: number;
 };
-
-function clampFilePreviewWidth(width: number, maxWidth: number): number {
-  return Math.min(Math.max(width, FILE_PREVIEW_MIN_WIDTH), maxWidth);
-}
-
-function maxFilePreviewWidth(containerWidth: number): number {
-  return Math.min(
-    containerWidth > 0 ? containerWidth : FILE_PREVIEW_MIN_WIDTH,
-    Math.max(
-      FILE_PREVIEW_MIN_WIDTH,
-      Math.min(FILE_PREVIEW_MAX_WIDTH, containerWidth - FILE_PREVIEW_MIN_MAIN_WIDTH),
-    ),
-  );
-}
 
 const EMPTY_TITLE_OVERRIDES: Record<string, string> = {};
 
@@ -260,6 +245,7 @@ interface ThreadShellProps {
   settingsSnapshot?: SettingsPayload | null;
   settingsLoading?: boolean;
   onOpenModelSettings?: () => void;
+  onInspectImagePreset?: (name: string) => void;
   onOpenSandboxSettings?: (target: "sandbox" | "sandbox-launcher") => void;
   skills?: SkillSummary[];
 }
@@ -356,7 +342,11 @@ function useInstalledSettingItems<Payload, Item>({
   return items;
 }
 
-export function ThreadShell({
+export function ThreadShell(props: ThreadShellProps) {
+  return <ToastProvider scopeKey={props.session?.key ?? null}><ThreadShellContent {...props} /></ToastProvider>;
+}
+
+function ThreadShellContent({
   session,
   sessions = [],
   titleOverrides = EMPTY_TITLE_OVERRIDES,
@@ -400,10 +390,12 @@ export function ThreadShell({
   settingsSnapshot = null,
   settingsLoading = false,
   onOpenModelSettings,
+  onInspectImagePreset,
   onOpenSandboxSettings,
   skills = [],
 }: ThreadShellProps) {
   const { t } = useTranslation();
+  const showToast = useToast();
   const chatId = session?.chatId ?? null;
   const historyKey = temporary ? null : session?.key ?? null;
   const [visibleWindow, setVisibleWindow] = useState<{ key: string | null; turnIds: string[]; hasMessages: boolean } | null>(null);
@@ -426,6 +418,18 @@ export function ThreadShell({
     [historyKey, sessions, titleOverrides],
   );
   const { client, getToken, ingressLimits, modelName, token, webuiCapabilities } = useClient();
+  const [online, setOnline] = useState(client.status === "open");
+  useEffect(() => client.onStatus((status) => setOnline(status === "open")), [client]);
+  const cancelGoal = useCallback(async () => {
+    if (!chatId || client.status !== "open") throw new Error(t("thread.composer.cancelGoalOffline"));
+    await client.sendSystemCommand(chatId, "/cancel_goal").catch(() => {
+      throw new Error(t("thread.composer.cancelGoalFailed"));
+    });
+    const remainingGoal = client.getGoalState(chatId);
+    if (remainingGoal?.active || remainingGoal?.status === "blocked") {
+      throw new Error(t("thread.composer.cancelGoalFailed"));
+    }
+  }, [chatId, client, t]);
   const favoriteWorkspaceProject = useCallback(
     async (path: string, pinned: boolean) => {
       const response = await client.requestMutation<{ favorite_projects: ProjectDirectory[] }>("workspace.favorite", { path, pinned });
@@ -455,14 +459,9 @@ export function ThreadShell({
     isPayload: isCliAppsPayload,
     selectItems: installedCliAppsFromPayload,
   });
-  const mcpPresets = useInstalledSettingItems({
-    requestCount: mentionCatalogRequestCount,
-    getToken,
-    eventName: MCP_PRESETS_CHANGED_EVENT,
-    fetchPayload: fetchMcpPresets,
-    isPayload: isMcpPresetsPayload,
-    selectItems: installedMcpPresetsFromPayload,
-  });
+  const toolsCatalog = getToolsCatalog(client, token);
+  const mcpPayload = useMcpPresetCatalog(toolsCatalog, mentionCatalogRequestCount, true);
+  const mcpPresets = useMemo(() => mcpPayload ? installedMcpPresetsFromPayload(mcpPayload) : [], [mcpPayload]);
   const [settings, setSettings] = useState<SettingsPayload | null>(settingsSnapshot);
   const [modelFallback, setModelFallback] = useState<{
     chatId: string;
@@ -471,7 +470,7 @@ export function ThreadShell({
     dismissed: boolean;
   } | null>(null);
   const sandboxNotice = useSandboxNotice(client, chatId, webuiCapabilities.includes("webui.sandbox-settings.v1"));
-  const [submittedViewportTurnId, setSubmittedViewportTurnId] = useState<string | null>(null);
+  const [submittedViewportTurn, setSubmittedViewportTurn] = useState<{ chatId: string; turnId: string } | null>(null);
   const { state: previewState, openFile, resolveFile, selectTab, closeTab, close: closePreview, setWidth: setFilePreviewWidth } =
     useFilePreviewState(previewSessionKey, filePreviewStore);
   const [contextSidebarOpen, setContextSidebarOpen] = useState(false);
@@ -480,6 +479,7 @@ export function ThreadShell({
   }, [multiplePanes, previewSessionKey]);
   const [sidebarEnterWidth, setSidebarEnterWidth] = useState(0);
   const [contextSidebarHost, setContextSidebarHost] = useState<HTMLElement | null>(null);
+  const contextSidebarRef = useRef<HTMLElement>(null);
   const setSidebarHost = useCallback((node: HTMLElement | null) => { shellRef.current = node; setContextSidebarHost(node); }, []);
   const [closingPreview, setClosingPreview] = useState<{ key: string; state: FilePreviewState } | null>(null);
   const filePreviewClosing = closingPreview?.key === previewSessionKey;
@@ -507,8 +507,6 @@ export function ThreadShell({
     if (range && selection) { selection.removeAllRanges(); selection.addRange(range); }
   }, [composerDestination, composerMount, inlineComposer]);
   useLayoutEffect(() => () => composerMount.remove(), [composerMount]);
-  const [filePreviewMaxWidth, setFilePreviewMaxWidth] = useState(FILE_PREVIEW_MAX_WIDTH);
-  const filePreviewWidth = clampFilePreviewWidth(previewState.width, filePreviewMaxWidth);
   const draftKey = session?.key ?? (temporaryChatEnabled ? "new:temporary" : "new:chat");
   const persistDraft = session ? !temporary : !temporaryChatEnabled;
   const [quote, setQuote] = useState<{ key: string; text: string | null } | null>(null);
@@ -520,6 +518,9 @@ export function ThreadShell({
   }, [draftKey]);
   const [composerFocusSignal, setComposerFocusSignal] = useState(0);
   const shellRef = useRef<HTMLElement | null>(null);
+  const { width: filePreviewWidth, panelRef: previewPanelRef, startResize: handleFilePreviewResizeStart, cancelResize: cancelPreviewResize } = useFilePreviewResize(
+    shellRef, previewOpen, previewState.width, setFilePreviewWidth,
+  );
   const [conversationElement, setConversationElement] = useState<HTMLDivElement | null>(null);
   const [composerSurface, setComposerSurface] = useState<HTMLDivElement | null>(null);
   const alignSidebar = useCallback(() => {
@@ -538,9 +539,7 @@ export function ThreadShell({
     observer.observe(composerSurface);
     return () => observer.disconnect();
   }, [alignSidebar, contextSidebarHost, sidebarOpen, inlineComposer, composerDestination, composerMount, composerSurface]);
-  const filePreviewWidthRef = useRef(FILE_PREVIEW_DEFAULT_WIDTH);
   const filePreviewCloseTimerRef = useRef<number | null>(null);
-  const filePreviewResizeCleanupRef = useRef<(() => void) | null>(null);
   const pendingFirstRef = useRef<(PendingFirstMessage & { draft?: ComposerDraft; draftKey: string }) | null>(null);
   const [restoredFirstDraft, setRestoredFirstDraft] = useState<{ chatId: string; revision: number; error: string } | null>(null);
   const [pendingFirstTargetChatId, setPendingFirstTargetChatId] = useState<string | null>(null);
@@ -556,7 +555,6 @@ export function ThreadShell({
   const sessionKeyByChatIdRef = useRef<Map<string, string>>(new Map());
   const handleTurnEnd = useCallback(() => {
     if (chatId) activeViewportTurnByChatIdRef.current.delete(chatId);
-    setSubmittedViewportTurnId(null);
     onTurnEnd?.();
   }, [chatId, onTurnEnd]);
   const {
@@ -630,18 +628,14 @@ export function ThreadShell({
   }, [chatId, historyKey]);
 
   useEffect(() => {
-    filePreviewWidthRef.current = filePreviewWidth;
-  }, [filePreviewWidth]);
-
-  useEffect(() => {
-    filePreviewResizeCleanupRef.current?.();
+    cancelPreviewResize();
     if (filePreviewCloseTimerRef.current !== null) {
       window.clearTimeout(filePreviewCloseTimerRef.current);
       filePreviewCloseTimerRef.current = null;
     }
     setClosingPreview(null);
-    setSubmittedViewportTurnId(null);
-  }, [previewSessionKey]);
+    setSubmittedViewportTurn(null);
+  }, [cancelPreviewResize, previewSessionKey]);
 
   useEffect(() => {
     const retained = new Set(temporaryChatIds);
@@ -663,7 +657,6 @@ export function ThreadShell({
 
   useEffect(() => {
     return () => {
-      filePreviewResizeCleanupRef.current?.();
       if (filePreviewCloseTimerRef.current !== null) {
         window.clearTimeout(filePreviewCloseTimerRef.current);
       }
@@ -710,15 +703,12 @@ export function ThreadShell({
       ?? historyActiveTurnId
       ?? restoredViewportTurnId
     : null;
-  const activeTurnStartedHere =
-    viewportTurnId !== null && viewportTurnId === submittedViewportTurnId;
+  const submittedViewportTurnId = submittedViewportTurn?.chatId === chatId
+    ? submittedViewportTurn.turnId : null;
   useEffect(() => {
     if (!chatId || !messagesReady || turnActive) return;
     activeViewportTurnByChatIdRef.current.delete(chatId);
-    setSubmittedViewportTurnId((current) =>
-      current === rememberedViewportTurnId ? null : current,
-    );
-  }, [chatId, messagesReady, rememberedViewportTurnId, turnActive]);
+  }, [chatId, messagesReady, turnActive]);
   const filePreviewAvailabilityCache = useMemo(
     () => new Map<string, FilePreviewAvailabilityCacheEntry>(),
     [previewSessionKey],
@@ -793,6 +783,25 @@ export function ThreadShell({
     || settings?.agent.model_preset
     || "default"
   );
+  const imageInputBlocked = settings?.image_fallback_configured === false
+    && settings.model_presets.find((preset) => preset.name === activeModelPreset)?.supports_images === false;
+  const inspectImagePreset = useMemo(() => onInspectImagePreset
+    ? () => onInspectImagePreset(activeModelPreset)
+    : onOpenModelSettings, [activeModelPreset, onInspectImagePreset, onOpenModelSettings]);
+  const emptyFinalKey = streamError?.kind === "model_request_failed" && emptyFinalMessageKey(streamError.errorKind);
+  const imageRequestError = streamError?.kind === "model_request_failed" && isImageRequestFailure(streamError.errorKind)
+    ? streamError
+    : null;
+  useEffect(() => {
+    if (!messagesReady || !imageRequestError) return;
+    showToast?.({
+      message: resolveModelRequestFailureCopy(imageRequestError, t).title,
+      tone: "error",
+      dedupeKey: `image-request-failed:${imageRequestError.chatId}`,
+      action: inspectImagePreset ? { label: t("settings.models.viewPreset"), run: inspectImagePreset } : undefined,
+    });
+    dismissStreamError();
+  }, [dismissStreamError, imageRequestError, inspectImagePreset, messagesReady, showToast, t]);
   useEffect(() => {
     setModelFallback(null);
     if (!chatId) return;
@@ -820,12 +829,26 @@ export function ThreadShell({
       });
     });
   }, [activeModelPreset, chatId, client]);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const { data: modelOptionsData, select: selectModelOptions, reset: resetModelOptions,
+    sendValue: selectedModelOptions, moveToSession: moveModelOptionsToSession } = useSessionModelOptions({
+    sessionKey: session?.key ?? null, preset: activeModelPreset, settings,
+    open: modelMenuOpen, disabled: temporary, storedValue: session?.modelOptions,
+  });
+  // A receipt for the previous chat must not change the newly opened chat's badge.
+  const modelScope = useRef(0);
+  useLayoutEffect(() => () => { modelScope.current++; }, [client, chatId]);
   const handleModelPresetChange = useCallback((name: string) => {
-    setLocalModelPreset(name);
-    if (chatId) {
-      void client.sendSystemCommand(chatId, `/model ${name}`).catch(() => {});
-    }
-  }, [chatId, client]);
+    const select = (preset: string) => {
+      resetModelOptions(preset);
+      setLocalModelPreset(preset);
+    };
+    if (!chatId) return select(name);
+    const scope = modelScope.current;
+    return switchModelPreset(client, chatId, name).then((preset) => {
+      if (scope === modelScope.current) select(preset);
+    });
+  }, [chatId, client, resetModelOptions]);
   const modelPresetOptions = useMemo(
     () => modelPresetOptionsFromSettings(settings),
     [settings],
@@ -845,13 +868,15 @@ export function ThreadShell({
     : modelBadge.label;
   const withWorkspaceScope = useCallback(
     (options?: SendOptions): SendOptions | undefined => {
-      if (!workspaceScope) return options;
+      const modelOptions = selectedModelOptions();
+      if (!workspaceScope && !modelOptions) return options;
       return {
         ...(options ?? {}),
-        workspaceScope,
+        ...(workspaceScope ? { workspaceScope } : {}),
+        ...(modelOptions ? { modelOptions } : {}),
       };
     },
-    [workspaceScope],
+    [selectedModelOptions, workspaceScope],
   );
 
   const refreshModelSettings = useCallback(async () => {
@@ -958,7 +983,7 @@ export function ThreadShell({
     const submitted = send(pending.content, pending.images, pending.options);
     if (submitted && !submitted.sideChannel) {
       activeViewportTurnByChatIdRef.current.set(chatId, submitted.turnId);
-      setSubmittedViewportTurnId(submitted.turnId);
+      setSubmittedViewportTurn({ chatId, turnId: submitted.turnId });
     }
     if (submitted?.delivery) {
       void submitted.delivery.then(() => pending.finish?.(true), (error: unknown) => {
@@ -997,7 +1022,7 @@ export function ThreadShell({
     );
     if (submitted && !submitted.sideChannel) {
       activeViewportTurnByChatIdRef.current.set(chatId, submitted.turnId);
-      setSubmittedViewportTurnId(submitted.turnId);
+      setSubmittedViewportTurn({ chatId, turnId: submitted.turnId });
     }
     onPendingFirstMessageConsumed?.(pendingFirstMessage.id);
   }, [
@@ -1029,25 +1054,23 @@ export function ThreadShell({
       setBooting(true);
       let finish!: (accepted: boolean) => void;
       const delivery = new Promise<boolean>((resolve) => { finish = resolve; });
-      pendingFirstRef.current = {
+      const pending = {
         content, images, options: withWorkspaceScope(options), finish,
         draftKey, draft: draftStore?.get(draftKey, persistDraft),
       };
-      setPendingFirstTargetChatId(null);
-      const newId = await onCreateChat?.(workspaceScope, content, localModelPreset);
-      if (!newId) {
-        pendingFirstRef.current = null;
-        setPendingFirstTargetChatId(null);
-        setBooting(false);
-        return false;
+      let newId;
+      try {
+        newId = await onCreateChat?.(workspaceScope, content, localModelPreset);
+      } finally {
+        if (!newId) setBooting(false);
       }
-      if (localModelPreset) {
-        await client.sendSystemCommand(newId, `/model ${localModelPreset}`).catch(() => {});
-      }
+      if (!newId) return false;
+      pendingFirstRef.current = pending;
+      moveModelOptionsToSession(`websocket:${newId}`, pending.options?.modelOptions);
       setPendingFirstTargetChatId(newId);
       return delivery;
     },
-    [booting, client, draftKey, draftStore, localModelPreset, onCreateChat, persistDraft, withWorkspaceScope, workspaceScope],
+    [booting, draftKey, draftStore, localModelPreset, moveModelOptionsToSession, onCreateChat, persistDraft, withWorkspaceScope, workspaceScope],
   );
 
   const inspectAttachment = useCallback(async (path: string) => {
@@ -1060,6 +1083,9 @@ export function ThreadShell({
 
   const handleThreadSend = useCallback(
     (content: string, images?: SendAttachment[], options?: SendOptions) => {
+      if (content.trim() === "/cancel_goal" && options?.sideChannel && client.status !== "open") {
+        return Promise.reject(new Error(t("thread.composer.cancelGoalOffline")));
+      }
       setRestoredFirstDraft((current) => current?.chatId === chatId ? { ...current, error: "" } : current);
       const submitted = send(content, images, withWorkspaceScope(options));
       if (
@@ -1069,11 +1095,11 @@ export function ThreadShell({
         && options?.continueActiveTurn !== true
       ) {
         activeViewportTurnByChatIdRef.current.set(chatId, submitted.turnId);
-        setSubmittedViewportTurnId(submitted.turnId);
+        setSubmittedViewportTurn({ chatId, turnId: submitted.turnId });
       }
       return submitted?.delivery ? submitted.delivery.then(() => true) : submitted !== null;
     },
-    [chatId, send, withWorkspaceScope],
+    [chatId, client, send, t, withWorkspaceScope],
   );
 
   const loadTemporaryFilePreview = useCallback((path: string) =>
@@ -1088,7 +1114,7 @@ export function ThreadShell({
 
   const handleCloseFilePreview = useCallback(() => {
     if (!previewSessionKey || !previewState.activeId || filePreviewClosing) return;
-    filePreviewResizeCleanupRef.current?.();
+    cancelPreviewResize();
     setClosingPreview({ key: previewSessionKey, state: previewState });
     // Record the closed state immediately, even if navigation interrupts the animation.
     closePreview();
@@ -1096,23 +1122,24 @@ export function ThreadShell({
       filePreviewCloseTimerRef.current = null;
       setClosingPreview(null);
     }, FILE_PREVIEW_CLOSE_ANIMATION_MS);
-  }, [previewSessionKey, filePreviewClosing, previewState, closePreview]);
+  }, [cancelPreviewResize, previewSessionKey, filePreviewClosing, previewState, closePreview]);
 
   const cancelPreviewClose = useCallback(() => {
-    filePreviewResizeCleanupRef.current?.();
+    cancelPreviewResize();
     if (filePreviewCloseTimerRef.current !== null) {
       window.clearTimeout(filePreviewCloseTimerRef.current);
       filePreviewCloseTimerRef.current = null;
     }
     setClosingPreview(null);
-  }, []);
+  }, [cancelPreviewResize]);
 
   const handleOpenFilePreview = useCallback((path: string) => {
-    setSidebarEnterWidth(shellRef.current?.querySelector(".file-preview-pane")?.getBoundingClientRect().width ?? 0);
+    const outgoingSidebar = previewPanelRef.current ?? contextSidebarRef.current;
+    setSidebarEnterWidth(outgoingSidebar?.getBoundingClientRect().width ?? 0);
     setContextSidebarOpen(false);
     cancelPreviewClose();
     openFile(path);
-  }, [cancelPreviewClose, openFile]);
+  }, [cancelPreviewClose, openFile, previewPanelRef]);
 
   const handleContextSidebarOpenChange = useCallback((open: boolean) => {
     if (open) {
@@ -1125,10 +1152,10 @@ export function ThreadShell({
   const handleClosePreviewTab = useCallback((id: string) => {
     if (previewState.tabs.length === 1) handleCloseFilePreview();
     else {
-      filePreviewResizeCleanupRef.current?.();
+      cancelPreviewResize();
       closeTab(id);
     }
-  }, [previewState.tabs.length, handleCloseFilePreview, closeTab]);
+  }, [cancelPreviewResize, previewState.tabs.length, handleCloseFilePreview, closeTab]);
 
   // Markdown blocks can retain rendered links while their text is unchanged.
   // Keep their callback stable, but always act on the current pane/session state.
@@ -1158,91 +1185,13 @@ export function ThreadShell({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
       // Let a dialog/menu above the pane consume Escape without closing this preview.
-      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]')) return;
+      if (hasAnyOverlayMounted()) return;
       event.preventDefault();
       handleCloseFilePreview();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [previewOpen, headerActive, handleCloseFilePreview]);
-
-  const handleFilePreviewResizeStart = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
-    filePreviewResizeCleanupRef.current?.();
-    event.preventDefault();
-    event.stopPropagation();
-    const panel = event.currentTarget.closest<HTMLElement>("[data-file-preview-panel]");
-    const shellRect = shellRef.current?.getBoundingClientRect();
-    const rightEdge = shellRect?.right ?? window.innerWidth;
-    const maxWidth = maxFilePreviewWidth(shellRect?.width ?? window.innerWidth);
-    const originalBodyCursor = document.body.style.cursor;
-    const originalBodyUserSelect = document.body.style.userSelect;
-    const originalPanelTransition = panel?.style.transition ?? "";
-    const frameElement = panel?.querySelector("iframe");
-    const originalFramePointerEvents = frameElement?.style.pointerEvents ?? "";
-    let nextWidth = filePreviewWidthRef.current;
-    let frame: number | null = null;
-
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    if (panel) panel.style.transition = "none";
-    if (frameElement) frameElement.style.pointerEvents = "none";
-
-    const applyWidth = (clientX: number) => {
-      nextWidth = clampFilePreviewWidth(rightEdge - clientX, maxWidth);
-      filePreviewWidthRef.current = nextWidth;
-      if (frame !== null) return;
-      frame = window.requestAnimationFrame(() => {
-        frame = null;
-        panel?.style.setProperty("--file-preview-width", `${nextWidth}px`);
-        panel?.style.setProperty("--file-preview-slot-width", `${nextWidth}px`);
-      });
-    };
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      moveEvent.preventDefault();
-      applyWidth(moveEvent.clientX);
-    };
-    const stopResize = (commit: boolean) => {
-      if (frame !== null) {
-        window.cancelAnimationFrame(frame);
-        frame = null;
-      }
-      panel?.style.setProperty("--file-preview-width", `${nextWidth}px`);
-      panel?.style.setProperty("--file-preview-slot-width", `${nextWidth}px`);
-      if (panel) panel.style.transition = originalPanelTransition;
-      if (frameElement) frameElement.style.pointerEvents = originalFramePointerEvents;
-      if (commit) setFilePreviewWidth(nextWidth);
-      document.body.style.cursor = originalBodyCursor;
-      document.body.style.userSelect = originalBodyUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", handlePointerUp);
-      filePreviewResizeCleanupRef.current = null;
-    };
-    const handlePointerUp = () => stopResize(true);
-    filePreviewResizeCleanupRef.current = () => stopResize(false);
-
-    applyWidth(event.clientX);
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", handlePointerUp);
-  }, [setFilePreviewWidth]);
-
-  useEffect(() => {
-    if (!previewOpen) return;
-    const clampToShell = () => {
-      const shellWidth = shellRef.current?.getBoundingClientRect().width ?? window.innerWidth;
-      const maxWidth = maxFilePreviewWidth(shellWidth);
-      setFilePreviewMaxWidth(maxWidth);
-    };
-    clampToShell();
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(clampToShell);
-    if (shellRef.current) observer?.observe(shellRef.current);
-    window.addEventListener("resize", clampToShell);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", clampToShell);
-    };
-  }, [previewOpen]);
 
   const handleForkFromMessage = useCallback(
     async (beforeUserIndex: number) => {
@@ -1267,15 +1216,7 @@ export function ThreadShell({
           onDismiss={() => setModelFallback((current) => current && { ...current, dismissed: true })}
         />
       ) : null}
-      {recoveryState ? (
-        <RecoveryNotice
-          state={recoveryState}
-          onContinue={continueRecovery}
-          onDismiss={dismissRecovery}
-          onOpenSettings={onOpenModelSettings}
-        />
-      ) : null}
-      {streamError && !hasInlineDeliveryError(messages, streamError) ? (
+      {streamError && !emptyFinalKey && !imageRequestError && !hasInlineDeliveryError(messages, streamError) ? (
         <StreamErrorNotice
           error={streamError}
           onDismiss={dismissStreamError}
@@ -1300,6 +1241,8 @@ export function ThreadShell({
           draftStore={draftStore}
           persistDraft={persistDraft}
           onSend={handleThreadSend}
+          imageInputBlocked={imageInputBlocked}
+          onInspectImagePreset={inspectImagePreset}
           disabled={!chatId}
           inputAriaLabel={composerInputAriaLabel}
           isStreaming={turnActive}
@@ -1310,6 +1253,8 @@ export function ThreadShell({
           modelDetail={modelBadge.model}
           modelPreset={activeModelPreset}
           modelPresets={modelPresetOptions}
+          modelOptionsControl={{ data: modelOptionsData, onChange: selectModelOptions }}
+          onModelMenuOpenChange={setModelMenuOpen}
           onModelPresetChange={handleModelPresetChange}
           modelProvider={modelBadge.provider}
           modelProviderLabel={modelBadge.providerLabel}
@@ -1356,6 +1301,8 @@ export function ThreadShell({
           draftStore={draftStore}
           persistDraft={persistDraft}
           onSend={handleWelcomeSend}
+          imageInputBlocked={imageInputBlocked}
+          onInspectImagePreset={inspectImagePreset}
           disabled={booting}
           inputAriaLabel={composerInputAriaLabel}
           isStreaming={turnActive}
@@ -1364,6 +1311,8 @@ export function ThreadShell({
           modelDetail={modelBadge.model}
           modelPreset={activeModelPreset}
           modelPresets={modelPresetOptions}
+          modelOptionsControl={{ data: modelOptionsData, onChange: selectModelOptions }}
+          onModelMenuOpenChange={setModelMenuOpen}
           onModelPresetChange={handleModelPresetChange}
           modelProvider={modelBadge.provider}
           modelProviderLabel={modelBadge.providerLabel}
@@ -1429,7 +1378,7 @@ export function ThreadShell({
       className={previewOpen ? "h-10" : undefined}
       title={title}
       goal={currentGoalState && (currentGoalState.active || currentGoalState.status === "blocked")
-        ? <GoalIsland key={historyKey} goal={currentGoalState} /> : undefined}
+        ? <GoalIsland key={historyKey} goal={currentGoalState} cancelDisabled={!online} onCancel={cancelGoal} /> : undefined}
       onToggleSidebar={onToggleSidebar}
       theme={theme}
       onToggleTheme={onToggleTheme}
@@ -1482,9 +1431,18 @@ export function ThreadShell({
           resolve={previewSessionKey ? resolveFilePreviewAvailability : undefined}
         >
           <FileActionsProvider value={previewSessionKey ? fileActions : undefined}>
+          <McpCatalogContext.Provider value={toolsCatalog}>
           <ExecSessionCommandsContext.Provider value={sessionCommands}>
           <ThreadViewport
             ref={viewportRef}
+            toastViewport={<ThreadToastViewport>
+              {messagesReady && (recoveryNeedsDecision && recoveryState ? (
+                <RecoveryNotice key={chatId} state={recoveryState} onContinue={continueRecovery} onDismiss={dismissRecovery}
+                  onOpenSettings={onOpenModelSettings} onInspectImagePreset={inspectImagePreset} imageInputBlocked={imageInputBlocked} />
+              ) : emptyFinalKey ? (
+                <PersistentToast tone="error" message={t(emptyFinalKey)} secondaryAction={{ label: t("recovery.dismiss"), run: dismissStreamError }} />
+              ) : null)}
+            </ThreadToastViewport>}
             messages={displayMessages}
             messagesKey={messagesKey}
             navigation={promptNavigation}
@@ -1500,7 +1458,7 @@ export function ThreadShell({
             composer={inlineComposer ? <div ref={setLocalComposerHost} /> : null}
             onComposerLayoutChange={alignSidebar}
             activeTurnId={viewportTurnId}
-            activeTurnStartedHere={activeTurnStartedHere}
+            submittedPromptTurnId={submittedViewportTurnId}
             conversationKey={historyKey}
             conversationReady={messagesReady}
             onVisibleMessagesChange={reportVisibleMessages}
@@ -1521,6 +1479,7 @@ export function ThreadShell({
             onQuoteSelection={session ? handleQuoteSelection : undefined}
           />
           </ExecSessionCommandsContext.Provider>
+          </McpCatalogContext.Provider>
           </FileActionsProvider>
         </FilePreviewAvailabilityProvider>
       </div>
@@ -1533,6 +1492,7 @@ export function ThreadShell({
         rounds={composerRoundUsage}
         snapshots={contextGraphSnapshots}
         sidebarHost={contextSidebarHost}
+        sidebarRef={contextSidebarRef}
         open={contextSidebarOpen}
         onOpenChange={handleContextSidebarOpenChange}
         onOpenFile={handleOpenFilePreview}
@@ -1550,9 +1510,9 @@ export function ThreadShell({
         )}
       </ComposerUsagePopover>
       {activePreview && previewSessionKey ? (
-        <FileActionsProvider key={previewSessionKey} value={fileActions}>
+        <ToastProvider key={previewSessionKey} scopeKey={previewSessionKey}>
+        <FileActionsProvider value={fileActions}>
         <PreviewPane
-          key={previewSessionKey}
           tabs={visiblePreview.tabs}
           activeId={activePreview.id}
           width={filePreviewWidth}
@@ -1560,8 +1520,10 @@ export function ThreadShell({
           onSelect={selectTab}
           onCloseTab={handleClosePreviewTab}
           onClose={handleCloseFilePreview}
+          panelRef={previewPanelRef}
           onResizeStart={handleFilePreviewResizeStart}
         >
+          <LocalToastViewport surface="preview" />
           <FilePreviewPanel
             key={activePreview.id}
             sessionKey={previewSessionKey}
@@ -1574,6 +1536,7 @@ export function ThreadShell({
           />
         </PreviewPane>
         </FileActionsProvider>
+        </ToastProvider>
       ) : null}
     </section>
     </SubagentTasksProvider>

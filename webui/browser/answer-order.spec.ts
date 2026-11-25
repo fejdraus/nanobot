@@ -35,6 +35,8 @@ async function openThread(page: Page, events: ThreadProjectionEvent[] = [], loca
     });
   });
   await page.goto(`/browser/fixture.html?case=answer-order${reconnect ? "&reconnect=1" : ""}`);
+  // The load event does not await the fixture module's asynchronous startup.
+  await page.evaluate(async (entry) => { await import(entry); }, "/browser/fixture.tsx");
   await expect.poll(() => attached.has(chatId)).toBe(true);
   await expect(page.getByRole("status", { name: "Loading conversation…" })).toHaveCount(0);
   return {
@@ -57,8 +59,8 @@ async function expectAnswerOrder(page: Page) {
 }
 
 for (const scenario of [
-  { locale: "en", width: 1440, waiting: /Connection failed Retrying in [1-9][0-9]*s/, retrying: "Connection failed Retrying" },
-  { locale: "zh-CN", width: 390, waiting: /连接失败 [1-9][0-9]* 秒后重试/, retrying: "连接失败 正在重试" },
+  { locale: "en", width: 1440, working: /^Working for \d/, waiting: /Connection failed\. Retrying in [1-9][0-9]*s/, retrying: "Connection failed. Retrying" },
+  { locale: "zh-CN", width: 390, working: "正在处理", waiting: /连接失败，[1-9][0-9]* 秒后重试/, retrying: "连接失败，正在重试" },
 ]) {
   test(`shows retry progress in the live thread at ${scenario.width}px (${scenario.locale})`, async ({ page }, info) => {
     await page.setViewportSize({ width: scenario.width, height: 900 });
@@ -66,10 +68,9 @@ for (const scenario of [
     const { emit, errors } = await openThread(page, [], scenario.locale);
     emit({ event: "user_message", ...base, text: "Retry fixture", starts_turn: true, active_turn_id: turnId });
     await expect(page.getByText("Retry fixture", { exact: true })).toBeVisible();
-    emit(
-      { event: "goal_status", ...base, status: "running", started_at: Date.now() / 1000 },
-      { event: "retry_status", ...base, state: "waiting", attempt: 1, max_attempts: 4, error_kind: "connection", retry_after_s: 30 },
-    );
+    emit({ event: "goal_status", ...base, status: "running", started_at: Date.now() / 1000 });
+    await expect(page.getByRole("status", { name: scenario.working })).toHaveText(scenario.working);
+    emit({ event: "retry_status", ...base, state: "waiting", attempt: 1, max_attempts: 4, error_kind: "connection", retry_after_s: 30 });
     await expect(page.getByRole("status", { name: scenario.waiting })).toBeVisible();
     await page.screenshot({ path: info.outputPath("retry-waiting.png") });
     await page.clock.fastForward(30_000);
@@ -138,16 +139,18 @@ test.describe("answer order", () => {
       { event: "stream_end", ...base, stream_id: "live-empty", turn_seq: 4, resuming: true },
       { event: "message", ...base, turn_seq: 5, kind: "tool_hint", text: "read_file({\"path\":\"beta\"})" },
     );
-    await expect(page.getByTestId("agent-activity-content")).toContainText("网页");
+    const wheel = page.getByTestId("latest-activity-wheel");
+    await expect(wheel).toContainText("beta");
+    await expect(page.getByTestId("agent-activity-content")).toHaveCount(0);
     await expect(page.getByText("思考过程", { exact: true })).toHaveCount(0);
     await expect(page.getByTestId("activity-reasoning-marker")).toHaveCount(0);
     await page.getByRole("button", { name: "Switch topic" }).click();
     await expect(page.getByText("检查工具", { exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "Switch topic" }).click();
-    await expect(page.getByTestId("agent-activity-content")).toContainText("网页");
+    await expect(wheel).toContainText("beta");
     await expect(page.getByTestId("activity-reasoning-marker")).toHaveCount(0);
     await dropAndReconnect();
-    await expect(page.getByTestId("agent-activity-content")).toContainText("网页");
+    await expect(wheel).toContainText("beta");
     await expect(page.getByTestId("activity-reasoning-marker")).toHaveCount(0);
 
     emit(
@@ -157,6 +160,8 @@ test.describe("answer order", () => {
       { event: "delta", ...base, stream_id: "answer", turn_seq: 9, text: "最终答案" },
     );
     await expect(page.getByText("最终答案", { exact: true })).toHaveCount(1);
+    await expect(wheel).toContainText("真正的推理");
+    await page.getByRole("button", { name: /^处理中/ }).click();
     await expect(page.getByText("真正的推理", { exact: true })).toHaveCount(1);
     const activity = await page.getByTestId("agent-activity-content").textContent();
     expect(activity).toContain("网页");
@@ -176,11 +181,26 @@ test.describe("answer order", () => {
       { event: "stream_end", ...base, stream_id: "empty", turn_seq: 1, text: "", resuming: true },
     ];
     const { emit, errors } = await openThread(page, history);
-    await expect(page.getByText("Previous automation answer", { exact: true })).toHaveCount(1);
+    await page.evaluate(() => { document.documentElement.style.fontSize = "20px"; });
+    const answer = page.getByRole("paragraph").filter({ hasText: /^Previous automation answer$/ });
+    await expect(answer).toBeVisible();
+    const answerLeft = (await answer.boundingBox())!.x;
+    await answer.hover();
+    await page.getByRole("button", { name: /^Worked/ }).click();
+    const completed = page.getByRole("button", { name: /Collapse activity details/ });
+    const icon = (await completed.locator("svg").boundingBox())!;
+    expect(icon.x).toBeCloseTo(answerLeft, 0);
+    const guide = (await page.locator("[data-contextual-activity-guide]").boundingBox())!;
+    expect(guide.x).toBeCloseTo(icon.x + icon.width / 2, 0);
+    await completed.click();
     emit({ event: "goal_status", ...base, status: "running", started_at: Date.now() / 1000 });
-    await expect(page.getByRole("status", { name: /^Working for / })).toBeVisible();
+    const working = page.getByRole("status", { name: /^Working for / });
+    await expect(working).toBeVisible();
+    expect((await working.locator("svg").boundingBox())!.x).toBeCloseTo(answerLeft, 0);
     await expect(page.getByTestId("activity-reasoning-marker")).toHaveCount(0);
     emit({ event: "message", ...base, turn_seq: 2, kind: "tool_hint", text: "web_search({\"query\":\"alpha\"})" });
+    await expect(page.getByTestId("latest-activity-wheel")).toContainText("alpha");
+    await page.getByRole("button", { name: /^Working for / }).click();
     await expect(page.getByTestId("agent-activity-content")).toContainText("web");
     await expect(page.getByTestId("activity-reasoning-marker")).toHaveCount(0);
     expect(errors).toEqual([]);
@@ -254,8 +274,9 @@ test.describe("answer order", () => {
       await expect(page.getByRole("button", { name: "Stop response" })).toHaveCount(0);
       const lastBlock = last.locator("xpath=ancestor::*[@data-thread-display-unit]");
       await lastBlock.hover();
-      await lastBlock.getByRole("button", { name: "Message actions" }).click();
-      await page.locator("[data-message-block-activity-action]").click();
+      if (width === 390) await lastBlock.getByRole("button", { name: "Message actions" }).click();
+      const controls = width === 390 ? page.locator("[data-message-mobile-sheet]") : lastBlock;
+      await controls.locator("[data-message-block-activity-action]").click();
       const tool = page.getByText(/Searched the web/).first();
       await expect(tool).toBeVisible();
       const [firstNode, lastNode] = await Promise.all([first.elementHandle(), last.elementHandle()]);

@@ -5,13 +5,13 @@ from pathlib import Path
 from nanobot.config.home import get_home_path
 from nanobot.utils.file_io import ensure_dir
 
+MEMORY_JOURNAL_PATH = Path("memory/history.jsonl")
+MEMORY_CURSOR_PATH = Path("memory/.cursor")
+DREAM_CURSOR_PATH = Path("memory/.dream_cursor")
+
 
 def get_config_path() -> Path:
-    """Get the configuration file path (lazy import to break circular dependency).
-
-    Delegates to ``nanobot.config.loader.get_config_path`` at call time so
-    that importing this module never triggers a circular import during startup.
-    """
+    """Import the loader lazily to avoid a startup import cycle."""
     from nanobot.config.loader import get_config_path as _loader_get_config_path
     return _loader_get_config_path()
 

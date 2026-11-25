@@ -7,11 +7,14 @@ import pytest
 from agent.session_helpers import run_session, stop_loop, visible_message
 from nanobot.agent.automation_turns import AutomationTurnError
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.session_inbox import SessionInbox
 from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.outbound_events import CommandResultEvent, TurnFailureNotice
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import TurnCompleted
+from nanobot.command.results import message_text
 from nanobot.cron.service import CronService
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.goal.assembly import install_goal
@@ -64,9 +67,9 @@ async def test_idle_new_resets_session_and_accepts_next_message(loop):
         async with asyncio.timeout(5):
             while True:
                 reply = await loop.bus.consume_outbound()
-                if reply.event is None:
+                if isinstance(reply.event, CommandResultEvent) and reply.event.command == "/new":
                     break
-        assert reply.content == "New session started."
+        assert message_text(reply) == "New session started."
         assert (await loop.sessions.state.read(key)).messages == []
 
         await loop.bus.publish_inbound(InboundMessage(
@@ -116,8 +119,8 @@ async def test_message_queued_during_idle_new_runs_in_reset_session(loop):
         async with asyncio.timeout(5):
             while len(replies) < 2:
                 reply = await loop.bus.consume_outbound()
-                if reply.event is None:
-                    replies.append(reply.content)
+                if reply.event is None or (isinstance(reply.event, CommandResultEvent) and reply.event.command == "/new"):
+                    replies.append(message_text(reply))
         assert replies == ["New session started.", "fresh reply"]
         session = await loop.sessions.state.read(key)
         assert any(str(message.get("content", "")).startswith("hello") for message in session.messages)
@@ -153,7 +156,7 @@ async def test_new_during_active_turn_stops_it_and_resets_session(loop):
         async with asyncio.timeout(5):
             while True:
                 reply = await loop.bus.consume_outbound()
-                if reply.event is None and reply.content == "New session started.":
+                if isinstance(reply.event, CommandResultEvent) and reply.event.command == "/new":
                     break
         assert cancelled.is_set()
         assert (await loop.sessions.state.read(key)).messages == []
@@ -224,15 +227,15 @@ async def test_rejected_input_does_not_stop_other_sessions(loop, monkeypatch, re
         async with asyncio.timeout(5):
             while True:
                 message = await loop.bus.consume_outbound()
-                if message.chat_id == chat_id and message.event is None:
+                if message.chat_id == chat_id and (message.event is None or isinstance(message.event, TurnFailureNotice)):
                     return message
 
     original_list = loop.sessions._store.list_metadata
 
-    def blocked_list():
+    def blocked_list(**filters):
         readers_started.set()
         assert release_readers.wait(5)
-        return original_list()
+        return original_list(**filters)
 
     loop.provider.chat_stream_with_retry = chat
     if rejection == "idle":
@@ -272,7 +275,8 @@ async def test_rejected_input_does_not_stop_other_sessions(loop, monkeypatch, re
                 metadata={"webui": True}, session_generation=session.generation,
             )
             await loop.bus.publish_inbound(rejected)
-            assert (await reply("busy")).content == "Sorry, I encountered an error."
+            notice = await reply("busy")
+            assert (notice.event, notice.content) == (TurnFailureNotice("internal"), "")
         assert not run_task.done()
 
         release_readers.set()
@@ -312,12 +316,26 @@ def _automation_message(kind: str, name: str) -> InboundMessage:
     )
 
 
+async def test_cron_failure_completes_even_if_its_notice_cannot_be_queued(loop):
+    msg = _automation_message("cron", "unavailable")
+    msg.channel = "telegram"
+    loop.provider.chat_stream_with_retry = AsyncMock(side_effect=RuntimeError("turn failed"))
+
+    def reject_notice(outbound):
+        if isinstance(outbound.event, TurnFailureNotice):
+            raise RuntimeError("outbox full")
+        return outbound
+
+    loop.bus.prepare_outbound = reject_notice
+    with pytest.raises(AutomationTurnError, match="turn failed"):
+        await asyncio.wait_for(loop.submit_cron_turn(msg), timeout=3)
+
+
 @pytest.mark.parametrize("kind", ["cron", "local_trigger"])
 async def test_automation_turn_is_deferred_while_session_active(loop, kind):
     key = "websocket:test"
-    pending = asyncio.Queue()
-    loop._pending_queues[key] = pending
-    coordinator = loop._cron_turns if kind == "cron" else loop._local_trigger_turns
+    pending = SessionInbox()
+    loop._pending_queues.install(key, pending)
     pending_ids = (
         loop.pending_cron_job_ids_for_session
         if kind == "cron"
@@ -329,17 +347,17 @@ async def test_automation_turn_is_deferred_while_session_active(loop, kind):
     try:
         await loop.bus.publish_inbound(msg)
         async with asyncio.timeout(3):
-            while not coordinator.deferred_queues.get(key):
+            while not pending.deferred:
                 await asyncio.sleep(0)
         assert pending.empty()
         assert loop._active_tasks == {}
-        assert coordinator.deferred_queues[key] == [msg]
+        assert pending.deferred == (msg,)
         assert pending_ids(key) == {"deferred"}
 
         loop._process_message = AsyncMock(return_value=None)
         await loop._run_session_queue(key, pending)
         assert loop._process_message.await_args.args[0] is msg
-        assert key not in coordinator.deferred_queues
+        assert not pending.deferred
         assert pending_ids(key) == set()
     finally:
         loop.stop()
@@ -466,7 +484,7 @@ async def test_cancelled_session_completes_queued_automation_waiters(loop):
         ))
         tasks.extend([cron, trigger])
         await asyncio.sleep(0)
-        assert len(loop._deferred_automation_turns["websocket:test"]) == 2
+        assert len(loop._pending_queues["websocket:test"].deferred) == 2
         worker.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker
@@ -490,22 +508,25 @@ async def test_cancelled_session_completes_queued_automation_waiters(loop):
 async def test_stopped_followups_are_not_recovered_but_shutdown_preserves_them(
     loop,
     tmp_path,
+    monkeypatch,
     followup_still_queued,
     shutdown,
 ):
     started = asyncio.Event()
 
-    async def chat(**kwargs):
+    async def hold_turn(_msg, **_kwargs):
         started.set()
         await asyncio.Event().wait()
 
-    loop.provider.chat_stream_with_retry = chat
+    # Only the inbox owner must be busy. Keep the real journal, cancellation and
+    # restart scan without making this test depend on prompt or provider startup.
+    monkeypatch.setattr(loop, "_process_message", hold_turn)
     key = "websocket:test"
-    (await loop._enqueue_session_message(InboundMessage(
+    await loop._enqueue_session_message(InboundMessage(
         channel="websocket", sender_id="u", chat_id="test", content="first",
         metadata={"webui": True},
-    )))
-    await asyncio.wait_for(started.wait(), timeout=3)
+    ))
+    await asyncio.wait_for(started.wait(), timeout=30)
     (await loop._enqueue_session_message(InboundMessage(
         channel="websocket", sender_id="u", chat_id="test", content="cancel me",
         metadata={"webui": True},
@@ -581,6 +602,270 @@ async def test_cancel_preserves_followups_accepted_after_cancellation_started(lo
     assert [message.content for message in pending_followups(
         loop.sessions.get_or_create(key)
     )] == ["new followup"]
+
+
+@pytest.fixture
+def handoff_started(loop, monkeypatch):
+    """Exercise the real dispatcher and inbox without waiting on turn storage."""
+    started = asyncio.Event()
+
+    async def process_message(msg, **_kwargs):
+        if msg.content == "original turn":
+            started.set()
+            await asyncio.Event().wait()
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="automation finished")
+
+    monkeypatch.setattr(loop.sessions.state, "read", AsyncMock(return_value=None))
+    monkeypatch.setattr(loop, "_process_message", process_message)
+    return started
+
+
+@pytest.mark.parametrize("kind", ["cron", "local_trigger"])
+async def test_stop_does_not_strand_automation_submitted_during_cleanup(
+    loop, monkeypatch, kind, handoff_started,
+):
+    cleaning_exec = asyncio.Event()
+    submit_turn = loop.submit_cron_turn if kind == "cron" else loop.submit_local_trigger_turn
+    cancel_launches = loop._exec_session_manager._cancel_launches
+
+    async def observe_launch_cleanup(launches):
+        # Wake the submitter from the real exec cleanup without adding a
+        # suspension that could hide the late queue removal this test catches.
+        cleaning_exec.set()
+        return await cancel_launches(launches)
+
+    monkeypatch.setattr(loop._exec_session_manager, "_cancel_launches", observe_launch_cleanup)
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        await loop._dispatch_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="test", content="original turn",
+        ))
+        await handoff_started.wait()
+        stop = tasks.create_task(loop._dispatch_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="test", content="/stop",
+        )))
+        await cleaning_exec.wait()
+        submitted = tasks.create_task(submit_turn(_automation_message(kind, "new work")))
+        await stop
+        while True:
+            reply = await loop.bus.consume_outbound()
+            if isinstance(reply.event, CommandResultEvent) and reply.event.command == "/stop":
+                break
+        result = await submitted
+        assert result is not None and result.content == "automation finished"
+
+
+async def test_automation_arriving_during_queue_cancellation_is_not_stranded(loop, handoff_started):
+    notifying = asyncio.Event()
+    release_notification = asyncio.Event()
+
+    async def observe_completion(event):
+        if event.context.metadata.get("message_id") == "queued-compact":
+            notifying.set()
+            await release_notification.wait()
+
+    loop.bus.subscribe(observe_completion, TurnCompleted)
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        await loop._dispatch_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="test", content="original turn",
+        ))
+        await handoff_started.wait()
+        await loop._dispatch_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="test", content="/compact",
+            metadata={"message_id": "queued-compact"},
+        ))
+        stop = tasks.create_task(loop._dispatch_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="test", content="/stop",
+        )))
+        try:
+            await notifying.wait()
+            msg = _automation_message("cron", "after queue cancellation")
+            submitted = tasks.create_task(loop.submit_cron_turn(msg))
+            while "after queue cancellation" not in loop.pending_cron_job_ids_for_session(msg.session_key):
+                await asyncio.sleep(0)
+        finally:
+            release_notification.set()
+        await stop
+        while True:
+            reply = await loop.bus.consume_outbound()
+            if isinstance(reply.event, CommandResultEvent) and reply.event.command == "/stop":
+                break
+        result = await submitted
+        assert result is not None and result.content == "automation finished"
+
+
+async def test_shutdown_rejects_automation_before_starting_cleanup(loop):
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def chat(**_kwargs):
+        if not started.is_set():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+        return LLMResponse(content="too late to start")
+
+    loop.provider.chat_stream_with_retry = chat
+    await loop._enqueue_session_message(InboundMessage(
+        channel="websocket", sender_id="user", chat_id="already-active", content="original turn",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    close = asyncio.create_task(loop.aclose())
+    try:
+        await asyncio.wait_for(cleaning.wait(), timeout=3)
+        # The snapshot contains another session; both same-key and cross-session
+        # submitters must see the closed runtime, not just its active inboxes.
+        with pytest.raises(RuntimeError, match="Session execution is closing"):
+            await asyncio.wait_for(loop.submit_local_trigger_turn(
+                _automation_message("local_trigger", "during shutdown"),
+            ), timeout=3)
+    finally:
+        release.set()
+        await asyncio.wait_for(close, timeout=3)
+
+
+async def test_shutdown_waits_for_worker_already_cancelling_from_stop(loop, monkeypatch):
+    started = asyncio.Event()
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+    closing_resources = asyncio.Event()
+    close_subagents = loop.subagents.close
+
+    async def chat(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelling.set()
+            await release.wait()
+
+    async def observe_close():
+        closing_resources.set()
+        await close_subagents()
+
+    loop.provider.chat_stream_with_retry = chat
+    monkeypatch.setattr(loop.subagents, "close", observe_close)
+    dispatcher = asyncio.create_task(loop.run())
+    close = None
+    try:
+        async with asyncio.timeout(5):
+            await loop.bus.publish_inbound(InboundMessage(
+                channel="websocket", sender_id="user", chat_id="test", content="original turn",
+            ))
+            await started.wait()
+            await loop.bus.publish_inbound(InboundMessage(
+                channel="websocket", sender_id="user", chat_id="test", content="/stop",
+            ))
+            await cancelling.wait()
+            close = asyncio.create_task(loop.aclose())
+            # With no other workers or background tasks, a close that does not
+            # join this worker goes straight to shared resource teardown.
+            await asyncio.sleep(0)
+            assert not closing_resources.is_set()
+    finally:
+        release.set()
+        if close is not None:
+            await asyncio.wait_for(close, timeout=3)
+        await stop_loop(loop, dispatcher, timeout=3)
+    assert closing_resources.is_set()
+
+
+async def test_replacement_waits_for_same_session_resource_cleanup(loop, monkeypatch):
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    cleanup_at_dispatch = []
+    dispatch_one = loop._dispatch_one
+    cancel_by_session = loop.subagents.cancel_by_session
+
+    async def chat(**_kwargs):
+        if not started.is_set():
+            started.set()
+            await asyncio.Event().wait()
+        return LLMResponse(content="automation finished")
+
+    async def observe_dispatch(msg, pending):
+        if msg.content == "same session":
+            cleanup_at_dispatch.append(release.is_set())
+        await dispatch_one(msg, pending)
+
+    async def blocked_cleanup(key):
+        cleaning.set()
+        await release.wait()
+        return await cancel_by_session(key)
+
+    loop.provider.chat_stream_with_retry = chat
+    monkeypatch.setattr(loop, "_dispatch_one", observe_dispatch)
+    monkeypatch.setattr(loop.subagents, "cancel_by_session", blocked_cleanup)
+    dispatcher = asyncio.create_task(loop.run())
+    submitted = None
+    try:
+        async with asyncio.timeout(5):
+            await loop.bus.publish_inbound(InboundMessage(
+                channel="websocket", sender_id="user", chat_id="test", content="original turn",
+            ))
+            await started.wait()
+            await loop.bus.publish_inbound(InboundMessage(
+                channel="websocket", sender_id="user", chat_id="test", content="/stop",
+            ))
+            await cleaning.wait()
+            submitted = asyncio.create_task(loop.submit_cron_turn(
+                _automation_message("cron", "same session"),
+            ))
+            other = _automation_message("cron", "other session")
+            other.chat_id = "other"
+            assert (await loop.submit_cron_turn(other)).content == "automation finished"
+            release.set()
+            assert (await submitted).content == "automation finished"
+        assert cleanup_at_dispatch == [True]
+    finally:
+        release.set()
+        if submitted is not None:
+            submitted.cancel()
+            await asyncio.gather(submitted, return_exceptions=True)
+        await stop_loop(loop, dispatcher, timeout=3)
+
+
+async def test_shutdown_joins_control_when_no_worker_remains(loop, monkeypatch):
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    closing_resources = asyncio.Event()
+    seen_released = []
+    cancel_by_session = loop.subagents.cancel_by_session
+    close_subagents = loop.subagents.close
+
+    async def blocked_cleanup(key):
+        cleaning.set()
+        await release.wait()
+        return await cancel_by_session(key)
+
+    async def observe_close():
+        seen_released.append(release.is_set())
+        closing_resources.set()
+        await close_subagents()
+
+    monkeypatch.setattr(loop.subagents, "cancel_by_session", blocked_cleanup)
+    monkeypatch.setattr(loop.subagents, "close", observe_close)
+    dispatcher = asyncio.create_task(loop.run())
+    close = None
+    try:
+        async with asyncio.timeout(5):
+            await loop.bus.publish_inbound(InboundMessage(
+                channel="websocket", sender_id="user", chat_id="test", content="/stop",
+            ))
+            await cleaning.wait()
+            close = asyncio.create_task(loop.aclose())
+            await asyncio.sleep(0)
+            assert not closing_resources.is_set()
+    finally:
+        release.set()
+        if close is not None:
+            await asyncio.wait_for(close, timeout=3)
+        await stop_loop(loop, dispatcher, timeout=3)
+    assert seen_released and all(seen_released)
 
 
 @pytest.mark.parametrize("action", ["stop", "close"])
@@ -692,7 +977,6 @@ async def test_ingress_sources_share_one_session_worker(loop, bus_running):
         assert len(set(workers)) == 1
         assert loop.bus.inbound_size == 0
         assert key not in loop._pending_queues
-        assert key not in loop._deferred_automation_turns
     finally:
         release.set()
         for task in tasks:

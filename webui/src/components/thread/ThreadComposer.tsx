@@ -1,32 +1,14 @@
+import type { ModelOptionsControlProps } from "@/components/thread/ModelOptionsControl";
 import { pastedFilePath, PastedPathRange, type LocalAttachment } from "../../../../packages/client-events/attachments";
 import {
-  NewChatIcon,
-  CompactIcon,
-  StatusIcon,
-  ModelsIcon,
-  TriggerIcon,
-  DreamLogIcon,
-  PromptTemplateIcon,
-  PairingIcon,
   ToolRunIcon,
-  ActivityIcon,
-  ArchiveIcon,
-  SkillsIcon,
-  MemoryIcon,
-  HelpIcon,
-  HistoryIcon,
   AttachIcon,
-  RestartIcon,
-  RestrictedAccessIcon,
-  DreamIcon,
-  StopIcon,
   EditIcon,
-  GoalIcon,
-  RestoreMemoryIcon,
 } from "@/components/icons/product-icons";
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -52,26 +34,35 @@ import {
   isCapabilityMentionStart,
   type CapabilityMentionSegment,
 } from "@/lib/composer-mention-text";
-import { INLINE_REFERENCE_HIGHLIGHT_COLOR, INLINE_TOKEN_HIGHLIGHT_COLOR, InlineTokenHighlight } from "@/components/InlineTokenHighlight";
+import { INLINE_REFERENCE_HIGHLIGHT_COLOR, InlineTokenHighlight } from "@/components/InlineTokenHighlight";
 import { SlashCommandText } from "@/components/SlashCommandText";
 import {
   CornerDownRight,
   Loader2,
+  Maximize2,
+  Minimize2,
   Quote,
   Trash2,
   X,
-  type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { commandLabel } from "../../../../packages/client-events/command-result";
 
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/toast";
 import { AttachmentCard, AttachmentTypeFace, attachmentCardActionClassName } from "@/components/AttachmentCard";
 import { ComposerActionIcon, type ComposerActionState } from "@/components/thread/ComposerActionIcon";
 import {
-  floatingItemClassName,
-  floatingItemFocusClassName,
-  floatingSurfaceVisualClassName,
-} from "@/components/ui/floating-surface";
+  CliAppMentionPalette,
+  SkillPalette,
+  SlashCommandPalette,
+  skillSourceBucket,
+  type MentionCandidate,
+  type SkillPaletteItem,
+  type SlashPaletteCommand,
+  type SlashPaletteLayout,
+  type SlashPalettePlacement,
+} from "@/components/thread/ComposerPalette";
 import {
   Tooltip,
   TooltipContent,
@@ -102,10 +93,9 @@ import {
 } from "@/hooks/useAttachedImages";
 import { useClipboardAndDrop } from "@/hooks/useClipboardAndDrop";
 import { useComposerMentionInput } from "@/hooks/useComposerMentionInput";
-import { useLogoFallback } from "@/hooks/useLogoFallback";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import type { SendAttachment, SendOptions } from "@/hooks/useNanobotStream";
-import { useVoiceRecorder, type VoiceRecorderErrorKey } from "@/hooks/useVoiceRecorder";
+import { useComposerVoiceInput } from "@/hooks/useComposerVoiceInput";
 import type {
   CliAppInfo,
   ChatSummary,
@@ -122,10 +112,6 @@ import type {
   ProjectDirectory,
   WorkspaceDirectoriesPayload,
 } from "@/lib/types";
-import {
-  logoFallbackUrls,
-} from "@/lib/provider-brand";
-import { sessionHandleColor } from "@/lib/session-handle";
 import { requestSkillsRefresh } from "@/lib/skill-events";
 import {
   isRegisteredSlashCommand,
@@ -150,12 +136,6 @@ import {
   type QueuedPromptContent,
 } from "@/components/thread/useQueuedPrompt";
 
-const VOICE_SHORTCUT_CODE = "KeyD";
-const VOICE_SHORTCUT_ARIA = "Control+Shift+D";
-const VOICE_ERROR_VISIBLE_MS = 3_500;
-const VOICE_ERROR_FADE_MS = 500;
-type VoiceShortcutPlatform = "apple" | "chromeos" | "linux" | "other" | "windows";
-
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
@@ -164,54 +144,6 @@ function formatBytes(n: number): string {
 
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
-}
-
-function isVoiceShortcutDown(event: KeyboardEvent): boolean {
-  return (
-    event.code === VOICE_SHORTCUT_CODE
-    && event.ctrlKey
-    && event.shiftKey
-    && !event.altKey
-    && !event.metaKey
-  );
-}
-
-function isVoiceShortcutRelease(event: KeyboardEvent): boolean {
-  return (
-    event.code === VOICE_SHORTCUT_CODE
-    || event.key === "Control"
-    || event.key === "Shift"
-  );
-}
-
-function getVoiceShortcutPlatform(): VoiceShortcutPlatform {
-  if (typeof navigator === "undefined") return "other";
-  const userAgentData = (navigator as Navigator & { userAgentData?: { platform?: string } })
-    .userAgentData;
-  const platform = [
-    userAgentData?.platform,
-    navigator.platform,
-    navigator.userAgent,
-  ].filter(Boolean).join(" ").toLowerCase();
-  const isIpadPretendingToBeMac =
-    navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
-  if (isIpadPretendingToBeMac || /mac|iphone|ipad|ipod/.test(platform)) return "apple";
-  if (/win/.test(platform)) return "windows";
-  if (/cros/.test(platform)) return "chromeos";
-  if (/linux|x11|android/.test(platform)) return "linux";
-  return "other";
-}
-
-function getVoiceShortcutLabel(): string {
-  switch (getVoiceShortcutPlatform()) {
-    case "apple":
-      return "⌃⇧D";
-    case "chromeos":
-    case "linux":
-    case "windows":
-    case "other":
-      return "Ctrl ⇧ D";
-  }
 }
 
 interface ThreadComposerProps {
@@ -223,6 +155,7 @@ interface ThreadComposerProps {
   disabled?: boolean;
   placeholder?: string;
   inputAriaLabel?: string;
+  expandable?: boolean;
   compactWhenIdle?: boolean;
   isStreaming?: boolean;
   activeTurnId?: string | null;
@@ -231,7 +164,11 @@ interface ThreadComposerProps {
   modelDetail?: string | null;
   modelPreset?: string | null;
   modelPresets?: ModelPresetOption[];
-  onModelPresetChange?: (name: string) => void;
+  modelOptionsControl?: ModelOptionsControlProps;
+  onModelMenuOpenChange?: (open: boolean) => void;
+  onModelPresetChange?: (name: string) => void | Promise<void>;
+  imageInputBlocked?: boolean;
+  onInspectImagePreset?: () => void;
   modelProvider?: string | null;
   modelProviderLabel?: string | null;
   modelNeedsSetup?: boolean;
@@ -275,37 +212,9 @@ interface ThreadComposerProps {
   onQuotedContextChange?: (text: string | null) => void;
 }
 
-const COMMAND_ICONS: Record<string, LucideIcon> = {
-  activity: ActivityIcon,
-  archive: ArchiveIcon,
-  "book-open": SkillsIcon,
-  brain: MemoryIcon,
-  "circle-help": HelpIcon,
-  history: HistoryIcon,
-  "rotate-cw": RestartIcon,
-  shield: RestrictedAccessIcon,
-  sparkles: DreamIcon,
-  square: StopIcon,
-  "square-pen": EditIcon,
-  "undo-2": RestoreMemoryIcon,
-  zap: TriggerIcon,
-  "file-text": PromptTemplateIcon,
-  wrench: ToolRunIcon,
-};
-
-const BUILTIN_COMMAND_ICONS: Record<string, LucideIcon> = {
-  "/new": NewChatIcon, "/compact": CompactIcon, "/stop": StopIcon,
-  "/restart": RestartIcon, "/status": StatusIcon, "/model": ModelsIcon,
-  "/history": HistoryIcon, "/goal": GoalIcon, "/trigger": TriggerIcon,
-  "/dream": DreamIcon, "/dream-log": DreamLogIcon, "/dream-restore": RestoreMemoryIcon,
-  "/dream-prompt": PromptTemplateIcon, "/evaluator-prompt": PromptTemplateIcon,
-  "/skill": SkillsIcon, "/help": HelpIcon, "/pairing": PairingIcon,
-};
-
 const SLASH_PALETTE_GAP_PX = 8;
 const SLASH_PALETTE_MAX_HEIGHT_PX = 288;
 const SLASH_PALETTE_MIN_HEIGHT_PX = 144;
-const SLASH_PALETTE_CHROME_PX = 12;
 const SLASH_RECENTS_STORAGE_KEY = "nanobot.webui.slashCommandRecents";
 const SLASH_RECENTS_LIMIT = 5;
 const SESSION_MENTIONS_LIMIT = 8;
@@ -349,31 +258,11 @@ function VoiceRecordingMeter({
   );
 }
 
-type SlashPalettePlacement = "above" | "below" | "beside";
-
-interface SlashPaletteLayout {
-  placement: SlashPalettePlacement;
-  maxHeight: number;
-}
-
 interface CliAppMentionQuery {
   query: string;
   start: number;
   end: number;
 }
-
-type MentionCandidate = {
-  name: string;
-  displayName: string;
-} & (
-  | { kind: "session"; mention: SessionMention }
-  | {
-      kind: "cli" | "mcp";
-      brandColor: string | null;
-      logoUrl: string | null;
-      initials: string;
-    }
-);
 
 interface MentionInsertion {
   value: string;
@@ -416,18 +305,6 @@ function sessionMentionOptions(sessions: ChatSummary[]): SessionMention[] {
   });
 }
 
-interface SlashPaletteCommand {
-  command: string;
-  title: string;
-  description: string;
-  icon: string;
-  kind?: "skill";
-  argHint?: string;
-  detail: string;
-  badge?: string;
-  recent: boolean;
-}
-
 function skillMatchRank(skill: SkillSummary, query: string): number | null {
   if (!query) return 0;
   const name = skill.name.toLowerCase();
@@ -438,8 +315,29 @@ function skillMatchRank(skill: SkillSummary, query: string): number | null {
   return null;
 }
 
-function slashCommandI18nKey(command: string): string {
-  return command.replace(/^\//, "").replace(/-/g, "_");
+function skillSourceOrder(source: string): number {
+  const bucket = skillSourceBucket(source);
+  if (bucket === "workspace") return 0;
+  if (bucket === "builtin") return 1;
+  return 2;
+}
+
+function slashCommandMatchRank(
+  command: SlashCommand,
+  title: string,
+  description: string,
+  query: string,
+): number | null {
+  if (!query) return 0;
+  const name = command.command.replace(/^\//, "").toLowerCase();
+  if (name === query) return 0;
+  if (name.startsWith(query)) return 1;
+  if (name.includes(query)) return 2;
+  if (title.toLowerCase().includes(query) || command.title.toLowerCase().includes(query)) return 3;
+  const haystack = [command.command, command.description, command.argHint ?? "", description]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query) ? 4 : null;
 }
 
 function readSlashRecents(): string[] {
@@ -535,12 +433,14 @@ function mcpPresetMentionPayload(preset: McpPresetInfo): OutboundMcpPresetMentio
 function autosizeTextarea(input: HTMLTextAreaElement) {
   const container = input.parentElement!;
   const previousMinHeight = container.style.minHeight;
+  const scrollTop = input.scrollTop;
   // Measuring the one-row textarea must not expand the sibling transcript and
   // clamp its native scroll offset, even temporarily before paint.
   container.style.minHeight = `${container.getBoundingClientRect().height}px`;
   try {
     input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, 260)}px`;
+    input.style.height = `${input.scrollHeight}px`;
+    input.scrollTop = scrollTop;
   } finally {
     container.style.minHeight = previousMinHeight;
   }
@@ -551,6 +451,7 @@ export function ThreadComposer({
   disabled,
   placeholder,
   inputAriaLabel,
+  expandable = true,
   compactWhenIdle = false,
   isStreaming = false,
   activeTurnId = null,
@@ -559,7 +460,11 @@ export function ThreadComposer({
   modelDetail = null,
   modelPreset = null,
   modelPresets = [],
+  modelOptionsControl,
+  onModelMenuOpenChange,
   onModelPresetChange,
+  imageInputBlocked = false,
+  onInspectImagePreset,
   modelProvider = null,
   modelProviderLabel = null,
   modelNeedsSetup = false,
@@ -601,7 +506,8 @@ export function ThreadComposer({
   focusRequest = 0,
   onQuotedContextChange,
 }: ThreadComposerProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage ?? i18n.language;
   const [initialDraft] = useState(() => draftKey ? draftStore?.get(draftKey, persistDraft) : undefined);
   const [value, setValue] = useState(initialDraft?.text ?? "");
   const [composerFocused, setComposerFocused] = useState(false);
@@ -615,8 +521,12 @@ export function ThreadComposer({
     start: number;
     end: number;
   } | null>(null);
-  const [inlineError, setInlineError] = useState<string | null>(null);
+  const showToast = useToast();
+  const reportError = useCallback((message: string) => {
+    showToast?.({ message, tone: "error", dedupeKey: message });
+  }, [showToast]);
   const [sendPending, setSendPending] = useState(false);
+  const [modelSwitchPending, setModelSwitchPending] = useState(false);
   const [pathInspection, setPathInspection] = useState<{
     generation: number; scope: string; range: PastedPathRange; attachment?: LocalAttachment;
   } | null>(null);
@@ -627,6 +537,9 @@ export function ThreadComposer({
   useEffect(() => () => { pathCheckGeneration.current += 1; }, []);
   const [modelSetupAttentionRequest, setModelSetupAttentionRequest] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaId = useId();
+  const [draftExpanded, setDraftExpanded] = useState(false);
+  const [draftOverflows, setDraftOverflows] = useState(false);
   const focusTextarea = useCallback(() => {
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, []);
@@ -689,6 +602,22 @@ export function ThreadComposer({
     return null;
   }, [formatRejection, formatUploadTooLarge, ingressLimits, maxAttachments, maxFileBytes, maxTextBytes, t, textTooLargeMessage]);
 
+  const validatePrompt = useCallback((prompt: QueuedPromptContent): boolean => {
+    if (imageInputBlocked && prompt.images?.some(({ kind }) => kind === "image")) {
+      showToast?.({
+        message: t("errors.modelRequestFailed.imageInputTitle"),
+        tone: "error",
+        action: onInspectImagePreset
+          ? { label: t("settings.models.viewPreset"), run: onInspectImagePreset }
+          : undefined,
+      });
+      return false;
+    }
+    const error = queuedPromptError(prompt);
+    if (error) reportError(error);
+    return error === null;
+  }, [imageInputBlocked, onInspectImagePreset, queuedPromptError, reportError, showToast, t]);
+
   const {
     snapshot: queueSnapshot,
     collect: collectQueuedPrompt,
@@ -697,18 +626,17 @@ export function ThreadComposer({
     pause: pauseQueue,
     send: sendQueuedPrompt,
   } = useQueuedPrompt(pendingQueueKey, { isStreaming, activeTurnId, completedTurnIds }, {
-    disabled: !!disabled || sendPending,
+    disabled: !!disabled || sendPending || modelSwitchPending,
     onSend,
-    validate: queuedPromptError,
-    onValidationError: setInlineError,
+    validate: validatePrompt,
     onSendAttempt: focusTextarea,
   });
   const queuedPrompt = queueSnapshot.prompt;
   const interactionDisabled = !!disabled || sendPending || queueSnapshot.sending;
+  const sendDisabled = interactionDisabled || modelSwitchPending;
   useEffect(() => {
-    if (queueSnapshot.error) setInlineError(queueSnapshot.error);
-  }, [queueSnapshot.error]);
-  const [voiceErrorFading, setVoiceErrorFading] = useState(false);
+    if (queueSnapshot.error) reportError(queueSnapshot.error);
+  }, [queueSnapshot.error, reportError]);
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
   const [cliAppMenuDismissed, setCliAppMenuDismissed] = useState(false);
@@ -726,34 +654,44 @@ export function ThreadComposer({
   const formRef = useRef<HTMLFormElement>(null);
   const [compactControls, setCompactControls] = useState(false);
 
+  const measureDraft = useCallback(() => {
+    const input = textareaRef.current;
+    if (!input) return;
+    autosizeTextarea(input);
+    if (expandable) setDraftOverflows(input.scrollHeight > input.clientHeight);
+    if (mentionOverlayRef.current) mentionOverlayRef.current.scrollTop = input.scrollTop;
+  }, [expandable]);
+
   useLayoutEffect(() => {
     const form = formRef.current;
-    if (!form) return;
+    const input = textareaRef.current;
+    if (!form || !input) return;
     let previousWidth = 0;
     const update = () => {
       const width = form.getBoundingClientRect().width;
-      if (width <= 0 || width === previousWidth) return;
-      previousWidth = width;
-      setCompactControls(width <= 512);
-      const input = textareaRef.current;
-      if (input) autosizeTextarea(input);
+      if (width <= 0) return;
+      if (width !== previousWidth) {
+        previousWidth = width;
+        setCompactControls(width <= 512);
+        measureDraft();
+      } else if (expandable) {
+        setDraftOverflows(input.scrollHeight > input.clientHeight);
+      }
     };
     update();
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
     observer?.observe(form);
+    if (expandable) observer?.observe(input);
     window.addEventListener("resize", update);
     return () => {
       observer?.disconnect();
       window.removeEventListener("resize", update);
     };
-  }, []);
+  }, [expandable, measureDraft]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chipRefs = useRef(new Map<string, HTMLButtonElement>());
   const previousPendingQueueKeyRef = useRef(pendingQueueKey);
-  const voiceShortcutDownRef = useRef(false);
-  const voiceErrorFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isHero = variant === "hero";
-  const voiceShortcutLabel = useMemo(getVoiceShortcutLabel, []);
   const projectPickerAvailable =
     !workspaceProjectLocked
     && !!workspaceDefaultScope
@@ -813,14 +751,12 @@ export function ThreadComposer({
       const { rejected } = enqueue(files);
       if (rejected.length > 0) {
         const { reason, file } = rejected[0];
-        setInlineError(reason === "too_large"
+        reportError(reason === "too_large"
           ? formatUploadTooLarge(file.size, acceptedAttachmentKind(file) === "video" ? MAX_VIDEO_BYTES : maxFileBytes)
           : formatRejection(reason));
-      } else {
-        setInlineError(null);
       }
     },
-    [enqueue, formatRejection, formatUploadTooLarge, interactionDisabled, maxFileBytes],
+    [enqueue, formatRejection, formatUploadTooLarge, interactionDisabled, maxFileBytes, reportError],
   );
 
   const {
@@ -866,7 +802,7 @@ export function ThreadComposer({
   const requiresModelSetup = modelNeedsSetup && !isUserShell;
   const hasComposerContent = value.trim().length > 0 || readyImages.length > 0;
   const canSend =
-    !interactionDisabled
+    !sendDisabled
     && !requiresModelSetup
     && !encoding
     && !hasErrors
@@ -877,7 +813,7 @@ export function ThreadComposer({
   const canQueueGuidance =
     isStreaming
     && !isUserShell
-    && !interactionDisabled
+    && !sendDisabled
     && !modelNeedsSetup
     && !encoding
     && !hasErrors
@@ -923,48 +859,46 @@ export function ThreadComposer({
     ];
   }, [isStreaming, onStop, slashCommands]);
 
-  const filteredSlashCommands = useMemo<SlashPaletteCommand[]>(() => {
-    if (skillQuery !== null) {
-      const query = skillQuery.text;
-      return skills
-        .filter((skill) => skill.enabled !== false && skill.available)
-        .flatMap((skill) => {
-          const matchRank = skillMatchRank(skill, query);
-          return matchRank === null
-            ? []
-            : [{
-                command: `$${skill.name}`,
-                matchRank,
-                skill,
-              }];
-        })
-        .sort((a, b) => {
-          if (a.matchRank !== b.matchRank) return a.matchRank - b.matchRank;
-          if (query !== "") return 0;
-          const aRecent = recentSlashCommands.indexOf(a.command);
-          const bRecent = recentSlashCommands.indexOf(b.command);
-          if (aRecent === -1 && bRecent === -1) return 0;
+  const filteredSkills = useMemo<SkillPaletteItem[]>(() => {
+    if (skillQuery === null) return [];
+    const query = skillQuery.text;
+    return skills
+      .filter((skill) => skill.enabled !== false && skill.available)
+      .flatMap((skill) => {
+        const matchRank = skillMatchRank(skill, query);
+        return matchRank === null
+          ? []
+          : [{
+              command: `$${skill.name}`,
+              matchRank,
+              skill,
+            }];
+      })
+      .sort((a, b) => {
+        if (a.matchRank !== b.matchRank) return a.matchRank - b.matchRank;
+        if (query !== "") return 0;
+        const aRecent = recentSlashCommands.indexOf(a.command);
+        const bRecent = recentSlashCommands.indexOf(b.command);
+        if (aRecent !== -1 || bRecent !== -1) {
           if (aRecent === -1) return 1;
           if (bRecent === -1) return -1;
           return aRecent - bRecent;
-        })
-        .slice(0, 8)
-        .map(({ command, skill }) => {
-          const description = skill.description || skill.name;
-          return {
-            command,
-            title: skill.name,
-            description,
-            detail: description,
-            icon: "brain",
-            kind: "skill" as const,
-            recent: recentSlashCommands.includes(command),
-          };
-        });
-    }
-    if (slashQuery === null) return [];
-    const withDetails = visibleSlashCommands
-      .filter((command) => {
+        }
+        return skillSourceOrder(a.skill.source) - skillSourceOrder(b.skill.source);
+      })
+      .map(({ command, skill }) => ({
+        name: skill.name,
+        command,
+        description: skill.description || skill.name,
+        source: skill.source,
+        recent: recentSlashCommands.includes(command),
+      }));
+  }, [recentSlashCommands, skills, skillQuery]);
+
+  const filteredSlashCommands = useMemo<SlashPaletteCommand[]>(() => {
+    if (skillQuery !== null || slashQuery === null) return [];
+    return visibleSlashCommands
+      .flatMap((command) => {
         if (
           slashQuery === ""
           && (
@@ -972,30 +906,12 @@ export function ThreadComposer({
             || (command.command === "/stop" && !(isStreaming && onStop))
           )
         ) {
-          return false;
+          return [];
         }
-        const commandKey = slashCommandI18nKey(command.command);
-        const title = t(`thread.composer.slash.commands.${commandKey}.title`, {
-          defaultValue: command.title,
-        });
-        const description = t(`thread.composer.slash.commands.${commandKey}.description`, {
-          defaultValue: command.description,
-        });
-        const haystack = [
-          command.command,
-          command.title,
-          command.description,
-          command.argHint ?? "",
-          title,
-          description,
-        ].join(" ").toLowerCase();
-        return haystack.includes(slashQuery);
-      })
-      .map((command) => {
-        const commandKey = slashCommandI18nKey(command.command);
-        const description = t(`thread.composer.slash.commands.${commandKey}.description`, {
-          defaultValue: command.description,
-        });
+        const title = commandLabel(command.command, "title", locale) ?? command.title;
+        const description = commandLabel(command.command, "description", locale) ?? command.description;
+        const matchRank = slashCommandMatchRank(command, title, description, slashQuery);
+        if (matchRank === null) return [];
         let detail = description;
         let badge: string | undefined;
         if (command.command === "/model" && modelLabel) {
@@ -1007,37 +923,40 @@ export function ThreadComposer({
             : t("thread.composer.slash.details.goalReady");
         } else if (command.command === "/stop" && isStreaming) {
           detail = t("thread.composer.slash.details.stopRunning");
-        } else if (command.command === "/history") {
-          detail = t("thread.composer.slash.details.history");
         }
-        return {
-          ...command,
-          detail,
-          badge,
-          recent: recentSlashCommands.includes(command.command),
-        };
+        return [{
+          matchRank,
+          item: {
+            ...command,
+            title,
+            description,
+            detail,
+            badge,
+            recent: recentSlashCommands.includes(command.command),
+          },
+        }];
       })
       .sort((a, b) => {
         if (isStreaming) {
-          if (a.command === "/stop") return -1;
-          if (b.command === "/stop") return 1;
+          if (a.item.command === "/stop") return -1;
+          if (b.item.command === "/stop") return 1;
         }
+        if (a.matchRank !== b.matchRank) return a.matchRank - b.matchRank;
         if (slashQuery !== "") return 0;
-        const aRecent = recentSlashCommands.indexOf(a.command);
-        const bRecent = recentSlashCommands.indexOf(b.command);
+        const aRecent = recentSlashCommands.indexOf(a.item.command);
+        const bRecent = recentSlashCommands.indexOf(b.item.command);
         if (aRecent !== -1 || bRecent !== -1) {
           if (aRecent === -1) return 1;
           if (bRecent === -1) return -1;
           return aRecent - bRecent;
         }
         return 0;
-      });
+      })
+      .map(({ item }) => item);
+  }, [goalState?.active, isStreaming, locale, modelLabel, onStop, recentSlashCommands, skillQuery, slashQuery, t, visibleSlashCommands]);
 
-    return withDetails
-      .slice(0, 8);
-  }, [goalState?.active, isStreaming, modelLabel, recentSlashCommands, skills, skillQuery, slashQuery, t, visibleSlashCommands]);
-
-  const showSlashMenu = filteredSlashCommands.length > 0;
+  const showSkillMenu = filteredSkills.length > 0;
+  const showSlashMenu = !showSkillMenu && filteredSlashCommands.length > 0;
   const cliAppMention = useMemo<CliAppMentionQuery | null>(() => {
     if (interactionDisabled || isUserShell || cliAppMenuDismissed) return null;
     const caret = Math.min(Math.max(cursorPosition, 0), value.length);
@@ -1117,7 +1036,6 @@ export function ThreadComposer({
     const edited = pathInspection.range.replace("", rawSelection().start);
     if (edited && !addLocal(pathInspection.attachment)) {
       replaceMentionInput(edited.value, edited.cursor, { preserveFocus: true });
-      setInlineError(null);
     }
     setPathInspection(null);
   }, [addLocal, isUserShell, mentionInput.isComposing, pathInspection, rawSelection, replaceMentionInput, scopeIdentity, value]);
@@ -1255,7 +1173,7 @@ export function ThreadComposer({
   }, [cliAppMention, cliApps, insertableSessionMentions, mcpPresets, sessionMentionCatalog]);
 
   const showCliAppMenu = filteredMentionCandidates.length > 0;
-  const showAnyPalette = showSlashMenu || showCliAppMenu;
+  const showAnyPalette = showSlashMenu || showSkillMenu || showCliAppMenu;
   const inlineSegments = useMemo(
     () => isUserShell ? displayMentionSegments : withSkillReferences(displayMentionSegments),
     [displayMentionSegments, isUserShell],
@@ -1283,19 +1201,21 @@ export function ThreadComposer({
     maxHeight: SLASH_PALETTE_MAX_HEIGHT_PX,
   });
 
+  const activeCommandCount = showSkillMenu ? filteredSkills.length : filteredSlashCommands.length;
+
   useEffect(() => {
     setSelectedCommandIndex(0);
-  }, [slashQuery]);
+  }, [skillQuery?.text, slashQuery]);
 
   useEffect(() => {
     setSelectedCliAppIndex(0);
   }, [cliAppMention?.query]);
 
   useEffect(() => {
-    if (selectedCommandIndex >= filteredSlashCommands.length) {
+    if (selectedCommandIndex >= activeCommandCount) {
       setSelectedCommandIndex(0);
     }
-  }, [filteredSlashCommands.length, selectedCommandIndex]);
+  }, [activeCommandCount, selectedCommandIndex]);
 
   useEffect(() => {
     if (selectedCliAppIndex >= filteredMentionCandidates.length) {
@@ -1367,32 +1287,18 @@ export function ThreadComposer({
       window.removeEventListener("resize", updateLayout);
       document.removeEventListener("scroll", updateLayout, true);
     };
-  }, [filteredMentionCandidates.length, filteredSlashCommands.length, showAnyPalette]);
+  }, [filteredMentionCandidates.length, filteredSkills.length, filteredSlashCommands.length, showAnyPalette]);
 
   useLayoutEffect(() => {
-    const el = textareaRef.current;
-    if (!el || mentionInput.isComposing) return;
-    autosizeTextarea(el);
-    if (mentionOverlayRef.current) mentionOverlayRef.current.scrollTop = el.scrollTop;
-  }, [compactControls, mentionInput.isComposing, mentionInput.value]);
+    if (mentionInput.isComposing) return;
+    if (!mentionInput.value) setDraftExpanded(false);
+    measureDraft();
+  }, [compactControls, measureDraft, mentionInput.isComposing, mentionInput.value]);
 
   useEffect(() => {
     // The parent projects typography tokens in its layout effect; measure after it.
-    const input = textareaRef.current;
-    if (input) autosizeTextarea(input);
-  }, [readingTextSize, customReadingTextSize]);
-
-  // Runs before paint so switching sessions never flashes stale draft text.
-  useLayoutEffect(() => {
-    if (previousPendingQueueKeyRef.current === pendingQueueKey) return;
-    previousPendingQueueKeyRef.current = pendingQueueKey;
-    setValue("");
-    setInlineError(null);
-    setSlashMenuDismissed(false);
-    setCliAppMenuDismissed(false);
-    setCursorPosition(0);
-    clear();
-  }, [clear, pendingQueueKey]);
+    measureDraft();
+  }, [readingTextSize, customReadingTextSize, measureDraft]);
 
   const appendTranscription = useCallback((text: string) => {
     const transcript = text.trim();
@@ -1404,80 +1310,57 @@ export function ThreadComposer({
     });
     setSlashMenuDismissed(false);
     setCliAppMenuDismissed(false);
-    setInlineError(null);
     focusTextarea();
   }, [focusTextarea]);
 
-  const clearVoiceErrorTimers = useCallback(() => {
-    if (voiceErrorFadeTimerRef.current !== null) clearTimeout(voiceErrorFadeTimerRef.current);
-    voiceErrorFadeTimerRef.current = null;
-  }, []);
-  const clearInlineError = useCallback(() => {
-    clearVoiceErrorTimers();
-    setVoiceErrorFading(false);
-    setInlineError(null);
-  }, [clearVoiceErrorTimers]);
-  const setVoiceError = useCallback((key: VoiceRecorderErrorKey) => {
-    clearVoiceErrorTimers();
-    setVoiceErrorFading(false);
-    setInlineError(t(`thread.composer.voiceErrors.${key}`));
-    voiceErrorFadeTimerRef.current = setTimeout(() => {
-      setVoiceErrorFading(true);
-      voiceErrorFadeTimerRef.current = setTimeout(() => {
-        setInlineError(null);
-        setVoiceErrorFading(false);
-        voiceErrorFadeTimerRef.current = null;
-      }, VOICE_ERROR_FADE_MS);
-    }, VOICE_ERROR_VISIBLE_MS);
-  }, [clearVoiceErrorTimers, t]);
-  const voiceRecorder = useVoiceRecorder({
-    disabled: interactionDisabled,
-    onClearError: clearInlineError,
-    onError: setVoiceError,
-    onTranscript: appendTranscription,
-    onTranscribeAudio,
+  const {
+    recorder: voiceRecorder,
+    shortcutLabel: voiceShortcutLabel, shortcutAria, canSendQueuedPrompt,
+  } = useComposerVoiceInput({
+    disabled: interactionDisabled, onTranscribeAudio, onTranscript: appendTranscription,
     wantsWav: transcriptionProvider === "xiaomi_mimo",
   });
 
-  useEffect(() => () => clearVoiceErrorTimers(), [clearVoiceErrorTimers]);
-
-  useEffect(() => {
-    if (!onTranscribeAudio) return;
-
-    function onKeyDown(event: KeyboardEvent): void {
-      if (!isVoiceShortcutDown(event) || event.repeat || voiceShortcutDownRef.current) return;
-      event.preventDefault();
-      voiceShortcutDownRef.current = true;
-      voiceRecorder.beginShortcutHold();
-    }
-
-    function onKeyUp(event: KeyboardEvent): void {
-      if (!voiceShortcutDownRef.current || !isVoiceShortcutRelease(event)) return;
-      event.preventDefault();
-      voiceShortcutDownRef.current = false;
-      voiceRecorder.endShortcutHold();
-    }
-
-    function onWindowBlur(): void {
-      if (!voiceShortcutDownRef.current) return;
-      voiceShortcutDownRef.current = false;
-      voiceRecorder.endShortcutHold();
-    }
-
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onWindowBlur);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", onWindowBlur);
-    };
-  }, [onTranscribeAudio, voiceRecorder.beginShortcutHold, voiceRecorder.endShortcutHold]);
+  // Runs before paint so switching sessions never flashes stale draft text.
+  useLayoutEffect(() => {
+    if (previousPendingQueueKeyRef.current === pendingQueueKey) return;
+    previousPendingQueueKeyRef.current = pendingQueueKey;
+    setValue("");
+    setSlashMenuDismissed(false);
+    setCliAppMenuDismissed(false);
+    setCursorPosition(0);
+    clear();
+  }, [clear, pendingQueueKey]);
 
   const handleStop = useCallback(() => {
     pauseQueue();
     onStop?.();
   }, [onStop, pauseQueue]);
+
+  const recordSlashRecent = useCallback((command: string) => {
+    const nextRecents = [
+      command,
+      ...recentSlashCommands.filter((item) => item !== command),
+    ].slice(0, SLASH_RECENTS_LIMIT);
+    setRecentSlashCommands(nextRecents);
+    storeSlashRecents(nextRecents);
+  }, [recentSlashCommands]);
+
+  const chooseSkill = useCallback(
+    (skill: SkillPaletteItem) => {
+      if (skillQuery === null) return;
+      recordSlashRecent(skill.command);
+      const suffix = value.slice(skillQuery.end);
+      const inserted = `${skill.command}${suffix.startsWith(" ") ? "" : " "}`;
+      const next = `${value.slice(0, skillQuery.start)}${inserted}${suffix}`;
+      const nextCursor = skillQuery.start + inserted.length;
+      replaceMentionInput(next, nextCursor);
+      setSlashMenuDismissed(true);
+      setCliAppMenuDismissed(false);
+      focusTextarea();
+    },
+    [focusTextarea, recordSlashRecent, replaceMentionInput, skillQuery, value],
+  );
 
   const chooseSlashCommand = useCallback(
     (command: SlashPaletteCommand) => {
@@ -1486,33 +1369,17 @@ export function ThreadComposer({
         setValue("");
         setSlashMenuDismissed(true);
         setCliAppMenuDismissed(false);
-        setInlineError(null);
         focusTextarea();
         return;
       }
 
-      const nextRecents = [
-        command.command,
-        ...recentSlashCommands.filter((item) => item !== command.command),
-      ].slice(0, SLASH_RECENTS_LIMIT);
-      setRecentSlashCommands(nextRecents);
-      storeSlashRecents(nextRecents);
-
-      if (skillQuery !== null) {
-        const suffix = value.slice(skillQuery.end);
-        const inserted = `${command.command}${suffix.startsWith(" ") ? "" : " "}`;
-        const next = `${value.slice(0, skillQuery.start)}${inserted}${suffix}`;
-        const nextCursor = skillQuery.start + inserted.length;
-        replaceMentionInput(next, nextCursor);
-      } else {
-        setValue(command.argHint ? `${command.command} ` : command.command);
-      }
+      recordSlashRecent(command.command);
+      setValue(command.argHint ? `${command.command} ` : command.command);
       setSlashMenuDismissed(true);
       setCliAppMenuDismissed(false);
-      setInlineError(null);
       focusTextarea();
     },
-    [handleStop, isStreaming, onStop, recentSlashCommands, replaceMentionInput, focusTextarea, skillQuery, value],
+    [focusTextarea, handleStop, isStreaming, onStop, recordSlashRecent],
   );
 
   const insertMention = useCallback(
@@ -1521,7 +1388,6 @@ export function ThreadComposer({
       replaceMentionInput(insertion.value, insertion.cursor);
       setCliAppMenuDismissed(true);
       setSlashMenuDismissed(false);
-      setInlineError(null);
       focusTextarea();
     },
     [replaceMentionInput, focusTextarea, value],
@@ -1593,7 +1459,6 @@ export function ThreadComposer({
 
   const clearComposerText = useCallback((restoreFocus = true) => {
     setValue("");
-    setInlineError(null);
     setSlashMenuDismissed(false);
     setCliAppMenuDismissed(false);
     setCursorPosition(0);
@@ -1625,7 +1490,6 @@ export function ThreadComposer({
     clearQueuedPrompt();
     replaceMentionInput(prompt.text, prompt.text.length);
     setBoundSessionMentions(prompt.sessionMentions ?? []);
-    setInlineError(null);
     setSlashMenuDismissed(false);
     setCliAppMenuDismissed(false);
     onQuotedContextChange?.(prompt.quotedContext ?? null);
@@ -1646,13 +1510,13 @@ export function ThreadComposer({
     }
     if (!canSend) return;
     if (isUserShell && (images.length > 0 || normalizedQuotedContext)) {
-      setInlineError(t("thread.composer.shell.removeContext"));
+      reportError(t("thread.composer.shell.removeContext"));
       return;
     }
     const trimmed = value.trim();
     const content = trimmed;
     if (utf8Bytes(formatQuotedUserMessage(content, normalizedQuotedContext)) > maxTextBytes) {
-      setInlineError(textTooLargeMessage());
+      reportError(textTooLargeMessage());
       return;
     }
     // Keep self-contained local previews across drafts and optimistic bubbles.
@@ -1685,7 +1549,6 @@ export function ThreadComposer({
       : null;
     if (
       slashLifecycle === "stop_active_turn"
-      && isStreaming
       && onStop
     ) {
       handleStop();
@@ -1699,11 +1562,7 @@ export function ThreadComposer({
       slashLifecycle === "finalize_active_turn";
     if (!isUserShell && !slashLifecycle) {
       const prompt = collectGuidancePrompt();
-      const error = queuedPromptError(prompt);
-      if (error) {
-        setInlineError(error);
-        return;
-      }
+      if (!validatePrompt(prompt)) return;
       if (queuedPrompt) {
         sendQueuedPrompt(prompt, options);
         if (draftKey) draftStore?.delete(draftKey);
@@ -1745,7 +1604,7 @@ export function ThreadComposer({
           if (accepted !== false) finishSend();
         })
         .catch((error: unknown) => {
-          setInlineError(error instanceof Error ? error.message : "Failed to send message");
+          reportError(error instanceof Error ? error.message : "Failed to send message");
         })
         .finally(() => setSendPending(false));
       return;
@@ -1762,7 +1621,7 @@ export function ThreadComposer({
     clearComposerText,
     collectGuidancePrompt,
     queuedPrompt,
-    queuedPromptError,
+    validatePrompt,
     sendQueuedPrompt,
     clearQueuedPrompt,
     hasTouchPrimaryPointer,
@@ -1781,6 +1640,7 @@ export function ThreadComposer({
     slashCommands,
     t,
     textTooLargeMessage,
+    reportError,
     value,
   ]);
 
@@ -1808,6 +1668,30 @@ export function ThreadComposer({
       if (e.key === "Escape") {
         e.preventDefault();
         setCliAppMenuDismissed(true);
+        return;
+      }
+    }
+    if (showSkillMenu) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelectedCommandIndex((idx) => (idx + 1) % filteredSkills.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelectedCommandIndex(
+          (idx) => (idx - 1 + filteredSkills.length) % filteredSkills.length,
+        );
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        chooseSkill(filteredSkills[selectedCommandIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashMenuDismissed(true);
         return;
       }
     }
@@ -1863,7 +1747,7 @@ export function ThreadComposer({
         && !e.ctrlKey
         && !e.metaKey
       ) {
-        if (!e.repeat && voiceRecorder.state === "idle" && !voiceShortcutDownRef.current) {
+        if (!e.repeat && canSendQueuedPrompt()) {
           sendQueuedPrompt(queuedPrompt);
         }
         return;
@@ -1881,7 +1765,6 @@ export function ThreadComposer({
   const removeChip = useCallback(
     (id: string) => {
       const { nextFocusId } = remove(id);
-      setInlineError(null);
       requestAnimationFrame(() => {
         const el = nextFocusId ? chipRefs.current.get(nextFocusId) : null;
         if (el) {
@@ -1937,7 +1820,7 @@ export function ThreadComposer({
     : showStopButton ? "stop" : requiresModelSetup ? "setup" : canSend || !isStreaming ? "send" : "busy";
   const relaxedHeroInput = isHero && images.length === 0 && !isStreaming;
   const compactIdle = compactWhenIdle && !compactControls && !isHero && !composerFocused
-    && value.length === 0 && images.length === 0 && !inlineError
+    && value.length === 0 && images.length === 0
     && !normalizedQuotedContext && !queuedPrompt
     && !isDragging && !sessionDragPreview && !voiceRecorder.isRecording && !showProjectPicker;
   useLayoutEffect(() => {
@@ -1990,7 +1873,18 @@ export function ThreadComposer({
       modelDetail={modelDetail}
       modelPreset={modelPreset}
       modelPresets={modelPresets}
-      onPresetChange={onModelPresetChange}
+      modelOptionsControl={modelOptionsControl}
+      onMenuOpenChange={onModelMenuOpenChange}
+      disabled={sendDisabled}
+      onPresetChange={onModelPresetChange && ((name) => {
+        const selection = onModelPresetChange(name);
+        if (!selection) return;
+        setModelSwitchPending(true);
+        void selection.catch((error: unknown) => {
+          pauseQueue();
+          reportError(error instanceof Error ? error.message : t("message.agentActivity.commandFailed"));
+        }).finally(() => setModelSwitchPending(false));
+      })}
       onManageModels={onManageModels}
       onRequestComposerFocus={() => textareaRef.current?.focus()}
       provider={modelProvider}
@@ -2005,8 +1899,8 @@ export function ThreadComposer({
   const usageControl = !voiceRecorder.isRecording
     ? renderContextUsage?.({ showLabel: usageInMeta, compactLabel: mobileWorkspaceControls }) : null;
   const inputTextClasses = cn(
-    // Keep the overlay's CJK/Latin spacing aligned with the native textarea caret.
-    "w-full resize-none bg-transparent text-composer [text-autospace:no-autospace]",
+    // The native input and its reference overlay must wrap and space text alike.
+    "inset-scrollbar w-full resize-none bg-transparent text-composer [scrollbar-gutter:stable] [text-autospace:no-autospace]",
     compactControls
       ? "min-h-[52px] px-4 pb-2 pt-3"
       : isHero
@@ -2017,6 +1911,16 @@ export function ThreadComposer({
         : "min-h-[50px] px-3.5 pb-1.5 pt-3 sm:px-4",
   );
   const paletteBeside = showAnyPalette && slashPaletteLayout.placement === "beside";
+  const draftResizeLabel = t(draftExpanded ? "thread.composer.collapseDraft" : "thread.composer.expandDraft");
+  const toggleDraftSize = () => {
+    const input = textareaRef.current;
+    if (!input) return;
+    const followCaret = draftExpanded && input.selectionStart === input.value.length
+      && input.scrollHeight - input.clientHeight - input.scrollTop <= 1;
+    setDraftExpanded(!draftExpanded);
+    input.focus({ preventScroll: true });
+    if (followCaret) requestAnimationFrame(() => { input.scrollTop = input.scrollHeight; });
+  };
 
   return (
     <form
@@ -2069,9 +1973,20 @@ export function ThreadComposer({
         paletteBeside && "grid grid-cols-2 items-start gap-2 p-0",
       )}
     >
-      {showSlashMenu ? (
+      {showSkillMenu ? (
+        <SkillPalette
+          skills={filteredSkills}
+          query={skillQuery?.text ?? ""}
+          selectedIndex={selectedCommandIndex}
+          layout={slashPaletteLayout}
+          isHero={isHero}
+          onHover={setSelectedCommandIndex}
+          onChoose={chooseSkill}
+        />
+      ) : showSlashMenu ? (
         <SlashCommandPalette
           commands={filteredSlashCommands}
+          query={slashQuery ?? ""}
           selectedIndex={selectedCommandIndex}
           layout={slashPaletteLayout}
           isHero={isHero}
@@ -2082,6 +1997,7 @@ export function ThreadComposer({
       {showCliAppMenu ? (
         <CliAppMentionPalette
           candidates={filteredMentionCandidates}
+          query={cliAppMention?.query ?? ""}
           selectedIndex={selectedCliAppIndex}
           layout={slashPaletteLayout}
           isHero={isHero}
@@ -2108,7 +2024,7 @@ export function ThreadComposer({
         {queuedPrompt ? (
           <QueuedPromptPreview
             prompt={queuedPrompt}
-            disabled={interactionDisabled}
+            disabled={sendDisabled}
             editDisabled={encoding || hasErrors}
             label={t("thread.composer.queued.label")}
             guideLabel={t("thread.composer.queued.guide")}
@@ -2171,7 +2087,12 @@ export function ThreadComposer({
             </button>
           </div>
         ) : null}
-        <div className="thread-composer-input relative min-w-0">
+        <div
+          className="thread-composer-input relative min-w-0"
+          data-expandable={expandable || undefined}
+          data-expanded={draftExpanded || undefined}
+          data-overflowing={draftOverflows || undefined}
+        >
           {placeholder === undefined ? (
             <span className="pointer-events-none invisible absolute h-0 w-0 overflow-hidden">
               <span ref={placeholderMeasureRef} aria-hidden className="inline-block whitespace-pre text-composer [text-autospace:no-autospace]">{resolvedPlaceholder}</span>
@@ -2191,6 +2112,7 @@ export function ThreadComposer({
             />
           ) : null}
           <textarea
+            id={textareaId}
             ref={textareaRef}
             value={mentionInput.value}
             onFocus={() => {
@@ -2224,18 +2146,6 @@ export function ThreadComposer({
             )}
           />
         </div>
-        {inlineError ? (
-          <div
-            role="alert"
-            className={cn(
-              "mx-3 mb-1 max-h-24 overflow-hidden rounded-md border border-destructive/40 bg-destructive/8 px-2.5 py-1",
-              "text-[11.5px] font-medium text-destructive transition-[max-height,margin,padding,opacity] [transition-duration:220ms] ease-out motion-reduce:transition-none",
-              voiceErrorFading && "mb-0 max-h-0 border-transparent py-0 opacity-0",
-            )}
-          >
-            {inlineError}
-          </div>
-        ) : null}
         <div
           className={cn(
             "thread-composer-footer flex flex-nowrap items-center px-[var(--composer-footer-inset)] motion-safe:transition-[padding-bottom] motion-safe:[transition-duration:220ms] motion-safe:ease-in-out",
@@ -2292,6 +2202,29 @@ export function ThreadComposer({
               isHero ? "gap-1.5" : "gap-2",
             )}
           >
+            {expandable && (draftExpanded || draftOverflows) ? (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="icon"
+                      disabled={interactionDisabled}
+                      aria-label={draftResizeLabel}
+                      aria-expanded={draftExpanded}
+                      aria-controls={textareaId}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={toggleDraftSize}
+                      className="thread-composer-action thread-composer-round-action touch-target h-[var(--composer-action-size)] w-[var(--composer-action-size)] shrink-0 rounded-xl text-muted-foreground hover:text-foreground"
+                    >
+                      {draftExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{draftResizeLabel}</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ) : null}
             {modelControl}
             {!usageInMeta ? usageControl : null}
             <TooltipProvider>
@@ -2310,7 +2243,7 @@ export function ThreadComposer({
                             ? t("thread.composer.configureModel", { defaultValue: "Configure model" })
                             : isUserShell ? t("thread.composer.shell.run") : t("thread.composer.send")
                     }
-                    aria-keyshortcuts={showVoiceButton ? VOICE_SHORTCUT_ARIA : undefined}
+                    aria-keyshortcuts={showVoiceButton ? shortcutAria : undefined}
                     onPointerDown={showVoiceButton ? voiceRecorder.beginPress : undefined}
                     onPointerUp={showVoiceButton ? voiceRecorder.endPress : undefined}
                     onPointerCancel={showVoiceButton ? voiceRecorder.endPress : undefined}
@@ -2540,311 +2473,6 @@ function ComposerInlineReferenceOverlay({
         );
       })}
       {segments.at(-1)?.text.endsWith("\n") ? "\u200b" : null}
-    </div>
-  );
-}
-interface SlashCommandPaletteProps {
-  commands: SlashPaletteCommand[];
-  selectedIndex: number;
-  layout: SlashPaletteLayout;
-  isHero: boolean;
-  onHover: (index: number) => void;
-  onChoose: (command: SlashPaletteCommand) => void;
-}
-
-interface CliAppMentionPaletteProps {
-  candidates: MentionCandidate[];
-  selectedIndex: number;
-  layout: SlashPaletteLayout;
-  isHero: boolean;
-  onHover: (index: number) => void;
-  onChoose: (candidate: MentionCandidate) => void;
-}
-
-function useSelectedOptionScroll(selectedIndex: number) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-
-  useLayoutEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const option = container.querySelector<HTMLElement>(
-      `[data-palette-index="${selectedIndex}"]`,
-    );
-    if (typeof option?.scrollIntoView === "function") {
-      option.scrollIntoView({ block: "nearest" });
-    }
-  }, [selectedIndex]);
-
-  return containerRef;
-}
-
-function CliAppMentionPalette({
-  candidates,
-  selectedIndex,
-  layout,
-  isHero,
-  onHover,
-  onChoose,
-}: CliAppMentionPaletteProps) {
-  const { t } = useTranslation();
-  const listMaxHeight = Math.max(
-    0,
-    layout.maxHeight - SLASH_PALETTE_CHROME_PX,
-  );
-  const listRef = useSelectedOptionScroll(selectedIndex);
-  const groupedCandidates = (["session", "cli", "mcp"] as const)
-    .map((kind) => ({
-      kind,
-      label: kind === "session"
-        ? t("thread.composer.mentions.sessionGroup")
-        : kind === "cli"
-          ? t("thread.composer.mentions.cliGroup")
-          : t("thread.composer.mentions.mcpGroup"),
-      items: candidates
-        .map((candidate, index) => ({ candidate, index }))
-        .filter(({ candidate }) => candidate.kind === kind),
-    }))
-    .filter((group) => group.items.length > 0);
-  return (
-    <div
-      role="listbox"
-      aria-label={t("thread.composer.mentions.ariaLabel")}
-      style={{ maxHeight: layout.maxHeight }}
-      className={cn(
-        floatingSurfaceVisualClassName,
-        "z-30 overflow-hidden",
-        layout.placement === "beside"
-          ? "relative col-start-2 row-start-1 w-full"
-          : cn("absolute left-1/2 w-[calc(100%-0.5rem)] -translate-x-1/2",
-            layout.placement === "above" ? "bottom-full mb-2" : "top-full mt-2"),
-        isHero ? "max-w-[58rem]" : "max-w-[49.5rem]",
-      )}
-    >
-      <div ref={listRef} className="overflow-y-auto" style={{ maxHeight: listMaxHeight }}>
-        {groupedCandidates.map((group) => (
-          <div key={group.kind} role="group" aria-label={group.label} className="mt-1.5 first:mt-0">
-            <div className="px-2 pb-1 pt-1 text-[12px] font-medium text-muted-foreground/72">
-              {group.label}
-            </div>
-            {group.items.map(({ candidate, index }) => {
-              const selected = index === selectedIndex;
-              const name = candidate.name;
-              const handleColor = candidate.kind === "session"
-                ? candidate.mention.id ? sessionHandleColor(candidate.mention.id) : INLINE_TOKEN_HIGHLIGHT_COLOR
-                : undefined;
-              const typeLabel = candidate.kind === "cli"
-                ? t("thread.composer.mentions.cliBadge")
-                : candidate.kind === "mcp"
-                  ? t("thread.composer.mentions.mcpBadge")
-                  : t("thread.composer.mentions.sessionBadge");
-              const ariaDescription = candidate.kind === "cli"
-                ? t("thread.composer.mentions.cliDescription", { name })
-                : candidate.kind === "mcp"
-                  ? t("thread.composer.mentions.mcpDescription", { name })
-                  : t("thread.composer.mentions.sessionDescription", { name });
-              return (
-                <button
-                  key={`${candidate.kind}-${name}`}
-                  type="button"
-                  role="option"
-                  data-palette-index={index}
-                  aria-selected={selected}
-                  aria-label={`@${name} ${candidate.displayName} ${ariaDescription} ${typeLabel}`}
-                  onMouseEnter={() => onHover(index)}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    onChoose(candidate);
-                  }}
-                  className={cn(
-                    floatingItemClassName,
-                    floatingItemFocusClassName,
-                    "touch-target flex min-h-10 w-full flex-wrap items-center gap-x-2.5 gap-y-1 px-2.5 py-1.5 text-left transition-colors",
-                    selected
-                      ? "bg-foreground/[0.055] text-foreground dark:bg-black/[0.12]"
-                      : "text-foreground/90 hover:bg-foreground/[0.04]",
-                  )}
-                >
-                  <span
-                    className="max-w-full shrink-0 truncate text-[15px] font-normal tracking-normal text-muted-foreground/72"
-                    style={{ color: handleColor }}
-                  >
-                    @{name}
-                  </span>
-                  <span className={cn(
-                    "flex max-w-full flex-1 flex-wrap items-center gap-x-2.5 gap-y-1",
-                    candidate.kind === "session" ? "min-w-[min(4rem,100%)]" : "min-w-[min(8rem,100%)]",
-                  )}>
-                    {candidate.kind !== "session" ? <MentionCandidateLogo candidate={candidate} selected={selected} /> : null}
-                    <span className="min-w-[min(4rem,100%)] flex-1 truncate text-[15px] font-medium tracking-normal text-foreground">
-                      {candidate.displayName}
-                    </span>
-                    {candidate.kind !== "session" ? (
-                      <span
-                        className={cn(
-                          "ml-2 shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold tracking-normal",
-                          candidate.kind === "cli"
-                            ? "bg-orange-500/10 text-orange-600 dark:text-orange-300"
-                            : "bg-sky-500/10 text-sky-600 dark:text-sky-300",
-                        )}
-                      >
-                        {typeLabel}
-                      </span>
-                    ) : null}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MentionCandidateLogo({
-  candidate,
-  selected,
-}: {
-  candidate: Extract<MentionCandidate, { kind: "cli" | "mcp" }>;
-  selected: boolean;
-}) {
-  const color = candidate.brandColor || INLINE_TOKEN_HIGHLIGHT_COLOR;
-  const logoUrls = useMemo(() => logoFallbackUrls(candidate.logoUrl), [candidate.logoUrl]);
-  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(logoUrls);
-
-  if (logoUrl) {
-    return (
-      <span
-        className={cn(
-          "flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-compact",
-          selected ? "bg-background/55" : "bg-transparent",
-        )}
-      >
-        <img
-          src={logoUrl}
-          alt=""
-          decoding="async"
-          loading="lazy"
-          className="h-5 w-5 object-contain"
-          onLoad={onLogoLoad}
-          onError={onLogoError}
-        />
-      </span>
-    );
-  }
-  return (
-    <span
-      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-compact text-[7.5px] font-semibold text-white"
-      style={{ backgroundColor: color }}
-    >
-      {candidate.initials}
-    </span>
-  );
-}
-
-function SlashCommandPalette({
-  commands,
-  selectedIndex,
-  layout,
-  isHero,
-  onHover,
-  onChoose,
-}: SlashCommandPaletteProps) {
-  const { t } = useTranslation();
-  const listMaxHeight = Math.max(
-    0,
-    layout.maxHeight - SLASH_PALETTE_CHROME_PX,
-  );
-  const listRef = useSelectedOptionScroll(selectedIndex);
-  return (
-    <div
-      role="listbox"
-      aria-label={t("thread.composer.slash.ariaLabel")}
-      style={{ maxHeight: layout.maxHeight }}
-      className={cn(
-        floatingSurfaceVisualClassName,
-        "z-30 overflow-hidden",
-        layout.placement === "beside"
-          ? "relative col-start-2 row-start-1 w-full"
-          : cn("absolute left-1/2 w-[calc(100%-0.5rem)] -translate-x-1/2",
-            layout.placement === "above" ? "bottom-full mb-2" : "top-full mt-2"),
-        isHero ? "max-w-[58rem]" : "max-w-[49.5rem]",
-      )}
-    >
-      <div ref={listRef} className="overflow-y-auto pr-0.5" style={{ maxHeight: listMaxHeight }}>
-        {commands.map((command, index) => {
-          const Icon = command.kind === "skill" ? SkillsIcon : BUILTIN_COMMAND_ICONS[command.command] ?? COMMAND_ICONS[command.icon] ?? HelpIcon;
-          const selected = index === selectedIndex;
-          const isSkill = command.kind === "skill";
-          const commandKey = slashCommandI18nKey(command.command);
-          const title = t(`thread.composer.slash.commands.${commandKey}.title`, {
-            defaultValue: command.title,
-          });
-          const description = t(`thread.composer.slash.commands.${commandKey}.description`, {
-            defaultValue: command.description,
-          });
-          return (
-            <button
-              key={command.command}
-              type="button"
-              role="option"
-              data-palette-index={index}
-              aria-selected={selected}
-              onMouseEnter={() => onHover(index)}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                onChoose(command);
-              }}
-              className={cn(
-                floatingItemClassName,
-                floatingItemFocusClassName,
-                "flex min-h-[44px] w-full items-center gap-3 px-3 py-2 text-left transition-colors",
-                selected
-                  ? "bg-foreground/[0.065] text-foreground dark:bg-white/[0.09]"
-                  : "text-foreground/86 hover:bg-foreground/[0.045] dark:hover:bg-white/[0.065]",
-              )}
-            >
-              <span
-                className={cn(
-                  "flex h-7 w-7 shrink-0 items-center justify-center text-muted-foreground transition-colors",
-                  selected && "text-foreground",
-                )}
-              >
-                <Icon className="h-4 w-4" />
-              </span>
-              <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2">
-                <span
-                  className={cn(
-                    "text-[13.5px] font-semibold tracking-normal text-foreground",
-                    isSkill
-                      ? "max-w-full shrink-0 break-all sm:max-w-[55%]"
-                      : "min-w-0 truncate",
-                  )}
-                >
-                  {title}
-                </span>
-                <span className="min-w-0 truncate text-[13px] text-muted-foreground">
-                  {command.detail || description}
-                </span>
-              </span>
-              {!isSkill || command.badge || command.recent ? (
-                <span className="ml-2 flex max-w-[42%] shrink-0 items-center gap-1.5 sm:max-w-none">
-                  {command.badge || command.recent ? (
-                    <span className="hidden rounded-full bg-foreground/[0.055] px-2 py-1 text-[11px] font-medium text-muted-foreground sm:inline-flex">
-                      {command.badge ?? t("thread.composer.slash.badges.recent")}
-                    </span>
-                  ) : null}
-                  {!isSkill ? (
-                    <span className="font-mono text-[12px] text-muted-foreground/60">
-                      {command.argHint ? `${command.command} ${command.argHint}` : command.command}
-                    </span>
-                  ) : null}
-                </span>
-              ) : null}
-            </button>
-          );
-        })}
-      </div>
     </div>
   );
 }

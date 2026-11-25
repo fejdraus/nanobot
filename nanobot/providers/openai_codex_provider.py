@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import ssl
 from collections.abc import Awaitable, Callable
@@ -20,6 +19,7 @@ from oauth_cli_kit.storage import FileTokenStorage
 
 from nanobot import __version__
 from nanobot.events import NO_EVENTS
+from nanobot.providers import langfuse as tracing
 from nanobot.providers.base import (
     CONTEXT_SAFETY_BUFFER,
     LLMProvider,
@@ -34,6 +34,7 @@ from nanobot.providers.compaction import (
     provider_compaction_scope,
 )
 from nanobot.providers.images import prepare_inline_images
+from nanobot.providers.model_options import CodexFastMode
 from nanobot.providers.oauth_catalog_cache import (
     OAuthCatalogAuthRequiredError,
     OAuthModelCatalog,
@@ -140,7 +141,9 @@ def _start_codex_langfuse_generation(
     ``find_spec`` can't fail the Codex request itself.
     """
     try:
-        if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
+        if not tracing.requested():
+            return _CodexGenerationTracer(None)
+        if importlib.util.find_spec("langfuse"):
             from langfuse import get_client
 
             langfuse = get_client()
@@ -161,11 +164,10 @@ def _start_codex_langfuse_generation(
             )
             return _CodexGenerationTracer(generation)
 
-        if os.environ.get("LANGFUSE_SECRET_KEY"):
-            logger.warning(
-                "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
-                "run `nanobot plugins enable langfuse` to enable tracing"
-            )
+        logger.warning(
+            "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
+            "run `nanobot plugins enable langfuse` to enable tracing"
+        )
         return _CodexGenerationTracer(None)
     except Exception as exc:
         logger.warning(_LANGFUSE_TRACE_WARNING, exc)
@@ -181,12 +183,14 @@ class OpenAICodexProvider(LLMProvider):
         proxy: str | None = None,
         extra_body: dict[str, Any] | None = None,
         *,
+        fast_mode: CodexFastMode | None = None,
         provider_name: str = "openai_codex",
     ):
         super().__init__(api_key=None, api_base=None, provider_name=provider_name)
         self.default_model = default_model
         self.proxy = proxy or None
         self._extra_body = dict(extra_body or {})
+        self._fast_mode = fast_mode
         self._responses = ResponsesBackend(websocket_options=ResponsesWebSocketOptions(
             beta_header="responses_websockets=2026-02-06",
         ))
@@ -253,8 +257,25 @@ class OpenAICodexProvider(LLMProvider):
         if reasoning_options:
             body["reasoning"] = reasoning_options
         if self._extra_body:
-            # Apply explicit provider overrides last, matching other provider backends.
+            # Keep legacy provider/preset JSON precedence, then apply explicit model options.
             body.update(self._extra_body)
+        options = provider_context.model_options if provider_context is not None else None
+        if options is not None and options.reasoning_effort is not None:
+            configured = body.get("reasoning")
+            effort = options.reasoning_effort
+            body["reasoning"] = {
+                **(configured if isinstance(configured, dict) else {}),
+                "effort": "none" if effort.lower() == "none" else effort,
+            }
+        fast_mode = options.codex_fast_mode if options is not None else None
+        if fast_mode is None:
+            fast_mode = self._fast_mode
+        if fast_mode == "ultrafast":
+            body["service_tier"] = "ultrafast"
+        elif fast_mode is True:
+            body["service_tier"] = "priority"
+        elif fast_mode is False:
+            body.pop("service_tier", None)
         effective_cache_key = body.get("prompt_cache_key")
         request_model = _diagnostic_token(body.get("model"))
         effective_reasoning = body.get("reasoning")

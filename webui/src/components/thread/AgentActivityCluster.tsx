@@ -1,7 +1,6 @@
 import {
   CompletedTaskIcon,
   WebSearchIcon,
-  McpIcon,
   ToolRunIcon,
 } from "@/components/icons/product-icons";
 import {
@@ -11,7 +10,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -19,13 +17,14 @@ import { Clock3, Layers, Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { MarkdownText } from "@/components/MarkdownText";
-import { cliAppInitials, mcpPresetInitials } from "@/components/CliAppMentionText";
+import { cliAppInitials } from "@/components/CliAppMentionText";
 import { ActivityStep } from "@/components/thread/activity/ActivityStep";
 import { coalesceActivityMessages } from "@/components/thread/activity/activity-message-model";
 import {
   compactActivityPath,
   formatActivityTarget,
   redactShellCommand,
+  safeActivityDetail,
 } from "@/components/thread/activity/activity-text";
 import { FileEditGroup, type FileEditSummary } from "@/components/thread/activity/FileEditRow";
 import { GenericToolRun } from "@/components/thread/activity/GenericToolRun";
@@ -37,14 +36,16 @@ import {
   type GenericToolStatus,
   parseGenericToolTrace,
 } from "@/components/thread/activity/generic-tool-model";
+import { LatestActivityWheel } from "@/components/thread/activity/LatestActivityWheel";
 import { ReasoningRow } from "@/components/thread/activity/ReasoningRow";
+import { compactReasoningPreview } from "@/components/thread/activity/reasoning-preview";
 import { describeMcpActivity } from "@/components/thread/activity/mcp-activity-model";
 import { ThinkingReasoningShell } from "@/components/thread/activity/ThinkingReasoningShell";
 import { WebActivityRow } from "@/components/thread/activity/WebActivityRow";
 import {
   describeTraceLine,
 } from "@/components/thread/activity/trace-activity-model";
-import { WebSearchRun } from "@/components/thread/activity/WebSearchRun";
+import { WebSearchActionRow, WebSearchRun } from "@/components/thread/activity/WebSearchRun";
 import { webSearchRunsByTraceLine } from "@/components/thread/activity/web-search-model";
 import {
   isReasoningOnlyAssistant,
@@ -53,6 +54,9 @@ import { formControlFocusClassName } from "@/components/ui/form-control";
 import { useFileEditDisplayMode } from "@/hooks/useFileEditDisplayMode";
 import { useLocalPreferences } from "@/hooks/useLocalPreferences";
 import { useLogoFallback } from "@/hooks/useLogoFallback";
+import { McpCatalogContext, useMcpPresetCatalog } from "@/hooks/useMcpPresetCatalog";
+import { McpActivityIcon } from "@/components/thread/activity/McpActivityIcon";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { usePageVisibility } from "@/hooks/usePageVisibility";
 import { useThreadVisibility } from "@/hooks/useThreadVisibility";
 import type { FileEditDisplayMode } from "@/lib/local-preferences";
@@ -67,6 +71,8 @@ import type {
   UIFileEdit,
   UIMessage,
 } from "@/lib/types";
+
+type McpServer = Pick<McpPresetInfo, "icons"> & { display_name?: string };
 
 const EMPTY_CLI_APPS: CliAppInfo[] = [];
 const EMPTY_MCP_PRESETS: McpPresetInfo[] = [];
@@ -95,8 +101,6 @@ type McpRunStatus = "running" | "done" | "error";
 
 interface McpRunSummary {
   key: string;
-  presetName: string;
-  displayName: string;
   toolName: string;
   args: unknown;
   status: McpRunStatus;
@@ -248,7 +252,8 @@ function FoldedAgentActivity({
   detailsId,
 }: AgentActivityClusterProps) {
   const { t } = useTranslation();
-  const { activityMode, fileEditDisplayMode } = useLocalPreferences();
+  const { activityMode, fileEditDisplayMode, brandLogos } = useLocalPreferences();
+  const mobile = useMediaQuery("(max-width: 639px)");
   const pageVisible = usePageVisibility();
   const threadVisible = useThreadVisibility();
   const activityMessages = useMemo(() => coalesceActivityMessages(messages), [messages]);
@@ -266,10 +271,24 @@ function FoldedAgentActivity({
     () => new Map(cliApps.map((app) => [app.name.toLowerCase(), app])),
     [cliApps],
   );
-  const mcpPresetsByName = useMemo(
-    () => new Map(mcpPresets.map((preset) => [preset.name.toLowerCase(), preset])),
-    [mcpPresets],
-  );
+  const catalog = useContext(McpCatalogContext);
+  const payload = useMcpPresetCatalog(catalog, brandLogos ? mcpRuns.length : 0);
+  const activityPresets = payload?.presets ?? mcpPresets;
+  const pluginIcons = payload?.plugin_server_icons;
+  const mcpPresetsByName = useMemo(() => {
+    const servers = new Map<string, McpServer>();
+    // Use the gateway's tool-name alphabet; a settings card can group multiple servers.
+    const wireName = (name: string) => name.replace(/[^a-zA-Z0-9-]+/g, "_");
+    for (const preset of activityPresets) {
+      if (preset.source !== "agent-plugin") servers.set(wireName(preset.name), {
+        display_name: preset.display_name, icons: brandLogos ? preset.icons : undefined,
+      });
+    }
+    for (const [name, icons] of Object.entries(pluginIcons ?? {})) {
+      servers.set(wireName(name), { icons: brandLogos ? icons : undefined });
+    }
+    return servers;
+  }, [activityPresets, brandLogos, pluginIcons]);
   const {
     reasoningSteps,
     toolCalls,
@@ -279,20 +298,12 @@ function FoldedAgentActivity({
     fileCount,
   } = countActivity(activityMessages, fileEdits, cliRuns, mcpRuns);
 
-  const [userToggledOuter, setUserToggledOuter] = useState(false);
-  const [outerOpenLocal, setOuterOpenLocal] = useState(false);
-  const [completionHoldOpen, setCompletionHoldOpen] = useState(false);
+  const [outerOpenLocal, setOuterOpenLocal] = useState<boolean>();
   const [failedTraceDetailKey, setFailedTraceDetailKey] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const wasTurnStreamingRef = useRef(isTurnStreaming);
-  const wasTurnStreaming = wasTurnStreamingRef.current;
-  const outerExpanded = expanded ?? (
-    userToggledOuter
-      ? outerOpenLocal
-      : activityMode === "expanded" || isTurnStreaming || completionHoldOpen || (wasTurnStreaming && !isTurnStreaming)
-  );
+  const outerExpanded = expanded ?? outerOpenLocal ?? (activityMode === "expanded");
   useEffect(() => {
-    setUserToggledOuter(false);
+    setOuterOpenLocal(undefined);
   }, [activityMode]);
   const deferredTraceRefs = useMemo(
     () => Array.from(new Set(
@@ -327,6 +338,16 @@ function FoldedAgentActivity({
     startedAtMs,
   );
   const activityDuration = formatActivityDuration(durationMs);
+  const showActivityPreview = isTurnStreaming && hasVisibleActivity && !outerExpanded && !hideHeader && !retryStatus;
+  const preview = useMemo(() => {
+    if (!showActivityPreview) return null;
+    const row = latestActivityRow(activityMessages, fileEditsByMessage, cliAppsByName, mcpPresetsByName);
+    return row ? <LatestActivityWheel row={row} visible={pageVisible && threadVisible} /> : null;
+  }, [showActivityPreview, activityMessages, fileEditsByMessage, cliAppsByName, mcpPresetsByName, pageVisible, threadVisible]);
+  const workingLabel = (duration: string) => t("message.activityWorkingFor", {
+    duration,
+    defaultValue: "Working for {{duration}}",
+  });
   const isCompletedDisclosure = !isTurnStreaming && expanded !== undefined;
   const retryError = retryStatus?.error_kind === "connection"
     ? t("message.retryConnection", { defaultValue: "Connection failed" })
@@ -357,10 +378,7 @@ function FoldedAgentActivity({
             defaultValue: "{{error}} Retrying",
           })
       : isTurnStreaming
-    ? t("message.activityWorkingFor", {
-        duration: activityDuration,
-        defaultValue: "Working for {{duration}}",
-      })
+    ? mobile ? t("message.agentActivity.working") : workingLabel(activityDuration)
     : durationMs <= 0
       ? t("message.activityWorked", { defaultValue: "Worked" })
       : t("message.activityWorkedFor", {
@@ -373,9 +391,7 @@ function FoldedAgentActivity({
       onExpandedChange?.(!expanded);
       return;
     }
-    const nextOpen = userToggledOuter ? !outerOpenLocal : !outerExpanded;
-    setUserToggledOuter(true);
-    setOuterOpenLocal(nextOpen);
+    setOuterOpenLocal(!outerExpanded);
   };
 
   useEffect(() => {
@@ -390,19 +406,6 @@ function FoldedAgentActivity({
     const interval = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(interval);
   }, [isTurnStreaming, pageVisible, threadVisible]);
-
-  useEffect(() => {
-    const wasStreaming = wasTurnStreamingRef.current;
-    wasTurnStreamingRef.current = isTurnStreaming;
-    if (isTurnStreaming) {
-      setCompletionHoldOpen(false);
-      return undefined;
-    }
-    if (!wasStreaming || userToggledOuter) return undefined;
-    setCompletionHoldOpen(true);
-    const timeout = window.setTimeout(() => setCompletionHoldOpen(false), 300);
-    return () => window.clearTimeout(timeout);
-  }, [isTurnStreaming, userToggledOuter]);
 
   if (!hasVisibleActivity && !isTurnStreaming) return null;
 
@@ -428,6 +431,8 @@ function FoldedAgentActivity({
         collapseLabel={t("message.collapseActivity")}
         contentId={detailsId}
         label={activityLabel}
+        preview={preview}
+        compactPreview={mobile && preview !== null}
         hasDetails={hasVisibleActivity}
         onToggle={toggleOuter}
       >
@@ -511,6 +516,55 @@ function traceLines(message: UIMessage): string[] {
   return message.content.trim() ? [message.content] : [];
 }
 
+function latestActivityRow(
+  messages: UIMessage[],
+  fileEditsByMessage: Map<string, FileEditSummary[]>,
+  cliAppsByName: Map<string, CliAppInfo>,
+  mcpPresetsByName: Map<string, McpServer>,
+) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isReasoningOnlyAssistant(message)) {
+      return <ReasoningRow key={message.id} text={message.reasoning ?? ""} streaming={!!message.reasoningStreaming} />;
+    }
+    if (message.activityKind === "model" && message.content.trim()) {
+      return <ActivityStep key={message.id} icon={Layers} label={safeActivityDetail(compactReasoningPreview(message.content))} />;
+    }
+    if (message.kind !== "trace") continue;
+    const edit = fileEditsByMessage.get(message.id)?.at(-1);
+    if (edit) return <FileEditGroup key={edit.key} edits={[edit]} displayMode="summary" />;
+    const entry = activityTraceEntries(message).at(-1);
+    const event = entry?.sessionEvent ?? message.toolEvents?.at(-1);
+    const line = entry?.line ?? formatToolCallTrace(event);
+    if (!line?.trim()) continue;
+    const traceKey = canonicalToolTrace(line);
+    const events = message.toolEvents ?? [];
+    const matchingEvent = entry?.sessionEvent ?? [...events].reverse().find((item) => {
+      const trace = formatToolCallTrace(item);
+      return trace !== null && canonicalToolTrace(trace) === traceKey;
+    });
+    const key = `${message.id}:${matchingEvent?.call_id ?? traceKey}`;
+    const search = webSearchRunsByTraceLine(events).get(traceKey);
+    if (search) {
+      const source = search.sources.at(-1);
+      if (source) return <WebActivityRow key={`${key}:${source.href}`} {...source} />;
+      return <WebSearchActionRow key={key} run={search} turnActive />;
+    }
+    if (matchingEvent && toolEventName(matchingEvent) === "exec_session") {
+      return <ExecSessionRow key={key} event={matchingEvent} turnActive />;
+    }
+    const state = genericToolStateByTraceLine(message).get(traceKey);
+    const cli = cliRunMapByTraceLine(message).get(traceKey) ?? parseCliRunTrace(line, state?.status);
+    if (cli) return <CliRunRow key={key} run={cli} active app={cliAppsByName.get(cli.name.toLowerCase())} />;
+    const mcp = mcpRunMapByTraceLine(message).get(traceKey) ?? parseMcpRunTrace(line, state?.status);
+    if (mcp) return <McpRunRow key={key} run={mcp} active presets={mcpPresetsByName} />;
+    const trace = parseGenericToolTrace(line);
+    if (trace) return <GenericToolRun key={key} items={[{ trace, status: state?.status ?? "running", error: state?.error }]} />;
+    return <ActivityTraceRow key={key} line={line} active state={state} />;
+  }
+  return null;
+}
+
 const ActivityMessageTimeline = memo(function ActivityMessageTimeline({
   messages,
   active,
@@ -523,7 +577,7 @@ const ActivityMessageTimeline = memo(function ActivityMessageTimeline({
   messages: UIMessage[];
   active: boolean;
   cliAppsByName: Map<string, CliAppInfo>;
-  mcpPresetsByName: Map<string, McpPresetInfo>;
+  mcpPresetsByName: Map<string, McpServer>;
   fileEditsByMessage: Map<string, FileEditSummary[]>;
   fileEditDisplayMode: FileEditDisplayMode;
   onOpenFilePreview?: (path: string) => void;
@@ -783,7 +837,7 @@ function ActivityTraceTimeline({
   active: boolean;
   turnActive: boolean;
   cliAppsByName: Map<string, CliAppInfo>;
-  mcpPresetsByName: Map<string, McpPresetInfo>;
+  mcpPresetsByName: Map<string, McpServer>;
 }) {
   const entries = foldSessionChecks(activityTraceEntries(message));
   const cliRunsByLine = cliRunMapByTraceLine(message);
@@ -1210,12 +1264,9 @@ function mcpRunFromToolName(
 ): McpRunSummary | null {
   const match = MCP_TOOL_NAME_RE.exec(toolName);
   if (!match) return null;
-  const presetName = match[1].toLowerCase();
   return {
     key: options.key,
-    presetName,
-    displayName: titleFromPresetName(presetName),
-    toolName: match[2],
+    toolName,
     args: argsObject,
     status: options.status,
     error: options.error,
@@ -1456,7 +1507,7 @@ function McpRunGroup({
 }: {
   runs: McpRunSummary[];
   active: boolean;
-  mcpPresetsByName: Map<string, McpPresetInfo>;
+  mcpPresetsByName: Map<string, McpServer>;
 }) {
   if (runs.length === 0) return null;
   return (
@@ -1466,23 +1517,29 @@ function McpRunGroup({
           key={run.key}
           run={run}
           active={active}
-          preset={mcpPresetsByName.get(run.presetName.toLowerCase())}
+          presets={mcpPresetsByName}
         />
       ))}
     </>
   );
 }
 
-function McpRunRow({ run, active, preset }: { run: McpRunSummary; active: boolean; preset?: McpPresetInfo }) {
+function McpRunRow({ run, active, presets }: { run: McpRunSummary; active: boolean; presets: Map<string, McpServer> }) {
   const { t } = useTranslation();
   const failed = run.status === "error";
   const rowActive = active && run.status === "running";
-  const color = failed ? "#DC2626" : preset?.brand_color || "#6D5DF6";
-  const logoUrls = useMemo(() => logoFallbackUrls(preset?.logo_url), [preset?.logo_url]);
-  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(logoUrls);
-  const displayName = preset?.display_name || run.displayName;
+  // The wire name has no separate server field. Prefer the longest catalog prefix
+  // so both server and tool names may contain underscores.
+  const qualified = run.toolName.slice(4);
+  let split = qualified.lastIndexOf("_");
+  while (!presets.has(qualified.slice(0, split)) && split > qualified.indexOf("_")) {
+    split = qualified.lastIndexOf("_", split - 1);
+  }
+  const name = qualified.slice(0, split);
+  const preset = presets.get(name);
+  const displayName = preset?.display_name || titleFromPresetName(name);
   const activity = describeMcpActivity(
-    run.toolName,
+    qualified.slice(split + 1),
     run.args,
     failed ? "error" : rowActive ? "running" : "done",
     t,
@@ -1495,33 +1552,7 @@ function McpRunRow({ run, active, preset }: { run: McpRunSummary; active: boolea
       tone={failed ? "error" : rowActive ? "active" : run.status === "done" ? "success" : "neutral"}
       label={label}
       detail={displayName}
-      marker={(
-        <span
-          data-testid={`activity-mcp-logo-${run.presetName.toLowerCase()}`}
-          className={cn(
-            "grid h-4 w-4 shrink-0 place-items-center overflow-hidden rounded-mark text-[6.5px] font-semibold text-white",
-            rowActive && "animate-pulse",
-          )}
-          style={{ backgroundColor: logoUrl ? "transparent" : color }}
-          aria-hidden
-        >
-          {logoUrl ? (
-            <img
-              src={logoUrl}
-              alt=""
-              decoding="async"
-              loading="lazy"
-              className="h-full w-full object-contain"
-              onLoad={onLogoLoad}
-              onError={onLogoError}
-            />
-          ) : preset ? (
-            mcpPresetInitials(preset).slice(0, 2)
-          ) : (
-            <McpIcon className="h-3 w-3" aria-hidden />
-          )}
-        </span>
-      )}
+      marker={<McpActivityIcon name={name} icons={preset?.icons} />}
     />
   );
 }

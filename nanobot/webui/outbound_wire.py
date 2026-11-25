@@ -83,6 +83,12 @@ class RetryStatusWirePayload(_ChatWirePayload):
     retry_after_s: NotRequired[float]
 
 
+class TurnFailureNoticeWirePayload(_ChatWirePayload):
+    event: Literal["turn_failure_notice"]
+    failure_kind: Literal["model", "tool", "internal"]
+    failure_error_kind: NotRequired[str]
+
+
 class TurnEndWirePayload(_ChatWirePayload):
     event: Literal["turn_end"]
     latency_ms: NotRequired[int]
@@ -108,6 +114,7 @@ class ModelRequestWirePayload(_ChatWirePayload):
     usage: NotRequired[dict[str, int]]
     round_usages: NotRequired[list[dict[str, int]]]
     context_window_tokens: NotRequired[int]
+    response_input_ids: NotRequired[list[str]]
 
 
 class ContextCompactionWirePayload(_ChatWirePayload):
@@ -127,6 +134,8 @@ class SubagentTaskWirePayload(_ChatWirePayload):
 class MessageWirePayload(_ChatWirePayload):
     event: Literal["message"]
     text: str
+    side_channel: NotRequired[Literal[True]]
+    command_result: NotRequired[dict[str, object]]
     render_as: NotRequired[Literal["text"]]
     media: NotRequired[list[str]]
     media_urls: NotRequired[list[dict[str, str]]]
@@ -199,7 +208,7 @@ WebUIWirePayload: TypeAlias = (
     RetryStatusWirePayload | ContextCompactionWirePayload | RecoveryStateWirePayload | TurnEndWirePayload
     | SubagentTaskWirePayload | MessageWirePayload | StreamWirePayload | FileEditWirePayload
     | GoalStateWirePayload | GoalStatusWirePayload | SessionUpdatedWirePayload | UserInputWirePayload
-    | PairingChangedWirePayload | RuntimeModelWirePayload | TurnModelWirePayload
+    | PairingChangedWirePayload | RuntimeModelWirePayload | TurnModelWirePayload | TurnFailureNoticeWirePayload
 )
 WebUIWirePersistence: TypeAlias = Literal[
     "transient",
@@ -272,6 +281,8 @@ def project_notification(
         }
         if context_graph is not None:
             payload["context_graph"] = context_graph
+        if event.phase == "started" and event.response_input_ids:
+            payload["response_input_ids"] = list(event.response_input_ids)
         if event.usage is not None:
             payload["usage"] = event.usage.to_turn_dict()
         payload["round_usages"] = [usage.to_turn_dict() for usage in event.round_usages[-8:]]

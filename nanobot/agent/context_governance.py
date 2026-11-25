@@ -43,6 +43,7 @@ from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.summary import (
     SUMMARY_CONTINUATION_TEXT,
     SessionSummaryCheckpoint,
+    is_empty_summary,
 )
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import (
@@ -204,11 +205,9 @@ class ContextCompactionState:
             instruction_prefix.append(dict(message))
 
         def build_summary_transcript(summary: str) -> list[dict[str, Any]]:
-            archived_context = (
-                "[Archived Context Summary]\n\n"
-                "Previous conversation summary:\n"
-                f"{summary}"
-            )
+            if is_empty_summary(summary):
+                return deepcopy(instruction_prefix)
+            archived_context = f"[Archived Context Summary]\n\n{summary}"
             prefix = deepcopy(instruction_prefix)
             for index in range(len(prefix) - 1, -1, -1):
                 content = prefix[index].get("content")
@@ -260,6 +259,8 @@ class ModelRequestState:
     request_run_id: str = field(default_factory=lambda: uuid4().hex)
     request_sequence: int = 0
     request_usage: LLMUsage | None = None
+    # Current response targets, shared by requests that recover the same answer.
+    response_input_ids: tuple[str, ...] = ()
     # Reported usage per runner round; recovery requests update the same slot.
     recent_round_usages: list[LLMUsage | None] = field(default_factory=list)
 

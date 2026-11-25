@@ -9,6 +9,7 @@ import pytest
 
 from agent.session_helpers import save_completed_subagent
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.session_inbox import SessionInboxes
 from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -131,7 +132,7 @@ async def test_recovery_continuation_runs_without_a_sustained_goal(
     loop._session_locks = {}
     loop._concurrency_gate = None
     loop._automation_turn_coordinators = []
-    loop._discarding_sessions = set()
+    loop._pending_queues = SessionInboxes()
     loop._preserve_inflight_turns_on_shutdown = False
     loop.turn_delivery_factory = TurnDeliveryFactory(bus)
     process_message = AsyncMock(return_value=OutboundMessage(
@@ -344,7 +345,7 @@ async def test_recovery_distinguishes_explicit_stop_from_gateway_shutdown(
                     metadata={"webui": True},
                 ))
                 outbound = [bus.outbound.get_nowait() for _ in range(bus.outbound.qsize())]
-                assert any(message.content == "Stopped 1 task(s)." for message in outbound)
+                assert any(getattr(message.event, "command", None) == "/stop" for message in outbound)
     finally:
         await loop.aclose()
 

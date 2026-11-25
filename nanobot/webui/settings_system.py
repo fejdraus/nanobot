@@ -7,7 +7,7 @@ import platform
 import re
 import subprocess
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
@@ -17,6 +17,7 @@ import httpx
 from pydantic import ValidationError
 from pydantic.alias_generators import to_snake
 
+from nanobot.agent.tools.mcp_metadata import MCPRuntimeSnapshot
 from nanobot.agent.tools.sandbox_check import check_sandbox, sandbox_settings_status
 from nanobot.build_info import COMMIT
 from nanobot.channels._setup import channel_setup_spec
@@ -51,6 +52,7 @@ from nanobot.update_service import (
 )
 from nanobot.webui.settings_capabilities import network_safety_payload
 from nanobot.webui.settings_contracts import (
+    MutationParams,
     QueryParams,
     SettingsRequest,
     SettingsRouteResult,
@@ -84,7 +86,7 @@ class SystemSettingsOperations:
     deny_code: SettingsOperation
     mcp_presets_action: SettingsOperation
     reload_mcp: SettingsOperation
-    mcp_runtime_status: Callable[[], Mapping[str, str]] | None
+    mcp_runtime_snapshot: Callable[[], MCPRuntimeSnapshot] | None
     check_for_update: Callable[[], Awaitable[dict[str, Any]]]
     channel_feature_action: SettingsOperation | None = None
     channel_runtime_status: Callable[[], dict[str, Any]] | None = None
@@ -1088,7 +1090,16 @@ class SystemSettingsHandler:
             )
 
         try:
-            payload = await connector.handle(action, request.query)
+            query = request.query
+            if isinstance(query, MutationParams):
+                # Channel connectors expose a scalar form interface, not structured JSON fields.
+                query = {
+                    key: [value]
+                    for key in query.values
+                    if key not in {"channel", "values", "authorization_response"}
+                    and (value := query_first(query, key)) is not None
+                }
+            payload = await connector.handle(action, query)
         except ChannelConnectError as exc:
             return SettingsRouteResult.failure(exc.status, exc.message)
         except Exception:
@@ -1227,7 +1238,7 @@ class SystemSettingsHandler:
                 action,
                 request.query,
                 reload_mcp=operations.reload_mcp,
-                mcp_runtime_status=operations.mcp_runtime_status,
+                mcp_runtime_snapshot=operations.mcp_runtime_snapshot,
                 config=self.settings.config,
             )
         except Exception as exc:

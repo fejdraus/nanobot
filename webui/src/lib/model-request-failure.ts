@@ -5,10 +5,28 @@ export interface ModelRequestFailureDetails {
   attempts?: number;
 }
 
+export function emptyFinalMessageKey(errorKind?: string) {
+  if (errorKind === "empty_final_response_length") return "errors.modelRequestFailed.emptyFinalResponseLength";
+  if (errorKind === "empty_final_response") return "errors.modelRequestFailed.emptyFinalResponse";
+  return null;
+}
+
+export function isImageRequestFailure(errorKind?: string): boolean {
+  return errorKind === "unsupported_image" || errorKind === "image_request_rejected";
+}
+
 export function resolveModelRequestFailureCopy(
   details: ModelRequestFailureDetails,
   t: TFunction,
 ): { title: string; body: string } {
+  if (isImageRequestFailure(details.errorKind)) {
+    return {
+      title: t(details.errorKind === "unsupported_image"
+        ? "errors.modelRequestFailed.imageInputTitle"
+        : "errors.modelRequestFailed.imageRequestRejectedTitle"),
+      body: t("errors.modelRequestFailed.imageInputBody"),
+    };
+  }
   let titleKey = "errors.modelRequestFailed.unknownTitle";
   if (details.errorKind === "billing") {
     titleKey = "errors.modelRequestFailed.billingTitle";

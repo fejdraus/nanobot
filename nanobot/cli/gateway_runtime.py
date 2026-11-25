@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import typer
 from loguru import logger
@@ -22,6 +23,7 @@ from nanobot.agent.tools.image_generation import (
 from nanobot.agent.tools.mcp import MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import TurnFailureNotice
 from nanobot.bus.queue import MessageBus
 from nanobot.cli import terminal as cli_terminal
 from nanobot.cli.dock import watch_gateway_icon
@@ -213,19 +215,6 @@ def _advance_dream_cursor_if_behind(memory: Any) -> None:
     latest = memory.get_latest_cursor()
     if memory.get_last_dream_cursor() < latest:
         memory.set_last_dream_cursor(latest)
-
-
-def _commit_dream_changes(memory: Any) -> str | None:
-    if not memory.git.is_initialized():
-        return None
-    diff_body = memory.dream_content_diff()
-    if not diff_body:
-        return None
-    message = memory.build_dream_commit_message(
-        "dream: periodic memory consolidation",
-        diff_body,
-    )
-    return memory.git.auto_commit(message)
 
 
 _HEARTBEAT_PREAMBLE = (
@@ -623,64 +612,17 @@ def _run_claimed_gateway(
 
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
-            from nanobot.agent.memory import MemoryStore
+            from nanobot.agent.dream import run_dream
 
-            dream_session_key = MemoryStore.dream_session_key
-
-            store = agent.context.memory
-            resp = None
-            diff_body = ""
-            try:
-                result = store.build_dream_prompt()
-                if result is None:
-                    logger.info("Dream: nothing to process")
-                    return None
-                prompt, last_cursor = result
-                key = dream_session_key()
-                dream_runtime = agent.dream_runtime()
-                await mcp_provider.connect()
-                from nanobot.agent import dream_filter
-                memory_before = dream_filter.snapshot(store)
-                resp = await agent.process_direct(
-                    prompt,
-                    session_key=key,
-                    ephemeral=True,
-                    tools=store.build_dream_tools(),
-                    on_progress=_silent,
-                    runtime=dream_runtime,
-                )
-                await asyncio.to_thread(dream_filter.apply, store, memory_before)
-                # The real file delta grounds the audit record; normal completion
-                # decides whether this history batch has finished processing.
-                diff_body = store.dream_content_diff()
-                completed = MemoryStore.dream_run_completed(resp)
-                if completed:
-                    store.set_last_dream_cursor(last_cursor)
-                    if diff_body:
-                        logger.info(
-                            "Dream cron job completed, cursor advanced to {}",
-                            last_cursor,
-                        )
-                    else:
-                        logger.info(
-                            "Dream cron job completed with no memory changes; "
-                            "cursor advanced to {}",
-                            last_cursor,
-                        )
-                else:
-                    logger.warning(
-                        "Dream cron job did not complete ({}); cursor remains at {}",
-                        MemoryStore.dream_incompletion_reason(resp),
-                        store.get_last_dream_cursor(),
-                    )
-            except Exception:
-                logger.exception("Dream cron job failed")
-            finally:
-                sha = _commit_dream_changes(store)
-                if sha:
-                    logger.info("Dream commit: {}", sha)
-                store.compact_history()
-                await agent.sessions.state.prune_dream_sessions()
+            result = await run_dream(agent, commit_prefix="dream: periodic memory consolidation")
+            if result.error:
+                logger.warning("Dream did not complete ({})", result.error)
+            elif not result.had_input:
+                logger.info("Dream: nothing to process")
+            else:
+                logger.info("Dream completed the pending history range")
+            if result.commit_sha:
+                logger.info("Dream commit: {}", result.commit_sha)
             return None
 
         if job.name == "heartbeat":
@@ -726,6 +668,11 @@ def _run_claimed_gateway(
                 if isinstance(message_tool, MessageTool) and suppress_token is not None:
                     message_tool.reset_suppress_delivery(suppress_token)
 
+            if resp is not None and isinstance(resp.event, TurnFailureNotice):
+                return CronRunResult(
+                    run_id=f"{job.id}:{uuid4().hex}", response="",
+                    error=resp.event.failure_error_kind or resp.event.failure_kind,
+                )
             if not resp or not resp.content:
                 return
 
@@ -801,7 +748,7 @@ def _run_claimed_gateway(
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,
         webui_runtime_capabilities=webui_runtime_capabilities,
-        webui_mcp_runtime_status=mcp_provider.runtime_status,
+        webui_mcp_runtime_snapshot=mcp_provider.runtime_snapshot,
         webui_mcp_reload=mcp_provider.reload,
         webui_image_generation_reload=_webui_image_generation_reload,
         webui_skill_state_action=_webui_skill_state_action,

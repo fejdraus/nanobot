@@ -331,13 +331,12 @@
       "local_file_not_found": "The SSH config or private key file couldn't be found on this machine.",
       "file_picker_unavailable": "Impossible d’ouvrir le sélecteur. Vous pouvez saisir le chemin d’un fichier local.",
       "runtime_user_denied": "SSH signed in, but cannot read as that service account without a password. Check the account with your server administrator.",
-      "python_unavailable": "The server needs python3 to locate its existing nanobot configuration.",
+      "python_unavailable": "SSH signed in, but couldn't start Python 3. Make python3 or python available to the SSH login on the server.",
       "config_not_found": "nanobot's config wasn't found. Set its server-side path in Connection options.",
       "config_permission": "This SSH user can't read nanobot's config. Set the nanobot service account in Connection options.",
-      "config_invalid": "Couldn't read the server's nanobot configuration.",
+      "config_invalid": "Couldn't read the server's nanobot configuration. Check that the selected file is valid UTF-8 JSON.",
       "webui_disabled": "The server's WebUI is disabled. Enable it on the server first.",
       "webui_auth_required": "The server needs a WebUI login secret in its config. No model key is needed here.",
-      "public_ws_unsupported": "This server uses a public WebSocket URL. This first version supports a loopback WebUI over SSH.",
       "remote_auth_failed": "The server rejected its saved WebUI credential. Check its running configuration.",
       "incompatible_gateway": "This endpoint isn't a compatible nanobot gateway. Update the server or check its configuration.",
       "webui_unavailable": "The gateway is running, but its WebUI isn't installed.",
@@ -454,10 +453,7 @@
       "ariaLabel": "Changer de langue"
     },
     "apps": "Applications",
-    "automations": "Automatisations",
-    "skills": {
-      "title": "Compétences"
-    }
+    "automations": "Automatisations"
   },
   "settings": {
     "timezoneNoMatches": "Aucun fuseau horaire correspondant.",
@@ -699,6 +695,15 @@
       "interrupted": "La tâche demande votre attention. Cliquez pour continuer."
     },
     "appearance": {
+      "background": "Image de fond",
+      "backgroundChoose": "Choisir une image",
+      "backgroundTooLarge": "L’image ne doit pas dépasser 6 Mio.",
+      "backgroundFade": "Atténuer le fond",
+      "backgroundBlur": "Flou",
+      "backgroundReplace": "Changer l’image",
+      "backgroundRemove": "Retirer",
+      "backgroundError": "Impossible d’enregistrer le fond. Réessayez.",
+      "backgroundPartialError": "La modification de l’image est enregistrée, mais pas l’apparence. Réessayez.",
       "system": "Système",
       "reading": "Lecture",
       "readingHelp": "Ajustez les messages, le code et la zone de saisie, sans changer la navigation.",
@@ -713,7 +718,7 @@
       "previewPlaceholder": "Par où commencer ?",
       "process": "Affichage de l’activité",
       "processHelp": "Choisissez le niveau de détail affiché pendant que nanobot travaille.",
-      "autoHelp": "Affichez la progression en cours et gardez les activités terminées compactes.",
+      "autoHelp": "Repliez les détails par défaut et affichez la dernière activité pendant le traitement.",
       "expandedHelp": "Gardez les détails de l’activité développés par défaut.",
       "summaryHelp": "Affichez les fichiers modifiés et le nombre de lignes.",
       "diffHelp": "Affichez les changements de code directement dans la conversation.",
@@ -802,7 +807,7 @@
       "currentModel": "Utilisé pour les nouvelles réponses.",
       "selectedModelProvider": "Défini par le modèle sélectionné.",
       "selectedModelValue": "Défini par le modèle sélectionné.",
-      "brandLogos": "Affichez les logos des fournisseurs et applications dans les réglages.\n\nAffiche les logos de fournisseurs tiers et CLI dans les Réglages.",
+      "brandLogos": "Affiche les logos dans les réglages et l’activité du chat.\n\nL’activité MCP utilise l’icône fournie par le serveur si elle est disponible.",
       "browserNotifications": "Recevez les notifications des tâches lorsque cette page est en arrière-plan.",
       "notificationSound": "Joue un son à la fin d’une réponse, même en arrière-plan.",
       "cliAppsCatalog": "Installez des outils CLI pour nanobot ; les applications de bureau restent inchangées.\n\nInstalle les outils en ligne de commande que nanobot peut utiliser sur cette machine. Les applications de bureau ne sont pas modifiées.",
@@ -830,6 +835,7 @@
       "unixSocket": "Socket Unix",
       "defaultWorkspace": "Espace par défaut",
       "auto": "Automatique",
+      "collapsed": "Replié",
       "expanded": "Développé",
       "default": "Par défaut",
       "summary": "Résumé",
@@ -1002,7 +1008,7 @@
       "extraHeaders": "En-têtes",
       "extraBody": "Paramètres du corps",
       "extraQuery": "Paramètres de requête",
-      "capabilityFastMode": "Mode rapide",
+      "capabilityFastMode": "Fast",
       "capabilityFastModeHelp": "Réponses plus rapides, consommation accrue.",
       "capabilityXSearch": "Recherche sur X",
       "capabilityXSearchHelp": "Les modèles Grok compatibles peuvent rechercher sur X.\n\nPermet aux modèles Grok compatibles d’utiliser X Search hébergé par xAI. L’activité de recherche apparaît dans le chat.",
@@ -1061,7 +1067,8 @@
       "maxTokens": "Tokens de sortie max.",
       "temperature": "Température",
       "imageInput": "Entrée d’images",
-      "imageInputHelp": "Si désactivée, les requêtes contenant des images ignorent ce préréglage.",
+      "imageInputHelp": "Activez cette option uniquement si le modèle accepte les images. Sinon, les requêtes contenant des images ignorent ce préréglage.",
+      "viewPreset": "Voir le préréglage",
       "reasoningEffort": "Effort de raisonnement",
       "convertTitle": "Convertir les réglages",
       "convertHelp": "Convertissez les modèles principal et de secours en préréglages.",
@@ -1240,35 +1247,43 @@
     },
     "observability": {
       "title": "Traces d’exécution", "configured": "Les identifiants de traçage sont disponibles pour nanobot.",
-      "environment": "Définissez LANGFUSE_SECRET_KEY et LANGFUSE_PUBLIC_KEY, puis redémarrez nanobot.", "enable": "Activer les traces"
+      "environment": "Définissez LANGFUSE_SECRET_KEY et LANGFUSE_PUBLIC_KEY, puis redémarrez nanobot.", "allow": "Autoriser les traces Langfuse", "install": "Installer le module de traçage"
     },
     "legal": {
       "thirdPartyBrands": "Les noms, logos et marques de produits appartiennent à leurs propriétaires respectifs. Leur utilisation sert uniquement à l'identification et n'implique aucune approbation."
     },
     "apps": {
-      "description": "Connectez des outils et appelez-les avec @ dans les discussions.",
-      "cliLabel": "Application",
+      "allTypes": "Tous",
+      "typeFilter": "Type d’outil",
+      "statusFilter": "État",
+      "description": "Gérez les applications CLI, les Agent Plugins et les outils MCP.",
+      "cliLabel": "CLI App",
       "mcpLabel": "MCP",
       "channelLabel": "Canal",
       "featureLabel": "Fonction",
-      "filterAll": "Prêts",
-      "filterPlugins": "Extensions",
-      "filterCli": "Applications",
+      "readyOnly": "Prêts uniquement",
+      "filterPlugins": "Agent Plugins",
+      "filterCli": "CLI Apps",
       "filterMcp": "MCP",
       "enabledSummary": "{{count}} prêts",
       "searchPlaceholder": "Rechercher des applications",
       "featured": "Outils",
       "mcpTools": "Outils MCP",
       "loading": "Chargement des applications...",
-      "empty": "Aucun outil ne correspond à votre recherche.",
-      "emptyApps": "Aucune application disponible.",
-      "emptyIntegrations": "Aucun outil MCP disponible.",
-      "emptyReady": "Aucun outil n’est encore prêt.",
+      "empty": "Aucun outil ne correspond à votre recherche",
+      "emptyApps": "Aucun outil disponible",
+      "emptyIntegrations": "Aucun outil MCP disponible",
+      "emptyReady": "Aucun outil n’est encore prêt",
       "clearSearch": "Effacer la recherche",
-      "browseApps": "Parcourir les applications",
-      "browseIntegrations": "Parcourir les outils MCP",
-      "emptyIntegrationsHint": "Ajoutez un serveur MCP personnalisé ci-dessous.",
-      "restartRequired": "Redémarrez nanobot pour appliquer les applications et outils MCP mis à jour."
+      "emptyIntegrationsHint": "Ajoutez un serveur MCP personnalisé ci-dessous",
+      "restartRequired": "Redémarrez nanobot pour appliquer les applications et outils MCP mis à jour.",
+      "emptyPlugins": "Aucun Agent Plugin installé",
+      "emptyPluginsHint": "Ajoutez un plugin au dossier plugins de l’espace de travail pour l’activer ici",
+      "pluginPermissions": "Autorisations déclarées",
+      "pluginServers": "Serveurs MCP",
+      "pluginTrustNotice": "Les plugins s’exécutent avec les permissions système de nanobot. Les autorisations déclarées ne les isolent pas.",
+      "pluginDetails": "Agent Plugin",
+      "pluginDisabled": "Agent Plugin désactivé"
     },
     "channels": {
       "description": "Connectez les applications de discussion, l’e-mail et WebUI.",
@@ -1304,7 +1319,7 @@
       "configuredInstances": "{{count}} instances configurées",
       "connectPreview": "La connexion dans le navigateur est la prochaine étape. Pour l'instant, exécutez la commande ci-dessous.",
       "copyCommand": "Copier la commande",
-      "filterAll": "Tous",
+      "enabledOnly": "Activés uniquement",
       "filterOff": "À l’arrêt",
       "filterOn": "En cours d’exécution",
       "helperCopied": "{{name}} copié.",
@@ -1608,7 +1623,7 @@
       "description": "Choisissez les compétences disponibles dans les discussions.",
       "views": "Vues des compétences",
       "installedTab": "Installées",
-      "discoverTab": "Découvrir",
+      "discoverTab": "Catalogue de compétences",
       "customGroup": "Personnalisées",
       "builtinGroup": "Intégrées",
       "otherGroup": "Autres",
@@ -1645,7 +1660,6 @@
       "marketplaceSearchFailed": "Impossible de rechercher dans les catalogues de compétences.",
       "marketplaceInstallFailed": "Impossible d’installer cette compétence.",
       "marketplaceSearchPlaceholder": "Rechercher des compétences",
-      "marketplaceSearchLabel": "Rechercher des compétences",
       "marketplaceSearching": "Recherche en cours",
       "marketplaceProviderFilter": "Source des compétences",
       "marketplaceProviderAll": "Toutes",
@@ -1751,32 +1765,6 @@
     "unarchiveTitleMany": "Désarchiver {{count}} sujets ?",
     "description": "Les conversations sont conservées. Vous pouvez les désarchiver à tout moment.",
     "unarchiveDescription": "Ces sujets réapparaîtront dans la barre latérale."
-  },
-  "deleteConfirm": {
-    "title": "Supprimer cette discussion ?",
-    "titleMany": "Supprimer {{count}} conversations ?",
-    "description": "Cette action est irréversible.",
-    "descriptionMany": "Cette action est irréversible.",
-    "cancel": "Annuler",
-    "confirm": "Supprimer",
-    "automationsDescription": "Supprimer ce sujet supprime aussi ses tâches automatiques liées.",
-    "automationsDescriptionMany": "Les automatisations liées seront également supprimées.",
-    "moreAutomations": "+ {{count}} autres",
-    "confirmWithAutomations": "Supprimer",
-    "schedule": {
-      "at": "{{time}}",
-      "every": "Tous les {{duration}}",
-      "cron": "Cron {{expr}}",
-      "cronWithTz": "Cron {{expr}} ({{tz}})",
-      "local": "Déclencheur local",
-      "unknown": "Planification personnalisée"
-    },
-    "next": {
-      "label": "Prochaine exécution : {{time}}",
-      "disabled": "En pause",
-      "local": "En attente du déclencheur",
-      "none": "Aucune prochaine exécution"
-    }
   },
   "connection": {
     "idle": "Inactif",
@@ -1937,6 +1925,11 @@
       "goalStateExpandAria": "Afficher l’objectif complet",
       "goalBlocked": "Bloqué",
       "goalStateSheetTitle": "Objectif",
+      "cancelGoal": "Annuler l’objectif",
+      "cancelGoalFailed": "Échec de l’annulation. Réessayez.",
+      "cancelGoalOffline": "Reconnectez-vous pour annuler l’objectif.",
+      "expandDraft": "Agrandir la zone de saisie",
+      "collapseDraft": "Réduire la zone de saisie",
       "send": "Envoyer le message",
       "stop": "Arrêter la réponse",
       "quotedContext": "Contexte cité",
@@ -1948,6 +1941,13 @@
         "removeContext": "Retirez les pièces jointes et le texte cité avant d’exécuter une commande."
       },
       "chooseAI": "Choisir le modèle",
+      "modelOptions": {
+        "title": "Pour cette discussion",
+        "on": "Activé",
+        "off": "Désactivé",
+        "codexFast": "Fast",
+        "ultrafast": "Ultrarapide"
+      },
       "switchModel": "Changer de modèle",
       "manageModels": "Gérer les préréglages",
       "fallbackNotice": "Cette réponse a utilisé un modèle de secours : {{model}}.",
@@ -2016,7 +2016,7 @@
         "tooLong": "L'enregistrement est trop long.",
         "tooShort": "Maintenez un peu plus longtemps pour enregistrer la voix.",
         "noInput": "Aucune entrée microphone détectée.",
-        "noDevice": "Aucun microphone trouvé. Connectez-en un, puis réessayez.",
+        "noDevice": "Branchez un micro pour enregistrer.",
         "failed": "Impossible de transcrire l'audio."
       },
       "slash": {
@@ -2025,68 +2025,6 @@
         "navigateHint": "↑↓ Naviguer",
         "selectHint": "Entrée/Tab Insérer",
         "closeHint": "Échap Fermer",
-        "commands": {
-          "new": {
-            "title": "Nouvelle discussion",
-            "description": "Réinitialisez ce sujet et commencez-en un nouveau."
-          },
-          "compact": {
-            "title": "Compacter le contexte",
-            "description": "Compactez le contexte et poursuivez la discussion."
-          },
-          "stop": {
-            "title": "Arrêter la tâche",
-            "description": "Arrêtez la tâche active dans cette discussion."
-          },
-          "restart": {
-            "title": "Redémarrer nanobot",
-            "description": "Redémarrez le processus nanobot."
-          },
-          "status": {
-            "title": "Afficher l’état",
-            "description": "Vérifiez l’état d’exécution, des fournisseurs et des canaux."
-          },
-          "model": {
-            "title": "Modèle",
-            "description": "Consultez ou changez le préréglage de modèle actuel."
-          },
-          "history": {
-            "title": "Historique de discussion",
-            "description": "Affichez les N derniers messages enregistrés."
-          },
-          "dream": {
-            "title": "Lancer Dream",
-            "description": "Organisez la mémoire maintenant."
-          },
-          "dream_log": {
-            "title": "Journal Dream",
-            "description": "Consultez les modifications de la dernière exécution de Dream."
-          },
-          "dream_restore": {
-            "title": "Restaurer la mémoire",
-            "description": "Restaurez un instantané précédent de la mémoire Dream."
-          },
-          "dream_prompt": {
-            "title": "Réglages Dream",
-            "description": "Définissez comment Dream organise la mémoire de cet espace."
-          },
-          "goal": {
-            "title": "Objectif long terme",
-            "description": "Demandez à l’assistant de poursuivre cet objectif."
-          },
-          "trigger": {
-            "title": "Déclencheur CLI",
-            "description": "Créez un déclencheur CLI pour cette discussion."
-          },
-          "help": {
-            "title": "Afficher l’aide",
-            "description": "Affichez les commandes slash disponibles."
-          },
-          "pairing": {
-            "title": "Appairage",
-            "description": "Gérez les demandes d’association."
-          }
-        },
         "badges": {
           "current": "Actuel",
           "recent": "Récent"
@@ -2094,7 +2032,6 @@
         "details": {
           "goalActive": "L’objectif est en cours",
           "goalReady": "Démarrer un objectif durable",
-          "history": "Afficher les messages récents",
           "stopRunning": "En cours"
         }
       },
@@ -2161,6 +2098,7 @@
     "actions": "Actions du message",
     "streaming": "en cours de génération",
     "delivery": {
+      "waiting": "En attente de traitement",
       "sending": "Envoi",
       "failed": "Non envoyé"
     },
@@ -2188,6 +2126,8 @@
     "fallbackResponse": "Cette réponse utilise un modèle de secours : {{preset}}.",
     "copyReply": "Copier",
     "copiedReply": "Copié",
+    "expandUserMessage": "Afficher plus",
+    "collapseUserMessage": "Afficher moins",
     "turnLatencyTitle": "Temps de réponse (de bout en bout)",
     "fileEditViewDiff": "Voir les modifications",
     "fileEditViewLargeDiff": "Déplier les modifications",
@@ -2214,8 +2154,8 @@
       "searchedFiles": "Recherche terminée dans les fichiers",
       "searchFilesFailed": "Impossible de rechercher dans les fichiers",
       "findingFiles": "Recherche de fichiers",
-      "foundFiles": "Recherche de fichiers terminée",
-      "findFilesFailed": "Impossible de rechercher des fichiers",
+      "foundFiles": "Fichiers trouvés",
+      "findFilesFailed": "Impossible de trouver les fichiers",
       "listingFiles": "Liste des fichiers",
       "listedFiles": "Fichiers listés",
       "listFilesFailed": "Impossible de lister les fichiers",
@@ -2234,18 +2174,18 @@
       "delegatingTask": "Création de la sous-tâche",
       "delegatedTask": "Sous-tâche créée",
       "delegateTaskFailed": "Impossible de créer la sous-tâche",
-      "checkingSubtask": "Vérification de l’état de la sous-tâche",
-      "checkedSubtask": "État de la sous-tâche obtenu",
-      "checkSubtaskFailed": "Impossible de vérifier l’état de la sous-tâche",
-      "messagingSubtask": "Envoi d’un message à la sous-tâche",
+      "checkingSubtask": "Vérification de la sous-tâche",
+      "checkedSubtask": "Sous-tâche vérifiée",
+      "checkSubtaskFailed": "Impossible de vérifier la sous-tâche",
+      "messagingSubtask": "Envoi à la sous-tâche",
       "queuedSubtaskMessage": "Message mis en attente pour la sous-tâche",
-      "messageSubtaskFailed": "Impossible d’envoyer un message à la sous-tâche",
+      "messageSubtaskFailed": "Impossible d’écrire à la sous-tâche",
       "stoppingSubtask": "Arrêt de la sous-tâche en cours",
-      "requestedSubtaskStop": "Demande d’arrêt traitée",
+      "requestedSubtaskStop": "Arrêt de sous-tâche demandé",
       "stopSubtaskFailed": "Impossible d’arrêter la sous-tâche",
       "managingSubtasks": "Opération sur les sous-tâches en cours",
-      "managedSubtasks": "Opération sur les sous-tâches terminée",
-      "manageSubtasksFailed": "Échec de l’opération sur les sous-tâches",
+      "managedSubtasks": "Sous-tâches gérées",
+      "manageSubtasksFailed": "Impossible de gérer les sous-tâches",
       "sendingMessage": "Envoi du message",
       "sentMessage": "Message envoyé",
       "sendMessageFailed": "Impossible d’envoyer le message",
@@ -2271,28 +2211,28 @@
       "updatedLongTask": "Tâche longue mise à jour",
       "updateLongTaskFailed": "Impossible de mettre à jour la tâche longue",
       "continuingCommand": "Poursuite de la commande",
-      "waitingCommandResult": "En attente du résultat de la commande",
+      "waitingCommandResult": "Attente de la commande",
       "waitingCommandOutput": "En attente de la sortie de la commande",
       "sendingCommandInput": "Envoi de l’entrée",
       "closingCommandInput": "Fermeture de l’entrée de la commande",
-      "sendingClosingInput": "Envoi puis fermeture de l’entrée de la commande",
+      "sendingClosingInput": "Envoi et fermeture de l’entrée",
       "stoppingCommand": "Arrêt de la commande",
       "commandStatusUnknown": "État de la commande inconnu",
-      "commandWasRunning": "La commande était toujours en cours d’exécution lors de la dernière vérification",
-      "commandWaitTimedOut": "Délai d’attente dépassé ; la commande était toujours en cours d’exécution lors de la dernière vérification",
-      "commandWasStopping": "La commande était en cours d’arrêt lors de la dernière vérification",
+      "commandWasRunning": "Commande toujours en cours",
+      "commandWaitTimedOut": "Délai dépassé (toujours en cours)",
+      "commandWasStopping": "Arrêt de la commande",
       "commandCompleted": "Commande terminée",
-      "commandExitFailed": "Échec de la commande (code de sortie {{code}})",
-      "commandExited": "La commande s’est terminée (code de sortie {{code}})",
-      "commandTimedOut": "La commande a dépassé le délai imparti et a été arrêtée",
-      "commandIdleTimedOut": "La commande a été arrêtée après une période sans sortie",
-      "commandCheckedUnknown": "Commande vérifiée ; état inconnu",
+      "commandExitFailed": "Commande échouée (sortie {{code}})",
+      "commandExited": "Commande terminée (sortie {{code}})",
+      "commandTimedOut": "Délai dépassé (arrêtée)",
+      "commandIdleTimedOut": "Arrêtée (aucune sortie)",
+      "commandCheckedUnknown": "Commande vérifiée (état inconnu)",
       "stopCommandError": "Impossible d’arrêter la commande",
-      "sendCloseInputError": "Impossible d’envoyer ou de fermer l’entrée de la commande",
+      "sendCloseInputError": "Impossible d’envoyer ou de fermer l’entrée",
       "sendInputError": "Impossible d’envoyer l’entrée",
       "closeInputError": "Impossible de fermer l’entrée de la commande",
       "checkCommandError": "Impossible de vérifier la commande",
-      "sentClosedInput": "Entrée de la commande envoyée et fermée",
+      "sentClosedInput": "Entrée envoyée et fermée",
       "sentCommandInput": "Entrée envoyée",
       "closedCommandInput": "Entrée de la commande fermée",
       "continuedCommand": "Commande poursuivie",
@@ -2300,14 +2240,14 @@
       "checkingRunningCommands": "Vérification des commandes en cours",
       "checkedRunningCommands": "Commandes en cours vérifiées",
       "checkRunningCommandsFailed": "Impossible de vérifier les commandes en cours",
-      "showEarlierCommandChecks": "Afficher les vérifications précédentes des commandes ({{count}})",
-      "hideEarlierCommandChecks": "Masquer les vérifications précédentes des commandes ({{count}})",
+      "showEarlierCommandChecks": "Afficher {{count}} vérifications précédentes",
+      "hideEarlierCommandChecks": "Masquer {{count}} vérifications précédentes",
       "capturingScreenshot": "Capture d’écran en cours",
       "capturedScreenshot": "Capture d’écran effectuée",
       "captureScreenshotFailed": "Impossible d’effectuer la capture d’écran",
       "runningTool": "Exécution de {{name}}",
       "completedTool": "Exécution de {{name}} terminée",
-      "completeToolFailed": "Impossible de terminer {{name}}",
+      "completeToolFailed": "Impossible d’exécuter {{name}}",
       "files_one": "{{count}} fichier",
       "files_other": "{{count}} fichiers",
       "searches_one": "{{count}} recherche",
@@ -2331,15 +2271,15 @@
       "working": "Traitement en cours",
       "completedStep": "Étape terminée",
       "stepFailed": "Échec de l’étape",
-      "checkingCurrentTime": "Vérification de l’heure actuelle",
-      "checkedCurrentTime": "Heure actuelle vérifiée",
-      "checkCurrentTimeFailed": "Impossible de vérifier l’heure actuelle",
+      "checkingCurrentTime": "Vérification de l’heure",
+      "checkedCurrentTime": "Heure vérifiée",
+      "checkCurrentTimeFailed": "Impossible de vérifier l’heure",
       "runningCommand": "Exécution de la commande",
       "ranCommand": "Commande exécutée",
       "commandFailed": "Échec de la commande",
       "command": "commande",
-      "scriptLines_one": "script, {{count}} ligne",
-      "scriptLines_other": "script, {{count}} lignes",
+      "scriptLines_one": "script ({{count}} ligne)",
+      "scriptLines_other": "script ({{count}} lignes)",
       "opening": "Ouverture",
       "opened": "Ouvert",
       "openFailed": "Impossible d’ouvrir",
@@ -2353,8 +2293,8 @@
       "pressing": "Appui sur",
       "pressed": "Touche activée",
       "pressFailed": "Impossible d’appuyer",
-      "hovering": "Survol de",
-      "hovered": "Survol effectué sur",
+      "hovering": "Survol",
+      "hovered": "Survolé",
       "hoverFailed": "Impossible de survoler",
       "selecting": "Sélection de",
       "selected": "Sélection effectuée",
@@ -2364,7 +2304,7 @@
       "inspectPageFailed": "Impossible d’inspecter la page",
       "waitingForPage": "Attente de la page",
       "waitedForPage": "Page attendue",
-      "pageNotReady": "La page n’est pas devenue disponible",
+      "pageNotReady": "Page indisponible",
       "searchingPlain": "Recherche en cours",
       "searchedPlain": "Recherche terminée",
       "searchFailedPlain": "Impossible d’effectuer la recherche",
@@ -2392,9 +2332,9 @@
     "retryRateLimit": "Limite de requêtes atteinte",
     "retryServer": "Modèle indisponible",
     "retryUnknown": "Échec de la requête au modèle",
-    "retryWaiting": "{{error}} Nouvelle tentative dans {{seconds}} s",
-    "retrying": "{{error}} Nouvelle tentative en cours",
-    "retryExhausted": "{{error}} Fin du tour",
+    "retryWaiting": "{{error}}. Nouvelle tentative dans {{seconds}} s",
+    "retrying": "{{error}}. Nouvelle tentative en cours",
+    "retryExhausted": "{{error}}. Fin du tour",
     "cliActivityRunningOne": "Utilisation de {{name}}",
     "cliActivityRanOne": "{{name}} utilisé",
     "cliActivityFailedOne": "Impossible d’utiliser {{name}}",
@@ -2408,7 +2348,11 @@
     "automationTriggered": "Déclenché automatiquement"
   },
   "recovery": {
-    "actionFailed": "La récupération a échoué. Réessayez.",
+    "details": "Détails",
+    "restart": "La passerelle a redémarré avant la fin de la tâche",
+    "uncertainTool": "Un outil a possiblement déjà été exécuté",
+    "interruptedAgain": "La tâche a de nouveau été interrompue",
+    "actionFailed": "Réessayez la récupération",
     "interrupted": "Tâche interrompue",
     "completed": "Tâche terminée",
     "failed": "Échec de la récupération de la tâche",
@@ -2515,6 +2459,24 @@
       "main-stack": "Principal et pile"
     }
   },
+  "toast": {
+    "undo": "Annuler",
+    "pendingDeleteSingle": "La conversation va être supprimée",
+    "archivedSingle": "Conversation archivée",
+    "archiveFailed": "Impossible de modifier le statut d’archivage.",
+    "unarchivedSingle": "Conversation désarchivée",
+    "deleteFailedSingle": "Impossible de supprimer la conversation",
+    "pendingDelete": "{{count}} conversations vont être supprimées",
+    "archived": "{{count}} conversations archivées",
+    "unarchived": "{{count}} conversations désarchivées",
+    "deleteFailed": "Impossible de supprimer {{count}} conversations",
+    "confirmDeleteAutomationsSingle": "Supprimer la conversation et ses automatisations ?",
+    "confirmDeleteAutomations": "Supprimer {{count}} conversations et leurs automatisations ?",
+    "automationCountSingle": "1 automatisation",
+    "automationCount": "{{count}} automatisations",
+    "excludeSession": "Conserver",
+    "excludeSessionAria": "Retirer {{title}} de cette suppression"
+  },
   "common": {
     "retry": "Réessayer",
     "dismiss": "Fermer",
@@ -2532,6 +2494,7 @@
       "body": "La passerelle a refusé ce projet ou ce mode d’accès. Choisissez un projet existant ou un autre mode d’accès, puis réessayez."
     },
     "turnRejected": {
+      "temporaryCommand": "Seules les commandes /model et /stop sont disponibles dans une discussion temporaire. Pour les autres commandes, utilisez une discussion normale.",
       "title": "Le message n’a pas été envoyé",
       "body": "La passerelle a refusé ce message. Vérifiez le texte ou les pièces jointes, puis réessayez."
     },
@@ -2544,6 +2507,11 @@
       "timeoutTitle": "La requête au fournisseur du modèle a expiré",
       "rateLimitTitle": "Limite de requêtes du fournisseur du modèle atteinte",
       "serverTitle": "Erreur du service du fournisseur du modèle",
+      "imageInputTitle": "L’entrée d’images est désactivée pour ce préréglage",
+      "imageRequestRejectedTitle": "Le modèle a rejeté la requête avec image",
+      "imageInputBody": "Cette requête contient des images. Vérifiez le préréglage ou utilisez-en un qui accepte les images.",
+      "emptyFinalResponseLength": "Limite de sortie atteinte avant la réponse finale",
+      "emptyFinalResponse": "Aucune réponse finale du modèle",
       "unknownTitle": "Échec de la requête au fournisseur du modèle",
       "bodyWithAttempt": "Arrêt après {{attempts}} tentatives. Réessayez plus tard ou choisissez un autre modèle.",
       "body": "Réessayez plus tard ou choisissez un autre modèle."

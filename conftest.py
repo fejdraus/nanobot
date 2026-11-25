@@ -46,8 +46,7 @@ def _isolate_runtime_stores(
     import nanobot.session.location as session_location
     from nanobot.webui import star_prompt
 
-    # A sibling of tmp_path stays outside any test's agent workspace. mkdir is
-    # deferred until a store is used and remains safe for concurrent callers.
+    # Keep lazy per-test stores outside the test workspace.
     data_root = tmp_path_factory.getbasetemp() / "runtime-data" / uuid4().hex
 
     def data_dir() -> Path:
@@ -60,6 +59,7 @@ def _isolate_runtime_stores(
         return path
 
     monkeypatch.setattr(session_location, "get_runtime_subdir", runtime_subdir)
+    monkeypatch.setattr("nanobot.session.image_attachments.get_data_dir", data_dir)
     monkeypatch.setattr("nanobot.webui.history.get_webui_dir", lambda: runtime_subdir("webui"))
     monkeypatch.setattr(star_prompt, "get_webui_dir", lambda: runtime_subdir("webui"))
     monkeypatch.setattr(pairing_store, "_store_path", lambda: data_dir() / "pairing.json")

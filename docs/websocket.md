@@ -134,6 +134,8 @@ All frames are JSON text. Each message has an `event` field.
 
 `media` and `reply_to` are only present when applicable.
 
+WebUI and TUI can send `locale` with a slash command. Display the reply’s `text` as sent, including when replaying history. A successful `/model <preset>` also sends `command_result: {"command": "/model", "switched_preset": "<canonical preset>"}` on the live reply. Neither the reply text nor `turn_end` confirms a switch.
+
 **`delta`** — streaming text chunk (only when `streaming: true`):
 
 ```json
@@ -204,6 +206,10 @@ The event contains no pairing codes or account data. Read the current state from
 {"event": "attached", "chat_id": "uuid-v4"}
 ```
 
+**`turn_end` with `outcome: "failed"`** — the turn ended without a successful reply. Display a notice from `failure_kind` (`model`, `tool`, or `internal`) and, when present, `failure_error_kind`. For example, `{"event":"turn_end","chat_id":"chat1","outcome":"failed","failure_kind":"model","failure_error_kind":"billing"}` means the provider rejected the request for billing or quota reasons. Do not expect a separate assistant message containing the error.
+
+**`turn_failure_notice`** — a chat-scoped failure without a turn completion, for example when a follow-up cannot be accepted while a turn is running. Display the notice without ending that turn or changing its transcript.
+
 **`error`** — soft error for malformed inbound envelopes. The connection stays open:
 
 ```json
@@ -241,6 +247,8 @@ See [Multi-chat multiplexing](#multi-chat-multiplexing) for the full flow.
 WebUI sends a `request_id` with every `new_chat`, `new_temporary_chat`, and `fork_chat`; the gateway echoes it on `attached` and expected `error` responses. IDs must match `[A-Za-z0-9._:-]{1,128}`; malformed IDs are rejected before creation. The shared WebSocket API also accepts requests without IDs for callers such as the TUI; those responses have no `request_id`.
 
 Clients must correlate tagged responses by ID, not by arrival order or the temporary-chat flag. Ordinary `attach` replies cannot complete a creation request. IDs provide correlation, not deduplication: a sent request that times out has an unknown outcome and must not be automatically replayed. Expired unsent requests must be removed before reconnecting.
+
+For authenticated WebUI `attach` requests, `attached.live_turn_ids` lists all named owners in the session that are still queued or running when the gateway acknowledges the subscription. An empty list explicitly reports no named owners. It can retire previously observed owners after reconnect, but does not confirm a new submission, report a turn outcome, or say that the paginated transcript is complete.
 
 A timeout ends the client's pending request, allowing a new user-initiated request with a different ID. A late response cannot complete that newer request. Late temporary-chat creations are discarded rather than selected.
 

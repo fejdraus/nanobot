@@ -21,7 +21,6 @@ from nanobot.session.manager import (
     SessionPolicy,
     fork_session,
 )
-from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.session.sqlite_store import SessionConflictError, SqliteSessionStore
 from nanobot.session.types import PARENT_SESSION_KEY, SessionTypes
 from nanobot.utils.cancellation import shield_and_drain
@@ -632,10 +631,13 @@ class SessionState:
         *,
         expected_generation: str | None = None,
         validate_existing: Callable[[Mapping[str, Any]], None] | None = None,
+        on_create: Mapping[str, Any] | None = None,
+        remove: tuple[str, ...] = (),
     ) -> tuple[str, bool]:
         """Open one generation and atomically validate and attach admission metadata."""
         values = deepcopy(dict(updates))
-        if _RESERVED_KEYS.intersection(values):
+        initial = deepcopy(dict(on_create or {}))
+        if _RESERVED_KEYS.intersection((*values, *initial, *remove)):
             raise ValueError("turn state must be changed through turn operations")
 
         def open_session() -> tuple[str, bool]:
@@ -647,7 +649,7 @@ class SessionState:
                         raise SessionConflictError("session does not exist")
                     with self._cache_lock:
                         self._retired.discard(key)
-                    session = Session(key=key)
+                    session = Session(key=key, metadata=initial)
                 elif (
                     expected_generation is not None
                     and session.generation != expected_generation
@@ -655,6 +657,8 @@ class SessionState:
                     raise SessionConflictError("session admission belongs to a replaced session")
                 if not created and validate_existing is not None:
                     validate_existing(session.metadata)
+                for name in remove:
+                    session.metadata.pop(name, None)
                 session.metadata.update(values)
                 header_only = session.policy.persist and session.persisted
                 if header_only:
@@ -867,10 +871,22 @@ class SessionState:
         self._archives_imported = True
         return imported
 
-    async def set_archived_keys(self, keys: Sequence[str]) -> list[str]:
-        values = list(dict.fromkeys(keys))
+    async def set_archived(self, keys: Sequence[str], archived: bool) -> None:
+        values = list(keys)
+        if values:
+            await self._execute(values, lambda: self._store.set_archived(values, archived), operation_name="set_archived")
+
+    async def typed_session_headers(self, session_type: str) -> list[tuple[str, dict[str, Any]]]:
         return await self._execute(
-            None, lambda: self._store.set_archived_keys(values), operation_name="set_archived_keys",
+            None, lambda: self._store.typed_session_headers(session_type),
+            operation_name="typed_session_headers", write=False,
+        )
+
+    async def recovery_candidates(self, key_prefix: str) -> list[tuple[str, bool]]:
+        """Take one ordered read snapshot before startup admits new work."""
+        return await self._execute(
+            None, lambda: self._store.recovery_candidates(key_prefix),
+            operation_name="recovery_candidates", write=False,
         )
 
     async def list_sessions(self) -> list[dict[str, Any]]:
@@ -885,7 +901,7 @@ class SessionState:
         return await self.query_metadata(lambda rows: rows)
 
     async def query_metadata(
-        self, project: Callable[[list[dict[str, Any]]], _T],
+        self, project: Callable[[list[dict[str, Any]]], _T], *, archived: bool | None = None,
     ) -> _T:
         """Read one committed display snapshot without waiting for active turns.
 
@@ -896,7 +912,7 @@ class SessionState:
         context = copy_context()
 
         def read() -> _T:
-            return context.run(project, self._store.list_metadata())
+            return context.run(project, self._store.list_metadata(archived=archived))
 
         async def query() -> _T:
             return await self._run_operation(read, write=False)
@@ -911,18 +927,7 @@ class SessionState:
             return 0
 
         def rename() -> int:
-            def write() -> list[str]:
-                changed: list[str] = []
-                for row in self._store.list_metadata():
-                    if row["metadata"].get(SESSION_MODEL_PRESET_METADATA_KEY) == old_name:
-                        if self._store.update_metadata(
-                            row["key"],
-                            {SESSION_MODEL_PRESET_METADATA_KEY: new_name},
-                        ):
-                            changed.append(row["key"])
-                return changed
-
-            changed = self._store.run_write(write)
+            changed = self._store.rename_model_preset(old_name, new_name)
             with self._cache_lock:
                 for key in changed:
                     self._snapshots.pop(key, None)
@@ -939,14 +944,14 @@ class SessionState:
 
         def read() -> tuple[dict[str, str], dict[str, str]]:
             return self._store.run_read(
-                lambda: allocate_session_handles(self._store.list_metadata(), self._types),
+                lambda: allocate_session_handles(self._store.list_handle_metadata(), self._types),
             )
 
         def allocate() -> dict[str, str]:
             changed: list[str] = []
 
             def write() -> dict[str, str]:
-                names, updates = allocate_session_handles(self._store.list_metadata(), self._types)
+                names, updates = allocate_session_handles(self._store.list_handle_metadata(), self._types)
                 for key, name in updates.items():
                     if self._store.update_metadata(
                         key,

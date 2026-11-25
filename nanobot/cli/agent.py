@@ -137,10 +137,13 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
         StreamDeltaEvent,
         StreamedResponseEvent,
         StreamEndEvent,
+        TurnFailureNotice,
     )
     from nanobot.bus.queue import MessageBus
+    from nanobot.channels.turn_notices import turn_failure_notice_text
     from nanobot.cli import terminal as cli_terminal
     from nanobot.cli.stream import ThinkingSpinner
+    from nanobot.command.results import as_text_message
     from nanobot.cron.service import CronService
     from nanobot.providers.factory import make_provider
     from nanobot.utils.helpers import sanitize_surrogates as _sanitize_surrogates
@@ -260,14 +263,23 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
                     bot_name=runtime_config.agents.defaults.bot_name,
                     bot_icon=runtime_config.agents.defaults.bot_icon,
                 )
-                response = await agent_loop.process_direct(
-                    message,
-                    session_id,
-                    on_progress=_make_progress(renderer),
-                    on_stream=renderer.on_delta,
-                    on_stream_end=renderer.on_end,
-                )
-                if not renderer.streamed:
+                try:
+                    response = await agent_loop.process_direct(
+                        message,
+                        session_id,
+                        on_progress=_make_progress(renderer),
+                        on_stream=renderer.on_delta,
+                        on_stream_end=renderer.on_end,
+                    )
+                except Exception:
+                    # Unlike a bus turn, direct execution can raise before returning a notice.
+                    await renderer.close()
+                    console.print(turn_failure_notice_text(TurnFailureNotice(failure_kind="internal")))
+                    raise typer.Exit(1) from None
+                if response is not None and isinstance(response.event, TurnFailureNotice):
+                    await renderer.close()
+                    console.print(turn_failure_notice_text(response.event))
+                elif not renderer.streamed:
                     await renderer.close()
                     print_kwargs: dict[str, Any] = {}
                     if renderer.header_printed:
@@ -324,10 +336,19 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
             reasoning_buffer = cli_terminal._ReasoningBuffer()
 
             async def _consume_outbound() -> None:
+                nonlocal renderer
                 while True:
                     try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        msg = as_text_message(await asyncio.wait_for(bus.consume_outbound(), timeout=1.0))
                         event = msg.event
+
+                        if isinstance(event, TurnFailureNotice):
+                            if renderer:
+                                await renderer.close()
+                                renderer = None
+                            await cli_terminal._print_interactive_line(turn_failure_notice_text(event))
+                            turn_done.set()
+                            continue
 
                         if isinstance(event, StreamDeltaEvent):
                             if renderer:
@@ -374,6 +395,7 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
                                 render_markdown=markdown,
                                 metadata=msg.metadata,
                             )
+                            msg.confirm_sent()
 
                     except asyncio.TimeoutError:
                         continue
@@ -441,6 +463,7 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
                                     metadata=meta,
                                     **print_kwargs,
                                 )
+                                response_msg.confirm_sent()
                         elif renderer and not renderer.streamed:
                             await renderer.close()
                     except KeyboardInterrupt:

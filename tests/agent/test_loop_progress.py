@@ -57,13 +57,21 @@ def _attach_webui_runtime_events(loop: AgentLoop, bus: MessageBus) -> None:
 class TestToolEventProgress:
 
     @pytest.mark.asyncio
-    async def test_write_file_emits_file_edit_progress(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("tool_name", ["write_file", "workspace_write"])
+    async def test_write_file_emits_file_edit_progress(self, tmp_path: Path, tool_name: str) -> None:
         loop = _make_loop(tmp_path)
         target = tmp_path / "foo.txt"
         target.write_text("old\n", encoding="utf-8")
+
+        class NamedWriteTool(WriteFileTool):
+            @property
+            def name(self) -> str:
+                return tool_name
+
+        loop.tools.register(NamedWriteTool(workspace=tmp_path))
         tool_call = ToolCallRequest(
             id="call-write",
-            name="write_file",
+            name=tool_name,
             arguments={"path": "foo.txt", "content": "new\nextra\n"},
         )
         calls = iter([
@@ -71,11 +79,6 @@ class TestToolEventProgress:
             LLMResponse(content="Done", tool_calls=[]),
         ])
         loop.provider.chat_stream_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
-        loop.tools.get_definitions = MagicMock(return_value=[])
-        tool = WriteFileTool(workspace=tmp_path)
-        loop.tools.prepare_call = MagicMock(
-            return_value=(tool, {"path": "foo.txt", "content": "new\nextra\n"}, None),
-        )
         file_events: list[dict] = []
 
         async def on_progress(
@@ -95,11 +98,12 @@ class TestToolEventProgress:
         )
 
         assert result.final_content == "Done"
+        assert target.read_text(encoding="utf-8") == "new\nextra\n"
         assert [event["phase"] for event in file_events] == ["start", "end"]
         assert file_events[0] == {
             "version": 1,
             "call_id": "call-write",
-            "tool": "write_file",
+            "tool": tool_name,
             "path": "foo.txt",
             "absolute_path": (tmp_path / "foo.txt").resolve().as_posix(),
             "phase": "start",
@@ -1029,16 +1033,16 @@ class TestToolEventProgress:
         while bus.outbound_size > 0:
             outbound.append(await bus.consume_outbound())
 
-        error_msgs = [m for m in outbound if m.content == "Sorry, I encountered an error."]
+        assert all(m.event is not None for m in outbound)
         turn_end_msgs = [m for m in outbound if isinstance(m.event, TurnEndEvent)]
         statuses = [m for m in outbound if isinstance(m.event, GoalStatusEvent)]
 
-        assert len(error_msgs) == 1
         assert len(turn_end_msgs) == 1
+        end = turn_end_msgs[0].event
+        assert isinstance(end, TurnEndEvent) and (end.outcome, end.failure_kind) == ("failed", "internal")
         assert turn_end_msgs[0].content == ""
         assert turn_end_msgs[0].chat_id == "chat1"
         assert [m.event.status for m in statuses if isinstance(m.event, GoalStatusEvent)] == ["idle"]
-        assert outbound.index(error_msgs[0]) < outbound.index(turn_end_msgs[0])
         assert outbound.index(turn_end_msgs[0]) < outbound.index(statuses[-1])
 
     @pytest.mark.asyncio

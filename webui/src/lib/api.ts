@@ -10,6 +10,7 @@ import type {
   ChannelConnectPayload,
   ChannelValidationPayload,
   ChatSummary,
+  SessionModelOptions,
   ContextGraph,
   CliAppsPayload,
   FilePreviewPayload,
@@ -195,7 +196,7 @@ function normalizeSessionHandle(value: unknown): SessionHandle | null {
 
 export async function listSessions(
   token: string,
-  base: string = "",
+  archived?: boolean,
 ): Promise<ChatSummary[]> {
   type Row = {
     key: string;
@@ -204,14 +205,16 @@ export async function listSessions(
     title?: string;
     preview?: string;
     model_preset?: string | null;
+    model_options?: SessionModelOptions;
     run_started_at?: number | null;
     recovery_state?: RecoveryState | null;
     workspace_scope?: WorkspaceScopePayload | null;
+    archived?: boolean;
     project_locked?: boolean;
     handle?: SessionHandle | null;
   };
   const body = await request<{ sessions: Row[] }>(
-    `${base}/api/sessions`,
+    archived === undefined ? "/api/sessions" : `/api/sessions?archived=${archived}`,
     token,
     undefined,
     API_READ_TIMEOUT_MS,
@@ -220,12 +223,14 @@ export async function listSessions(
     const handle = normalizeSessionHandle(s.handle);
     return {
       key: s.key,
+      archived: s.archived === true,
       ...splitKey(s.key),
       createdAt: s.created_at,
       updatedAt: s.updated_at,
       title: s.title ?? "",
       preview: s.preview ?? "",
       modelPreset: s.model_preset ?? null,
+      modelOptions: s.model_options ?? { reasoning_effort: null, codex_fast_mode: null },
       runStartedAt: s.run_started_at ?? null,
       recoveryState: s.recovery_state ?? null,
       workspaceScope: s.workspace_scope ?? null,
@@ -366,6 +371,7 @@ function parseThreadProjectionEvent(value: unknown, validatedGraphs: ReadonlySet
       return value as unknown as ThreadProjectionEvent;
     case "message":
       if (typeof value.text !== "string") break;
+      if (value.side_channel !== undefined && value.side_channel !== true) break;
       if (value.tool_events !== undefined && !isRecordArray(value.tool_events)) break;
       if (value.trace_detail !== undefined && (
         !["tool_hint", "progress"].includes(String(value.kind))
@@ -1417,7 +1423,7 @@ export async function fetchSidebarState(
 function modelGenerationSettingsPayload(
   configuration: Pick<
     ModelConfigurationCreate,
-    "maxTokens" | "contextWindowTokens" | "temperature" | "reasoningEffort" | "supportsImages" | "api" | "extraHeaders" | "extraQuery" | "extraBody"
+    "maxTokens" | "contextWindowTokens" | "temperature" | "reasoningEffort" | "codexFastMode" | "supportsImages" | "api" | "extraHeaders" | "extraQuery" | "extraBody"
   >,
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = {};
@@ -1435,6 +1441,9 @@ function modelGenerationSettingsPayload(
   }
   if (configuration.reasoningEffort !== undefined) {
     payload.reasoning_effort = configuration.reasoningEffort ?? "";
+  }
+  if (configuration.codexFastMode !== undefined) {
+    payload.codex_fast_mode = configuration.codexFastMode ?? "";
   }
   if (configuration.api !== undefined) {
     payload.api = configuration.api;

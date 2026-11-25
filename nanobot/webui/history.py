@@ -41,6 +41,7 @@ _CONTENT_FIELDS = frozenset({
     "merge_next", "latency_ms", "usage", "round_usages", "context_window_tokens", "goal_state",
     "outcome", "failure_kind", "failure_error_kind", "failure_attempts", "failure_message",
     "transcript_incomplete", "stream_id", "text_from_seq", "compaction_id", "phase", "reason", "render_as",
+    "side_channel",
     "request_usage", "request_id", "run_id", "sequence", "context_graph", "context_snapshot",
 })
 
@@ -106,10 +107,6 @@ def _records_from_entries(
     return [{**record_from_fact(fact, history.key, expand_graphs=False),
              "_webui_replay_identity": f"turn:{ordinal}:record:{position}"}
             for position, fact in entries]
-
-
-def turn_records(history: HistoryReader, ordinal: int) -> list[dict[str, Any]]:
-    return _records_from_entries(history, ordinal, history.read_entries(ordinal))
 
 
 def turn_record_page(

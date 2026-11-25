@@ -1,3 +1,5 @@
+import i18n from "i18next";
+import { resolveInitialLocale } from "../i18n/config";
 import { uploadAttachments, uploadCapability, type AttachmentReference, type UploadCapability } from "../../../packages/client-events/attachments";
 import { DeliveryReceipts } from "../../../packages/client-events/delivery";
 import { decodeNotification } from "../../../packages/client-events/notifications";
@@ -9,6 +11,7 @@ import type {
   OutboundMcpPresetMention,
   OutboundMedia,
   SessionMention,
+  SessionModelOptions,
   SidebarStatePayload,
   GoalStateWsPayload,
   WorkspaceScopePayload,
@@ -32,29 +35,40 @@ function createDefaultSocket(url: string): WebSocket {
   return new WebSocket(url);
 }
 
+const WS_DEBUG_CACHE_TTL_MS = 1_000;
+let wsDebugCache: { checkedAt: number; enabled: boolean } | null = null;
+
 /** Inbound WebSocket ``console.log`` / parse-failure ``console.warn``.
  *
  * - **Dev** (non-production bundle): **on by default** — messages appear at default log level.
  * - **Production**: off unless ``localStorage.setItem('nanobot_debug_ws','1')`` (or ``true``).
  * - **Silence anywhere**: ``localStorage.setItem('nanobot_debug_ws','0')`` (or ``false`` / ``off``).
- * Values are read on every frame; no reload needed.
+ * Values are cached briefly so toggling takes effect without reload while avoiding
+ * synchronous ``localStorage`` reads on every streamed delta frame.
  */
 function wsInboundDebugEnabled(): boolean {
   if (typeof globalThis === "undefined") return false;
+  if (import.meta.env.MODE === "test") return false;
+  const now = Date.now();
+  if (wsDebugCache && now - wsDebugCache.checkedAt < WS_DEBUG_CACHE_TTL_MS) {
+    return wsDebugCache.enabled;
+  }
+  let enabled: boolean;
   try {
-    if (import.meta.env.MODE === "test") return false;
     const ls = (globalThis as unknown as { localStorage?: Storage }).localStorage;
     const raw = ls?.getItem("nanobot_debug_ws")?.trim().toLowerCase() ?? "";
     if (raw === "0" || raw === "false" || raw === "off" || raw === "no") {
-      return false;
+      enabled = false;
+    } else if (raw === "1" || raw === "true" || raw === "on" || raw === "yes") {
+      enabled = true;
+    } else {
+      enabled = !import.meta.env.PROD;
     }
-    if (raw === "1" || raw === "true" || raw === "on" || raw === "yes") {
-      return true;
-    }
-    return !import.meta.env.PROD;
   } catch {
-    return !import.meta.env.PROD;
+    enabled = !import.meta.env.PROD;
   }
+  wsDebugCache = { checkedAt: now, enabled };
+  return enabled;
 }
 
 function summarizeInboundWsPayload(ev: InboundEvent): unknown {
@@ -69,6 +83,8 @@ function summarizeInboundWsPayload(ev: InboundEvent): unknown {
   }
   return row;
 }
+
+type SystemCommandReply = Extract<InboundEvent, { event: "message" }> | undefined;
 
 type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
@@ -193,6 +209,8 @@ function runObservation(event: InboundEvent): RunObservation | null {
     }
     case "goal_status":
       return { ...base, kind: "status", activity: event.status, startedAt: event.started_at };
+    case "turn_failure_notice":
+      return null;
     case "turn_end":
       return { ...base, kind: "completed" };
     case "error":
@@ -233,6 +251,7 @@ export class NanobotClient {
   private receipts = new DeliveryReceipts();
   private statusHandlers = new Set<StatusHandler>();
   private runtimeModelHandlers = new Set<RuntimeModelHandler>();
+  private sessionsChangedHandlers = new Set<() => void>();
   private sessionUpdateHandlers = new Set<SessionUpdateHandler>();
   private sidebarStateUpdateHandlers = new Set<SidebarStateUpdateHandler>();
   private runStatusHandlers = new Set<RunStatusHandler>();
@@ -246,6 +265,7 @@ export class NanobotClient {
   /** Inbound frames received while the transcript owner is absent, regardless of observers. */
   private pendingInboundByChat = new Map<string, InboundEvent[]>();
   private static readonly PENDING_INBOUND_MAX = 2000;
+  private static readonly PENDING_TEMP_INBOUND_MAX = 20_000;
   private knownChats = new Set<string>();
   /** Temporary chats are connection-owned and intentionally not reattached. */
   private temporaryChatIds = new Set<string>();
@@ -255,7 +275,7 @@ export class NanobotClient {
   private goalStateByChatId = new Map<string, GoalStateWsPayload>();
   private pendingChatRequest: PendingChatRequest | null = null;
   private pendingTranscriptions = new Map<string, PendingRequest<string>>();
-  private pendingSystemCommands = new Map<string, PendingRequest<void>>();
+  private pendingSystemCommands = new Map<string, PendingRequest<SystemCommandReply>>();
   private pendingWebUIRequests = new Map<string, PendingWebUIRequest>();
   private sendQueue: Outbound[] = [];
   private reconnectAttempts = 0;
@@ -288,7 +308,13 @@ export class NanobotClient {
     return this.readyChatId;
   }
 
-  /** Swap the URL (e.g. after fetching a fresh token) then reconnect. */
+  /** Stable browser preference namespace without authentication or query parameters. */
+  get preferenceScope(): string {
+    const url = new URL(this.currentUrl, window.location.href);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  }
+
+  /** Set the URL and optional socket factory for the next connection. */
   updateUrl(url: string, socketFactory?: (url: string) => WebSocket): void {
     this.currentUrl = url;
     if (socketFactory) {
@@ -309,6 +335,11 @@ export class NanobotClient {
     return () => {
       this.runtimeModelHandlers.delete(handler);
     };
+  }
+
+  onSessionsChanged(handler: () => void): Unsubscribe {
+    this.sessionsChangedHandlers.add(handler);
+    return () => { this.sessionsChangedHandlers.delete(handler); };
   }
 
   onSessionUpdate(handler: SessionUpdateHandler): Unsubscribe {
@@ -439,9 +470,9 @@ export class NanobotClient {
     this.applyRunEffects(this.runs.transition({ kind: "fence", chatId, completedTurnIds }));
   }
 
-  /** Settle explicit fragment completions without claiming coverage of live content. */
-  settleFragmentRunLifecycle(chatId: string, completedTurnIds: readonly string[]): void {
-    this.applyRunEffects(this.runs.transition({ kind: "settle-fragment-lifecycle", chatId, completedTurnIds }));
+  /** Settle explicit completions without claiming coverage of live content. */
+  settleCompletedRunLifecycle(chatId: string, completedTurnIds: readonly string[]): void {
+    this.applyRunEffects(this.runs.transition({ kind: "settle-completed-lifecycle", chatId, completedTurnIds }));
   }
 
   /** Whether a mounted transcript owns delivery for this chat. */
@@ -742,6 +773,23 @@ export class NanobotClient {
     }
   }
 
+  async uploadBackground(file: File): Promise<void> {
+    const socket = this.socket;
+    const capability = this.upload;
+    const stillConnected = () => this.socket === socket
+      && socket?.readyState === WS_OPEN && this.upload === capability;
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not read image"));
+      reader.onerror = () => reject(new Error("Could not read image"));
+      reader.readAsDataURL(file);
+    });
+    const [attachment] = await uploadAttachments([{ data_url: dataUrl, name: file.name }], capability,
+      typeof window !== "undefined" ? window.location.href : this.currentUrl, stillConnected);
+    if (!attachment || !("reference" in attachment)) throw new Error("Could not upload image");
+    await this.requestMutation("background.update", { reference: attachment.reference });
+  }
+
   async sendAttachments(
     chatId: string, content: string, media: OutboundMedia[],
     options?: Parameters<NanobotClient["sendMessage"]>[3],
@@ -802,6 +850,7 @@ export class NanobotClient {
       quotedContext?: string;
       intent?: "create_automation";
       userShell?: boolean;
+      modelOptions?: SessionModelOptions;
       workspaceScope?: WorkspaceScopePayload | null;
       turnId?: string;
       /** False for side-channel or injected messages that do not own a lifecycle. */
@@ -824,9 +873,12 @@ export class NanobotClient {
       ...(options?.quotedContext?.trim() ? { quoted_context: options.quotedContext.trim() } : {}),
       ...(options?.intent === "create_automation" ? { intent: options.intent } : {}),
       ...(options?.userShell ? { user_shell: true } : {}),
+      ...(!temporary && !options?.userShell && options?.modelOptions
+        ? { model_options: options.modelOptions } : {}),
       ...(options?.workspaceScope ? { workspace_scope: options.workspaceScope } : {}),
       ...(options?.turnId ? { turn_id: options.turnId } : {}),
       webui: true,
+      ...(content.trimStart().startsWith("/") ? { locale: i18n.resolvedLanguage || resolveInitialLocale() } : {}),
     };
     if (!this.frameFitsTransport(frame)) {
       if (options?.turnId && isSystemCommandTurnId(options.turnId)) {
@@ -852,10 +904,10 @@ export class NanobotClient {
     return true;
   }
 
-  sendSystemCommand(chatId: string, command: string, timeoutMs = 5_000): Promise<void> {
+  sendSystemCommand(chatId: string, command: string, timeoutMs = 5_000): Promise<SystemCommandReply> {
     const normalized = command.trim();
     const turnId = `${SYSTEM_COMMAND_TURN_PREFIX}${crypto.randomUUID()}`;
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<SystemCommandReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingSystemCommands.delete(turnId);
         reject(new Error("system command timed out"));
@@ -873,6 +925,10 @@ export class NanobotClient {
       chat_id: chatId,
       workspace_scope: workspaceScope,
     });
+  }
+
+  archiveSessions(keys: string[], archived: boolean): Promise<{ ok: true }> {
+    return this.requestMutation("sessions.archive", { keys, archived });
   }
 
   setSidebarState(state: SidebarStatePayload): Promise<SidebarStatePayload> {
@@ -996,7 +1052,7 @@ export class NanobotClient {
           [parsed.detail, parsed.reason].filter(Boolean).join(":") || "server error",
         );
       } else if (parsed.event === "message" || parsed.event === "turn_end") {
-        this.resolveSystemCommand(turnId);
+        this.resolveSystemCommand(turnId, parsed.event === "message" ? parsed : undefined);
       }
       return;
     }
@@ -1042,6 +1098,10 @@ export class NanobotClient {
       } else {
         this.knownChats.add(parsed.chat_id);
       }
+      const live = parsed.live_turn_ids;
+      if (Array.isArray(live) && live.every((id) => typeof id === "string" && id.length > 0)) {
+        this.applyRunEffects(this.runs.transition({ kind: "reattach", chatId: parsed.chat_id, liveTurnIds: live }));
+      }
       this.dispatch(parsed.chat_id, parsed);
       return;
     }
@@ -1065,6 +1125,11 @@ export class NanobotClient {
 
     if (parsed.event === "transcription_error") {
       this.rejectTranscription(parsed.request_id, parsed.detail || "error");
+      return;
+    }
+
+    if (parsed.event === "sessions_changed") {
+      for (const handler of this.sessionsChangedHandlers) handler();
       return;
     }
 
@@ -1140,11 +1205,13 @@ export class NanobotClient {
         this.pendingInboundByChat.set(chatId, pending);
       }
       pending.push(ev);
-      // Temporary chats have no canonical history to recover evicted events from.
-      if (!this.temporaryChatIds.has(chatId)) {
-        const over = pending.length - NanobotClient.PENDING_INBOUND_MAX;
-        if (over > 0) pending.splice(0, over);
-      }
+      // Temporary chats have no canonical history to recover evicted events from,
+      // but still keep a generous upper bound so an unmounted chat cannot OOM the tab.
+      const maxPending = this.temporaryChatIds.has(chatId)
+        ? NanobotClient.PENDING_TEMP_INBOUND_MAX
+        : NanobotClient.PENDING_INBOUND_MAX;
+      const over = pending.length - maxPending;
+      if (over > 0) pending.splice(0, over);
     }
     for (const handler of this.chatHandlers.get(chatId) ?? []) handler(ev);
   }
@@ -1202,15 +1269,11 @@ export class NanobotClient {
   }
 
   private emitError(error: StreamError): void {
-    // Isolate subscribers so a throwing handler cannot abort the surrounding
-    // ``handleClose`` flow (which still owes us a reconnect decision + status
-    // update). We deliberately swallow here: error reporting is best-effort
-    // and must never be allowed to compound the failure it's reporting.
     for (const handler of this.errorHandlers) {
       try {
         handler(error);
       } catch {
-        // best-effort: subscriber fault must not stall transport bookkeeping
+        // A failing subscriber must not prevent reconnect after handleClose.
       }
     }
   }
@@ -1243,12 +1306,12 @@ export class NanobotClient {
     }
   }
 
-  private resolveSystemCommand(turnId: string): void {
+  private resolveSystemCommand(turnId: string, reply: SystemCommandReply): void {
     const pending = this.pendingSystemCommands.get(turnId);
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingSystemCommands.delete(turnId);
-    pending.resolve();
+    pending.resolve(reply);
   }
 
   private rejectSystemCommand(turnId: string, detail: string): void {

@@ -26,7 +26,6 @@ import {
   updateMcpServerTools,
 } from "@/lib/api";
 import { notifyCliAppsChanged } from "@/lib/cli-app-events";
-import { notifyMcpPresetsChanged } from "@/lib/mcp-preset-events";
 import type { NanobotClient } from "@/lib/nanobot-client";
 import type {
   AutomationUpdatePayload,
@@ -93,6 +92,7 @@ export function createSystemSettingsActions({
     nanobotFeatureActionRef,
     nanobotFeatures,
     setAutomationAction,
+    setAutomationDialogError,
     setAutomationPendingDelete,
     setAutomationPendingEdit,
     setAutomations,
@@ -172,6 +172,7 @@ export function createSystemSettingsActions({
       setCliApps(payload);
       if (action !== "test") {
         notifyCliAppsChanged(payload);
+        state.toolsCatalog.invalidateMcpPresets();
       }
       setCliAppsMessage(payload.last_action?.message ?? null);
       setCliAppsFocusName(action === "uninstall" ? null : name);
@@ -229,8 +230,9 @@ export function createSystemSettingsActions({
     job: SessionAutomationJob,
   ) => {
     const key = `${action}:${job.id}`;
+    const reportError = action === "delete" ? setAutomationDialogError : setAutomationsError;
     setAutomationAction(key);
-    setAutomationsError(null);
+    reportError(null);
     try {
       const payload = await runAutomationAction(client, action, job.id);
       setAutomations(payload);
@@ -240,7 +242,7 @@ export function createSystemSettingsActions({
         window.setTimeout(() => void refreshAutomations(false), 4000);
       }
     } catch (err) {
-      setAutomationsError((err as Error).message);
+      reportError(err instanceof Error ? err.message : String(err));
     } finally {
       setAutomationAction(null);
     }
@@ -252,13 +254,13 @@ export function createSystemSettingsActions({
   ) => {
     const key = `update:${job.id}`;
     setAutomationAction(key);
-    setAutomationsError(null);
+    setAutomationDialogError(null);
     try {
       const payload = await updateAutomation(client, job.id, values);
       setAutomations(payload);
       setAutomationPendingEdit(null);
     } catch (err) {
-      setAutomationsError((err as Error).message);
+      setAutomationDialogError(err instanceof Error ? err.message : String(err));
     } finally {
       setAutomationAction(null);
     }
@@ -369,7 +371,6 @@ export function createSystemSettingsActions({
         const payload = await fetchMcpPresets(getToken());
         setMcpPresets(payload);
         retireMcpProxyDrafts([flow.name]);
-        notifyMcpPresetsChanged(payload);
         setMcpMessage(null);
         setMcpError(null);
       } catch (err) {
@@ -553,9 +554,6 @@ export function createSystemSettingsActions({
       const payload = await runMcpPresetAction(client, action, name, values);
       setMcpPresets(payload);
       applyMcpActionFeedback(payload, action === "test");
-      if (action !== "test") {
-        notifyMcpPresetsChanged(payload);
-      }
       if (payload.requires_restart) {
         setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
       }
@@ -613,7 +611,6 @@ export function createSystemSettingsActions({
       if (payload.last_action?.ok !== false) {
         retireMcpProxyDrafts([name]);
       }
-      notifyMcpPresetsChanged(payload);
       if (payload.requires_restart) {
         setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
       }
@@ -639,7 +636,6 @@ export function createSystemSettingsActions({
         const config: { mcpServers?: object } = JSON.parse(mcpConfigImport);
         retireMcpProxyDrafts(Object.keys(config.mcpServers ?? config));
       }
-      notifyMcpPresetsChanged(payload);
       if (payload.requires_restart) {
         setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
       }
@@ -660,7 +656,6 @@ export function createSystemSettingsActions({
       const payload = await updateMcpServerTools(client, name, enabledTools);
       setMcpPresets(payload);
       applyMcpActionFeedback(payload);
-      notifyMcpPresetsChanged(payload);
       if (payload.requires_restart) {
         setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
       }

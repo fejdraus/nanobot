@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +12,7 @@ import pytest
 from agent.session_helpers import mock_session_manager, run_session
 from nanobot.agent.memory import Consolidator
 from nanobot.bus.outbound_events import StreamDeltaEvent, StreamEndEvent
+from nanobot.command.results import message_text
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import GenerationSettings
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -109,6 +113,42 @@ async def _wait_for_background_callbacks(loop) -> None:
 
 
 class TestBackgroundTaskTracking:
+    def test_shutdown_drains_completed_task_before_its_callback(self, tmp_path):
+        # A busy loop cannot be bounded by an asyncio timeout in the same loop.
+        script = """
+import asyncio
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.queue import MessageBus
+
+async def main():
+    provider = MagicMock(aclose=AsyncMock())
+    provider.get_default_model.return_value = "test-model"
+    agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=Path(sys.argv[1]))
+
+    async def finish():
+        return
+
+    agent.schedule_background(finish())
+    task = next(iter(agent._background_tasks))
+    await asyncio.sleep(0)
+    assert task.done() and task in agent._background_tasks
+    await agent.aclose()
+    assert not agent._background_tasks
+
+asyncio.run(main())
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
     @pytest.mark.asyncio
     async def test_successful_background_task_is_removed(self, monkeypatch):
         loop, _bus = _make_loop()
@@ -175,6 +215,43 @@ class TestBackgroundTaskTracking:
 
 
     @pytest.mark.asyncio
+    async def test_shutdown_drains_work_scheduled_by_background_task(self):
+        loop, _bus = _make_loop()
+        loop.subagents.close = AsyncMock()
+        loop._exec_session_manager.close_all = AsyncMock()
+        scan_started = asyncio.Event()
+        release_scan = asyncio.Event()
+        archival_started = asyncio.Event()
+        release_archival = asyncio.Event()
+
+        async def archive():
+            archival_started.set()
+            await release_archival.wait()
+
+        async def scan():
+            scan_started.set()
+            await release_scan.wait()
+            loop.schedule_background(archive())
+
+        loop.schedule_background(scan())
+        await scan_started.wait()
+        closing = asyncio.create_task(loop.aclose())
+        try:
+            await asyncio.sleep(0)
+            release_scan.set()
+            await archival_started.wait()
+            assert not closing.done()
+            loop.subagents.close.assert_not_awaited()
+        finally:
+            release_scan.set()
+            release_archival.set()
+            await closing
+
+        assert not loop._background_tasks
+        loop.subagents.close.assert_awaited_once()
+        loop._exec_session_manager.close_all.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_shutdown_drains_background_failure_and_logs_it_once(self, monkeypatch):
         loop, _bus = _make_loop()
         loop.subagents.close = AsyncMock()
@@ -219,7 +296,7 @@ class TestHandleStop:
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
         ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
         out = await cmd_stop(ctx)
-        assert "No active task" in out.content
+        assert message_text(out) == "Stopped."
 
     @pytest.mark.asyncio
     async def test_aclose_cancels_active_turn_before_resources(self):
@@ -302,7 +379,7 @@ class TestHandleStop:
         out = await cmd_stop(ctx)
 
         assert cancelled.is_set()
-        assert "stopped" in out.content.lower()
+        assert "stopped" in message_text(out).lower()
 
     @pytest.mark.asyncio
     async def test_stop_cancels_multiple_tasks(self):
@@ -329,7 +406,7 @@ class TestHandleStop:
         out = await cmd_stop(ctx)
 
         assert all(e.is_set() for e in events)
-        assert "2 task" in out.content
+        assert message_text(out) == "Stopped."
 
 
 class TestDispatch:

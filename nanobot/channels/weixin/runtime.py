@@ -54,7 +54,6 @@ ITEM_TOOL_CALL_RESULT = 12
 # MessageType  (1 = inbound from user, 2 = outbound from bot)
 MESSAGE_TYPE_BOT = 2
 
-# MessageState
 MESSAGE_STATE_FINISH = 2
 
 WEIXIN_MAX_MESSAGE_LEN = 1800
@@ -203,7 +202,7 @@ class WeixinConfig(Base):
     cdn_base_url: str = "https://novac2c.cdn.weixin.qq.com/c2c"
     route_tag: str | int | None = None
     token: str = ""  # Manually set token, or obtained via QR login
-    state_dir: str = ""  # Default: ~/.nanobot/weixin/
+    state_dir: str = ""  # Defaults to weixin/ in the active instance's data directory.
     poll_timeout: int = DEFAULT_LONG_POLL_TIMEOUT_S
     # Extra progress messages consume the same undocumented iLink send quota as
     # final replies. Keep them off unless an operator explicitly opts in.
@@ -1973,7 +1972,6 @@ class WeixinChannel(BaseChannel):
                         else 0
                     )
                     if self._is_retryable_http_status(status_code):
-                        # Server-side / retryable HTTP error — same as network.
                         self.logger.exception(
                             "Server error ({} {}) sending media {}",
                             status_code,
@@ -2239,18 +2237,14 @@ class WeixinChannel(BaseChannel):
         to_user_id: str,
         text: str,
         context_token: str,
-        *,
-        client_id: str | None = None,
-        run_id: str = "",
     ) -> None:
         options = _SEND_OPTIONS.get()
         self._ensure_context_budget(
             context_token,
             reserve=options.reserve_budget if options else 0,
         )
-        client_id = client_id or (options.client_id if options else None)
-        client_id = client_id or f"nanobot-{uuid.uuid4().hex[:12]}"
-        run_id = run_id or (options.run_id if options else "")
+        client_id = (options.client_id if options else None) or f"nanobot-{uuid.uuid4().hex[:12]}"
+        run_id = options.run_id if options else ""
 
         item_list: list[dict[str, Any]] = []
         if text:
@@ -2284,11 +2278,6 @@ class WeixinChannel(BaseChannel):
         to_user_id: str,
         media_path: str,
         context_token: str,
-        *,
-        client_id: str | None = None,
-        file_key: str | None = None,
-        aes_key_raw: bytes | None = None,
-        run_id: str = "",
     ) -> None:
         """Upload a local file to WeChat CDN and send it as a media message.
 
@@ -2327,16 +2316,14 @@ class WeixinChannel(BaseChannel):
             item_key = "file_item"
 
         options = _SEND_OPTIONS.get()
-        aes_key_raw = aes_key_raw or (options.aes_key_raw if options else None)
-        aes_key_raw = aes_key_raw or os.urandom(16)
+        aes_key_raw = (options.aes_key_raw if options else None) or os.urandom(16)
         aes_key_hex = aes_key_raw.hex()
 
         # Compute encrypted size: PKCS7 padding to 16-byte boundary
         # Matches aesEcbPaddedSize: Math.ceil((size + 1) / 16) * 16
         padded_size = ((raw_size + 1 + 15) // 16) * 16
 
-        file_key = file_key or (options.file_key if options else None)
-        file_key = file_key or os.urandom(16).hex()
+        file_key = (options.file_key if options else None) or os.urandom(16).hex()
         upload_body: dict[str, Any] = {
             "filekey": file_key,
             "media_type": upload_type,
@@ -2379,7 +2366,6 @@ class WeixinChannel(BaseChannel):
         )
         cdn_resp.raise_for_status()
 
-        # The download encrypted_query_param comes from CDN response header
         download_param = cdn_resp.headers.get("x-encrypted-param", "")
         if not download_param:
             raise RuntimeError(
@@ -2408,9 +2394,8 @@ class WeixinChannel(BaseChannel):
             media_item["len"] = str(raw_size)
 
         # Send each media item as its own message (matching reference plugin)
-        client_id = client_id or (options.client_id if options else None)
-        client_id = client_id or f"nanobot-{uuid.uuid4().hex[:12]}"
-        run_id = run_id or (options.run_id if options else "")
+        client_id = (options.client_id if options else None) or f"nanobot-{uuid.uuid4().hex[:12]}"
+        run_id = options.run_id if options else ""
         item_list: list[dict[str, Any]] = [
             {"type": item_type, item_key: media_item}
         ]
@@ -2457,7 +2442,6 @@ def _parse_aes_key(aes_key_b64: str) -> bytes:
     if len(decoded) == 16:
         return decoded
     if len(decoded) == 32 and re.fullmatch(rb"[0-9a-fA-F]{32}", decoded):
-        # hex-encoded key: base64 → hex string → raw bytes
         return bytes.fromhex(decoded.decode("ascii"))
     raise ValueError(
         f"aes_key must decode to 16 raw bytes or 32-char hex string, got {len(decoded)} bytes"

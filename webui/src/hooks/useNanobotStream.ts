@@ -1,12 +1,17 @@
 import { acceptsCompactionPhase } from "../../../packages/client-events/notifications";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useThreadVisibility } from "@/hooks/useThreadVisibility";
+import { useStreamBatch } from "@/hooks/useStreamBatch";
 
 import { useClient } from "@/providers/ClientProvider";
 import { hasPendingAgentActivity } from "@/lib/activity-timeline";
 import { ApiError, fetchWebuiThread, fetchWebuiThreadTraceDetail } from "@/lib/api";
 import { fetchLatestWebuiThread } from "@/lib/latest-thread-request";
+import { useTranslation } from "react-i18next";
+import { useToast } from "@/components/ui/toast";
+import { nonModelFailureLine } from "../../../packages/client-events/turn-failure";
+import { emptyFinalMessageKey, resolveModelRequestFailureCopy, isImageRequestFailure } from "@/lib/model-request-failure";
 import { persistedCanonicalRunState } from "@/lib/canonical-run-snapshot";
+import { historyContentSnapshot, sameHistoryContent } from "@/lib/thread-display-projection";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { ThreadTranscript, type ThreadPaging, type ThreadRead, type ThreadTranscriptSnapshot } from "@/lib/thread-transcript";
 import type { ThreadMessageCache } from "@/lib/thread-message-cache";
@@ -30,6 +35,7 @@ import type {
   OutboundMcpPresetMention,
   OutboundMedia,
   SessionMention,
+  SessionModelOptions,
   GoalStateWsPayload,
   MessageDeliveryStatus,
   RecoveryState,
@@ -44,9 +50,6 @@ type PendingStreamEvent =
   | { kind: "delta"; text: string; turn: UIMessageTurnFields; streamId?: string; source?: UIMessage["source"]; responseSources?: UIMessage["responseSources"]; responseInputIds?: string[] }
   | { kind: "reasoning"; text: string; turn: UIMessageTurnFields; streamId?: string };
 
-const BACKGROUND_STREAM_FLUSH_INTERVAL_MS = 1_000;
-// Markdown and layout work must leave room for input between visible updates.
-const VISIBLE_STREAM_FLUSH_INTERVAL_MS = 50;
 const EMPTY_INITIAL_MESSAGES: UIMessage[] = [];
 const EMPTY_COMPLETED_TURN_IDS: readonly string[] = [];
 
@@ -62,6 +65,7 @@ export interface SendAttachment {
 }
 
 export interface SendOptions {
+  modelOptions?: SessionModelOptions;
   intent?: "create_automation";
   cliApps?: OutboundCliAppMention[];
   mcpPresets?: OutboundMcpPresetMention[];
@@ -159,6 +163,8 @@ export function useNanobotStream(
   dismissStreamError: () => void;
 } {
   const { client, getToken } = useClient();
+  const { i18n } = useTranslation();
+  const showToast = useToast();
   const historyKey = history?.key ?? null;
   const temporary = history?.temporary === true;
   const messageCache = history?.cache;
@@ -169,9 +175,6 @@ export function useNanobotStream(
   const publishHistory = useCallback(() => setHistoryState(transcriptRef.current.paging), []);
   const [refreshSeq, setRefreshSeq] = useState(0);
   const refreshHistory = useCallback(() => setRefreshSeq((value) => value + 1), []);
-  const threadVisible = useThreadVisibility();
-  const threadVisibleRef = useRef(threadVisible);
-  threadVisibleRef.current = threadVisible;
   const [runState, setRunState] = useState(() => chatId ? client.getRunState(chatId) : null);
   const isStreaming = runState?.active ?? false;
   const runStartedAt = runState?.startedAt ?? null;
@@ -180,6 +183,12 @@ export function useNanobotStream(
     historyRunGenerationRef.current = { chatId, generation: chatId ? client.getRunGeneration(chatId) : 0 };
   }
   const [messages, setRenderedMessages] = useState<UIMessage[]>(initialTranscript.messages);
+  const [liveInputs, setLiveInputs] = useState<{
+    chatId: string;
+    client: typeof client;
+    waiting: ReadonlySet<string>;
+    consumed: ReadonlySet<string>;
+  } | null>(null);
   const [execSourceMessages, setExecSourceMessages] = useState<UIMessage[]>(initialTranscript.messages);
   const [modelRequests, setModelRequests] = useState(initialTranscript.modelRequests);
   const messagesRef = useRef(messages);
@@ -206,26 +215,7 @@ export function useNanobotStream(
   const [recoveryState, setRecoveryState] = useState<RecoveryState | null>(null);
   const [streamError, setStreamError] = useState<StreamError | null>(null);
 
-  const pendingStreamEventsRef = useRef<PendingStreamEvent[]>([]);
-  const streamFrameRef = useRef<number | null>(null);
-  const streamTimerRef = useRef<number | null>(null);
-  const lastStreamFlushRef = useRef(0);
-
-
   const dismissStreamError = useCallback(() => setStreamError(null), []);
-
-  const clearPendingStreamWork = useCallback(() => {
-    if (streamFrameRef.current !== null) {
-      window.cancelAnimationFrame(streamFrameRef.current);
-      streamFrameRef.current = null;
-    }
-    if (streamTimerRef.current !== null) {
-      window.clearTimeout(streamTimerRef.current);
-      streamTimerRef.current = null;
-    }
-    pendingStreamEventsRef.current = [];
-    lastStreamFlushRef.current = 0;
-  }, []);
 
   const isSideChannelEvent = useCallback((ev: InboundEvent) => {
     const turnId = eventTurnId(ev);
@@ -241,73 +231,6 @@ export function useNanobotStream(
     transcriptRef.current.projection = closeThreadProjectionAnswer(transcriptRef.current.projection);
     return hadActiveAssistant;
   }, []);
-
-  const applyStreamError = useCallback((err: StreamError) => {
-    // One multiplexed client serves every thread. A correlated send fault
-    // belongs only to its target chat. An uncorrelated transport close can
-    // still be shown in the mounted thread, but cannot roll back any turn.
-    if (!chatId || (err.chatId && err.chatId !== chatId)) return;
-    setStreamError(err);
-    if (err.kind === "model_request_failed") return;
-    if (!err.turnId) return;
-
-    const rejectedTurnId = err.turnId;
-    pendingStreamEventsRef.current = pendingStreamEventsRef.current.filter(
-      (event) => event.turn.turnId !== rejectedTurnId,
-    );
-    transcriptRef.current.sideChannelTurnIds.delete(rejectedTurnId);
-    setMessages((prev) => {
-      const rejectedRows = prev.filter((message) => message.turnId === rejectedTurnId);
-      if (rejectedRows.length === 0) return prev;
-      const rejectedIds = new Set(rejectedRows.map((message) => message.id));
-      const rejectedSegments = new Set(
-        rejectedRows
-          .map((message) => message.activitySegmentId)
-          .filter((segmentId): segmentId is string => typeof segmentId === "string"),
-      );
-      const projection = transcriptRef.current.projection;
-      const closedAssistantIds = new Set(projection.closedAssistantIds);
-      for (const id of rejectedIds) closedAssistantIds.delete(id);
-      const nextMessages = prev.flatMap<UIMessage>((message) => {
-        if (message.turnId !== rejectedTurnId) return [message];
-        if (message.role !== "user") return [];
-        return [{
-          ...message,
-          deliveryStatus: "failed" as const,
-          deliveryErrorKind: err.kind,
-        }];
-      });
-      transcriptRef.current.projection = {
-        ...projection,
-        messages: nextMessages,
-        activeAssistantId: projection.activeAssistantId
-          && rejectedIds.has(projection.activeAssistantId)
-          ? null
-          : projection.activeAssistantId,
-        closedAssistantIds,
-        activitySegmentId: projection.activitySegmentId
-          && rejectedSegments.has(projection.activitySegmentId)
-          ? null
-          : projection.activitySegmentId,
-        fileEditSegmentId: projection.fileEditSegmentId
-          && rejectedSegments.has(projection.fileEditSegmentId)
-          ? null
-          : projection.fileEditSegmentId,
-      };
-      transcriptRef.current.rejectTurn(rejectedTurnId);
-      setExecSourceMessages(nextMessages);
-      return nextMessages;
-    });
-
-    if (!client.getRunState(chatId).active) {
-      transcriptRef.current.projection = {
-        ...transcriptRef.current.projection,
-        suppressUntilTurnEnd: false,
-      };
-    }
-  }, [chatId, client, setMessages]);
-
-  useEffect(() => client.onError(applyStreamError), [applyStreamError, client]);
 
   const applyPendingStreamEvents = useCallback(
     (prev: UIMessage[], events: PendingStreamEvent[]): UIMessage[] => {
@@ -379,19 +302,73 @@ export function useNanobotStream(
     [chatId],
   );
 
+  const publishStreamBatch = useCallback((events: PendingStreamEvent[]) => {
+    setMessages((prev) => applyPendingStreamEvents(prev, events));
+  }, [applyPendingStreamEvents, setMessages]);
+  const { enqueue: enqueueStreamEvent, drain: drainStreamEvents, discard: discardStreamEvents } = useStreamBatch(publishStreamBatch);
+
+  const applyStreamError = useCallback((err: StreamError) => {
+    // One multiplexed client serves every thread. A correlated send fault
+    // belongs only to its target chat. An uncorrelated transport close can
+    // still be shown in the mounted thread, but cannot roll back any turn.
+    if (!chatId || (err.chatId && err.chatId !== chatId)) return;
+    setStreamError(err);
+    if (err.kind === "model_request_failed") return;
+    if (!err.turnId) return;
+
+    const rejectedTurnId = err.turnId;
+    discardStreamEvents((event) => event.turn.turnId === rejectedTurnId);
+    transcriptRef.current.sideChannelTurnIds.delete(rejectedTurnId);
+    setMessages((prev) => {
+      const rejectedRows = prev.filter((message) => message.turnId === rejectedTurnId);
+      if (rejectedRows.length === 0) return prev;
+      const rejectedIds = new Set(rejectedRows.map((message) => message.id));
+      const rejectedSegments = new Set(
+        rejectedRows
+          .map((message) => message.activitySegmentId)
+          .filter((segmentId): segmentId is string => typeof segmentId === "string"),
+      );
+      const projection = transcriptRef.current.projection;
+      const closedAssistantIds = new Set(projection.closedAssistantIds);
+      for (const id of rejectedIds) closedAssistantIds.delete(id);
+      const nextMessages = prev.flatMap<UIMessage>((message) => {
+        if (message.turnId !== rejectedTurnId) return [message];
+        if (message.role !== "user") return [];
+        return [{
+          ...message,
+          deliveryStatus: "failed" as const,
+          deliveryErrorKind: err.kind,
+          deliveryErrorDetail: err.kind === "turn_rejected" ? err.detail : undefined,
+        }];
+      });
+      transcriptRef.current.projection = {
+        ...projection,
+        messages: nextMessages,
+        activeAssistantId: projection.activeAssistantId
+          && rejectedIds.has(projection.activeAssistantId)
+          ? null
+          : projection.activeAssistantId,
+        closedAssistantIds,
+        activitySegmentId: projection.activitySegmentId
+          && rejectedSegments.has(projection.activitySegmentId)
+          ? null
+          : projection.activitySegmentId,
+        fileEditSegmentId: projection.fileEditSegmentId
+          && rejectedSegments.has(projection.fileEditSegmentId)
+          ? null
+          : projection.fileEditSegmentId,
+      };
+      transcriptRef.current.rejectTurn(rejectedTurnId);
+      setExecSourceMessages(nextMessages);
+      return nextMessages;
+    });
+  }, [chatId, discardStreamEvents, setMessages]);
+
+  useEffect(() => client.onError(applyStreamError), [applyStreamError, client]);
+
   const flushPendingStreamEvents = useCallback((end?: Extract<ThreadProjectionEvent, { event: "stream_end" }>) => {
-    lastStreamFlushRef.current = 0;
-    if (streamFrameRef.current !== null) {
-      window.cancelAnimationFrame(streamFrameRef.current);
-      streamFrameRef.current = null;
-    }
-    if (streamTimerRef.current !== null) {
-      window.clearTimeout(streamTimerRef.current);
-      streamTimerRef.current = null;
-    }
-    const events = pendingStreamEventsRef.current;
+    const events = drainStreamEvents();
     if (events.length === 0 && !end) return;
-    pendingStreamEventsRef.current = [];
     setMessages((prev) => {
       const nextMessages = events.length > 0 ? applyPendingStreamEvents(prev, events) : prev;
       transcriptRef.current.projection = { ...transcriptRef.current.projection, messages: nextMessages };
@@ -400,67 +377,7 @@ export function useNanobotStream(
       });
       return transcriptRef.current.messages;
     });
-  }, [applyPendingStreamEvents, setMessages]);
-
-  const schedulePendingStreamFlush = useCallback(function schedule() {
-    if (streamFrameRef.current !== null || streamTimerRef.current !== null) return;
-    if (document.visibilityState === "hidden" || !threadVisibleRef.current) {
-      streamTimerRef.current = window.setTimeout(() => {
-        streamTimerRef.current = null;
-        const events = pendingStreamEventsRef.current;
-        if (events.length === 0) return;
-        pendingStreamEventsRef.current = [];
-        setMessages((prev) => applyPendingStreamEvents(prev, events));
-      }, BACKGROUND_STREAM_FLUSH_INTERVAL_MS);
-      return;
-    }
-    const delay = VISIBLE_STREAM_FLUSH_INTERVAL_MS
-      - (performance.now() - lastStreamFlushRef.current);
-    if (delay > 0) {
-      streamTimerRef.current = window.setTimeout(() => {
-        streamTimerRef.current = null;
-        schedule();
-      }, delay);
-      return;
-    }
-    streamFrameRef.current = window.requestAnimationFrame(() => {
-      streamFrameRef.current = null;
-      const events = pendingStreamEventsRef.current;
-      if (events.length === 0) return;
-      pendingStreamEventsRef.current = [];
-      lastStreamFlushRef.current = performance.now();
-      setMessages((prev) => applyPendingStreamEvents(prev, events));
-    });
-  }, [applyPendingStreamEvents, setMessages]);
-
-  useEffect(() => {
-    if (threadVisible) {
-      flushPendingStreamEvents();
-    } else if (streamFrameRef.current !== null || streamTimerRef.current !== null) {
-      if (streamFrameRef.current !== null) window.cancelAnimationFrame(streamFrameRef.current);
-      streamFrameRef.current = null;
-      if (streamTimerRef.current !== null) window.clearTimeout(streamTimerRef.current);
-      streamTimerRef.current = null;
-      schedulePendingStreamFlush();
-    }
-  }, [threadVisible, flushPendingStreamEvents, schedulePendingStreamFlush]);
-
-  useEffect(() => {
-    const onVisibilityChange = () => {
-      if (pendingStreamEventsRef.current.length === 0) return;
-      if (document.visibilityState === "visible" && threadVisibleRef.current) {
-        flushPendingStreamEvents();
-      } else {
-        if (streamFrameRef.current !== null) window.cancelAnimationFrame(streamFrameRef.current);
-        streamFrameRef.current = null;
-        if (streamTimerRef.current !== null) window.clearTimeout(streamTimerRef.current);
-        streamTimerRef.current = null;
-        schedulePendingStreamFlush();
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [flushPendingStreamEvents, schedulePendingStreamFlush]);
+  }, [applyPendingStreamEvents, drainStreamEvents, setMessages]);
 
   useEffect(() => {
     if (!chatId) return;
@@ -495,8 +412,8 @@ export function useNanobotStream(
     setRetryStatus(null);
     setGoalState(chatId ? client.getGoalState(chatId) : undefined);
     setRecoveryState(null);
-    clearPendingStreamWork();
-  }, [chatId, client, historyKey, temporary, clearActivitySegment, clearPendingStreamWork, setMessages]);
+    drainStreamEvents();
+  }, [chatId, client, historyKey, temporary, clearActivitySegment, drainStreamEvents, setMessages]);
 
   useEffect(() => {
     if (!chatId || (!hasPendingToolCalls && !initialStreaming)) return;
@@ -543,7 +460,7 @@ export function useNanobotStream(
   }, [chatId, client]);
   const settleFragment = useCallback((owner: ThreadTranscript) => {
     if (!chatId || !owner.fragmentCompletedTurnIds.length) return;
-    client.settleFragmentRunLifecycle(chatId, owner.fragmentCompletedTurnIds);
+    client.settleCompletedRunLifecycle(chatId, owner.fragmentCompletedTurnIds);
     if (!client.getRunState(chatId)?.active) setRetryStatus(null);
   }, [chatId, client]);
 
@@ -574,7 +491,9 @@ export function useNanobotStream(
       if (chatId && canonical && (ownRead || !seed)) {
         if (body?.page?.record_range) {
           if (accepted) settleFragment(owner);
-        } else if (ownRead && !owner.hasPendingFragmentGap) {
+        } else if (!owner.hasPendingFragmentGap) {
+          // A published reconnect page supersedes this owner's shared read.
+          // The owner must reconcile its completion facts after that handoff too.
           reconcileCanonical(generation, canonical, accepted);
         }
       }
@@ -612,19 +531,31 @@ export function useNanobotStream(
     olderReadRef.current = operation;
     publishHistory();
     try {
-      const body = await fetchWebuiThread(getToken(), historyKey, { before, limit: 120, signal: controller.signal });
-      if (olderReadRef.current !== operation || transcriptRef.current !== owner) return;
-      flushPendingStreamEvents();
-      const accepted = owner.accept(body, read);
-      setMessages(owner.messages);
-      setExecSourceMessages(owner.messages);
-      if (accepted) {
-        if (chatId) messageCache?.set(chatId, owner.save());
-        settleFragment(owner);
+      while (true) {
+        const body = await fetchWebuiThread(getToken(), historyKey, {
+          before: operation.read.before!, limit: 120, signal: controller.signal,
+        });
+        if (olderReadRef.current !== operation || transcriptRef.current !== owner) return;
+        flushPendingStreamEvents();
+        const previousContent = historyContentSnapshot(owner.messages, owner.paging.forkBoundaryMessageCount);
+        const accepted = owner.accept(body, operation.read);
+        const needsContent = accepted && owner.paging.hasMoreBefore
+          && (owner.hasPendingFragmentGap
+            || sameHistoryContent(previousContent, historyContentSnapshot(owner.messages, owner.paging.forkBoundaryMessageCount)));
+        // Keep one pull pending across bookkeeping pages and staged fragments.
+        // Begin the continuation before publishing accept()'s intermediate state.
+        if (needsContent) operation.read = owner.begin("older");
+        setMessages(owner.messages);
+        setExecSourceMessages(owner.messages);
+        if (accepted) {
+          if (chatId) messageCache?.set(chatId, owner.save());
+          settleFragment(owner);
+        }
+        if (!needsContent) break;
       }
     } catch (error) {
       if (olderReadRef.current === operation && transcriptRef.current === owner) {
-        owner.finishRead(read, (error as Error).message);
+        owner.finishRead(operation.read, (error as Error).message);
         publishHistory();
       }
     } finally {
@@ -669,7 +600,20 @@ export function useNanobotStream(
   useEffect(() => {
     if (!chatId) return;
 
+    // A request may start before its acceptance frame reaches this tab.
+    const startedInputs = new Set<string>();
+    const notifyFailure = (failure: { failure_kind?: string; failure_error_kind?: string }) => {
+      const emptyFinal = emptyFinalMessageKey(failure.failure_error_kind);
+      const message = failure.failure_kind === "model"
+        ? emptyFinal ? i18n.t(emptyFinal) : resolveModelRequestFailureCopy({ errorKind: failure.failure_error_kind }, i18n.t).title
+        : nonModelFailureLine(failure.failure_kind, i18n.resolvedLanguage ?? i18n.language);
+      showToast?.({ tone: "error", message });
+    };
     const handle = (ev: InboundEvent) => {
+      if (ev.event === "turn_failure_notice") {
+        notifyFailure(ev);
+        return;
+      }
       if (ev.event === "error") {
         if (ev.detail === "message_too_big") {
           applyStreamError({
@@ -699,6 +643,15 @@ export function useNanobotStream(
       if (turnId) {
         setMessages((prev) => transitionTurnDelivery(prev, turnId, "accepted"));
       }
+      if ((ev.event === "message_accepted" || ev.event === "user_message") && ev.waiting_for_model === true) {
+        const id = ev.event === "user_message" ? ev.input_id : `user:${ev.turn_id}`;
+        if (id && !startedInputs.has(id)) {
+          setLiveInputs((prev) => {
+            const current = prev?.chatId === chatId && prev.client === client ? prev : null;
+            return { chatId, client, waiting: new Set([...(current?.waiting ?? []), id]), consumed: new Set() };
+          });
+        }
+      }
       if (ev.event === "message_accepted") {
         if (ev.media_urls?.length) {
           setMessages((prev) => prev.map((message) => (
@@ -715,6 +668,16 @@ export function useNanobotStream(
         return;
       }
       if (ev.event === "model_request") {
+        if (ev.phase === "started" && Array.isArray(ev.response_input_ids)) {
+          const ids = ev.response_input_ids;
+          ids.forEach((id) => startedInputs.add(id));
+          setLiveInputs((prev) => {
+            if (prev?.chatId !== chatId || prev.client !== client) return prev;
+            const consumed = new Set(ids.filter((id) => prev.waiting.has(id)));
+            if (!consumed.size) return prev;
+            return { ...prev, waiting: new Set([...prev.waiting].filter((id) => !consumed.has(id))), consumed };
+          });
+        }
         flushPendingStreamEvents();
         applyProjectionEvent(ev);
         return;
@@ -736,10 +699,10 @@ export function useNanobotStream(
         || ev.event === "stream_end"
       ) setRetryStatus(null);
       if (ev.event === "delta") {
-        if (transcriptRef.current.projection.suppressUntilTurnEnd || transcriptRef.current.represented(ev)) return;
+        if (transcriptRef.current.represented(ev)) return;
         const chunk = typeof ev.text === "string" ? ev.text : "";
         if (!chunk) return;
-        pendingStreamEventsRef.current.push({
+        enqueueStreamEvent({
           kind: "delta",
           text: chunk,
           turn: turnFieldsFromEvent(ev, "answer"),
@@ -748,28 +711,25 @@ export function useNanobotStream(
           responseSources: ev.response_sources,
           responseInputIds: ev.response_input_ids,
         });
-        schedulePendingStreamFlush();
         return;
       }
 
       if (ev.event === "reasoning_delta") {
-        if (transcriptRef.current.projection.suppressUntilTurnEnd || transcriptRef.current.represented(ev)) return;
+        if (transcriptRef.current.represented(ev)) return;
         const chunk = ev.text;
         if (!chunk) return;
-        pendingStreamEventsRef.current.push({
+        enqueueStreamEvent({
           kind: "reasoning",
           text: chunk,
           turn: turnFieldsFromEvent(ev, "reasoning"),
           streamId: ev.stream_id,
         });
-        schedulePendingStreamFlush();
         return;
       }
 
       if (ev.event === "stream_end") {
         if (transcriptRef.current.represented(ev)) return;
         flushPendingStreamEvents(ev);
-        if (transcriptRef.current.projection.suppressUntilTurnEnd) return;
         if (ev.resuming) {
           return;
         }
@@ -782,7 +742,6 @@ export function useNanobotStream(
       flushPendingStreamEvents();
 
       if (ev.event === "reasoning_end") {
-        if (transcriptRef.current.projection.suppressUntilTurnEnd) return;
         applyProjectionEvent(ev);
         return;
       }
@@ -827,11 +786,15 @@ export function useNanobotStream(
       }
 
       if (ev.event === "turn_end") {
+        if (!sideChannelEvent && (ev.outcome === "cancelled" || ev.outcome === "failed" || ev.outcome === "interrupted")) {
+          setLiveInputs(null);
+        }
         if (typeof ev.turn_id === "string") transcriptRef.current.sideChannelTurnIds.delete(ev.turn_id);
         if ("goal_state" in ev && ev.goal_state != null && typeof ev.goal_state === "object") {
           setGoalState(ev.goal_state);
         }
         setRetryStatus(null);
+        if (ev.outcome === "failed" && ev.failure_kind !== "model") notifyFailure(ev);
         const modelRequestFailed = ev.outcome === "failed" && ev.failure_kind === "model";
         const failureAttempts =
           typeof ev.failure_attempts === "number"
@@ -850,7 +813,8 @@ export function useNanobotStream(
               ...(failureAttempts !== undefined ? { attempts: failureAttempts } : {}),
             }
           : null;
-        if (modelFailure) setStreamError(modelFailure);
+        // Recovery decides whether an image failure needs an action card or just a toast.
+        if (modelFailure && !isImageRequestFailure(modelFailure.errorKind)) setStreamError(modelFailure);
         applyProjectionEvent(ev);
         playTurnCompleteSound();
         onTurnEnd?.();
@@ -873,8 +837,11 @@ export function useNanobotStream(
             ? { reply_preserved: ev.reply_preserved }
             : {}),
         };
-        setRecoveryState(next);
-        if (ev.reason === "model_request_failed" || ev.status === "resuming") {
+        const inputRejected = ev.status === "recovered" && ev.reason === "input_rejected";
+        setRecoveryState(inputRejected ? null : next);
+        if (inputRejected) {
+          setStreamError({ kind: "model_request_failed", chatId, errorKind: next.failure_error_kind });
+        } else if (ev.reason === "model_request_failed" || ev.status === "resuming") {
           setStreamError(null);
         }
         if (
@@ -883,7 +850,7 @@ export function useNanobotStream(
           || ev.status === "failed"
         ) {
           setRetryStatus(null);
-          clearPendingStreamWork();
+          drainStreamEvents();
           closeActiveAssistantStream();
           clearActivitySegment();
         }
@@ -891,7 +858,7 @@ export function useNanobotStream(
       }
 
       if (ev.event === "attached") {
-        setRecoveryState(ev.recovery_state ?? null);
+        setRecoveryState(ev.recovery_state?.reason === "input_rejected" ? null : ev.recovery_state ?? null);
         if (
           ev.recovery_state?.reason === "model_request_failed"
           || ev.recovery_state?.status === "resuming"
@@ -902,7 +869,7 @@ export function useNanobotStream(
           ev.recovery_state?.status === "awaiting_user"
           || ev.recovery_state?.status === "failed"
         ) {
-          clearPendingStreamWork();
+          drainStreamEvents();
           closeActiveAssistantStream();
           clearActivitySegment();
         }
@@ -922,19 +889,23 @@ export function useNanobotStream(
       }
     };
 
+    const unsubStatus = client.onStatus((status) => {
+      if (status !== "open") setLiveInputs(null);
+    });
     const unsub = client.onTranscript(chatId, handle);
     return () => {
+      unsubStatus();
       unsub();
+      setLiveInputs(null);
       // Navigation may happen before the throttled paint. Snapshot the pending
       // deltas synchronously while they still belong to this subscription.
-      const pending = pendingStreamEventsRef.current;
+      const pending = drainStreamEvents();
       const snapshot = pending.length > 0
         ? applyPendingStreamEvents(messagesRef.current, pending)
         : messagesRef.current;
       onStreamDetach?.(snapshot);
       if (pending.length > 0) setMessages(snapshot);
       messageCache?.set(chatId, transcriptRef.current.save());
-      clearPendingStreamWork();
     };
   }, [
     applyProjectionEvent,
@@ -944,13 +915,15 @@ export function useNanobotStream(
     closeActiveAssistantStream,
     client,
     clearActivitySegment,
-    clearPendingStreamWork,
+    drainStreamEvents,
     flushPendingStreamEvents,
     isSideChannelEvent,
+    i18n,
+    showToast,
     onTurnEnd,
     onStreamDetach,
     messageCache,
-    schedulePendingStreamFlush,
+    enqueueStreamEvent,
     setMessages,
   ]);
 
@@ -1044,6 +1017,7 @@ export function useNanobotStream(
   const stop = useCallback(() => {
     if (!chatId) return;
     flushPendingStreamEvents();
+    setLiveInputs(null);
     setRetryStatus(null);
     setMessages((prev) => {
       const settled = prev.map((m) => ({ ...m, isStreaming: false }));
@@ -1080,8 +1054,19 @@ export function useNanobotStream(
     [recoveryAction],
   );
 
+  const visibleMessages = useMemo(() => {
+    if (!liveInputs || liveInputs.chatId !== messageScope.chatId || liveInputs.client !== messageScope.client
+      || (!liveInputs.waiting.size && !liveInputs.consumed.size)) return messages;
+    return messages.map((row): UIMessage => {
+      if (row.role !== "user" || !row.inputId) return row;
+      if (liveInputs.waiting.has(row.inputId)) return { ...row, processingStatus: "pending" };
+      if (liveInputs.consumed.has(row.inputId)) return { ...row, processingStatus: "consumed" };
+      return row;
+    });
+  }, [liveInputs, messageScope, messages]);
+
   return {
-    messages,
+    messages: visibleMessages,
     execSourceMessages,
     modelRequests,
     messagesKey: messageScope.historyKey ?? messageScope.chatId,

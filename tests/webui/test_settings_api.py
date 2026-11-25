@@ -3,9 +3,9 @@ from __future__ import annotations
 import builtins
 import json
 import time
-from datetime import date
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
@@ -17,8 +17,9 @@ from nanobot.llm_usage.models import LLMCallRecord
 from nanobot.providers.base import LLMUsage
 from nanobot.providers.oauth_model_catalog import OAuthModelCatalogSnapshot
 from nanobot.providers.registry import ProviderModelSpec, find_by_name
+from nanobot.providers.routing import resolve_provider_route
 from nanobot.session.manager import SessionManager
-from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY, SessionModelPreset
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     _docs_version,
@@ -41,10 +42,6 @@ from nanobot.webui.settings_api import (
     update_provider_settings,
     update_transcription_settings,
     update_web_search_settings,
-)
-from nanobot.webui.settings_models import (
-    _extract_model_rows,
-    _model_catalog_row_active,
 )
 from nanobot.webui.settings_services import WebUIOAuthFlowRegistry
 
@@ -543,7 +540,7 @@ def test_update_model_configuration_renames_preset_and_config_references(
         tmp_path / "workspace",
         sessions_root=tmp_path / "sessions",
     ).get_or_create("websocket:selected")
-    assert persisted.metadata[SESSION_MODEL_PRESET_METADATA_KEY] == "Codex"
+    assert SessionModelPreset.from_metadata(persisted.metadata) == SessionModelPreset("Codex")
 
 
 def test_update_model_configuration_rejects_duplicate_rename(
@@ -859,6 +856,26 @@ def test_fixed_responses_provider_rejects_chat_without_saving(tmp_path, monkeypa
         "name": ["codex"], "api": [json.dumps({"supportedApis": ["responses"]})],
     })
     assert load_config(config_path).model_presets["codex"].api.supported_apis == ("responses",)
+
+
+def test_preset_fast_mode_can_override_and_restore_connection_default(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config = Config.model_validate({
+        "modelPresets": {"codex": {"provider": "openai_codex", "model": "openai-codex/gpt-6.2-sol"}},
+        "providers": {"openaiCodex": {"extraBody": {"service_tier": "priority"}}},
+    })
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+    for value, saved, effective in (
+        ("false", False, False), ("true", True, True), ("ultrafast", "ultrafast", "ultrafast"), ("", None, True),
+    ):
+        payload = update_model_configuration({"name": ["codex"], "codex_fast_mode": [value]})
+        preset = next(row for row in payload["model_presets"] if row["name"] == "codex")
+        assert preset["codex_fast_mode"] == saved
+        assert preset["model_options"]["codex_fast_mode"] == {"default": effective, "ultrafast_supported": True}
+        current = load_config(config_path)
+        assert current.model_presets["codex"].codex_fast_mode == saved
+        assert current.providers.openai_codex.extra_body == {"service_tier": "priority"}
 
 
 def test_legacy_migration_preserves_primary_and_fallback_apis(tmp_path, monkeypatch):
@@ -1289,6 +1306,42 @@ def test_settings_payload_includes_dynamic_custom_provider(
     assert providers[DYNAMIC_PROVIDER_NAME]["configured"] is True
     assert providers[DYNAMIC_PROVIDER_NAME]["api_key_required"] is False
     assert providers[DYNAMIC_PROVIDER_NAME]["api_base"] == DYNAMIC_PROVIDER_API_BASE
+
+
+@pytest.mark.parametrize(("api_base", "api_key"), [
+    ("https://legacy-private.test/v1", None),
+    ("https://router.shengsuanyun.com/api/v1", "legacy-test-key"),
+])
+def test_legacy_shengsuanyun_keeps_custom_route_and_settings(tmp_path, api_base, api_key):
+    config_path = tmp_path / "legacy.json"
+    config_path.write_text(json.dumps({
+        "agents": {"defaults": {"model": "shengsuanyun/example-model"}},
+        "providers": {
+            "openrouter": {"apiKey": "must-not-route-here"},
+            "shengsuanyun": {
+                "apiBase": api_base, "apiKey": api_key,
+                "api": {"supportedApis": ["chat_completions"]},
+            },
+        },
+    }), encoding="utf-8")
+
+    initial = settings_payload(config_path=config_path)
+    assert initial["agent"]["resolved_provider"] == "shengsuanyun"
+    initial_row = next(row for row in initial["providers"] if row["name"] == "shengsuanyun")
+    assert initial_row["is_custom"] and initial_row["provider_api_configurable"]
+
+    update_provider_settings(
+        {"provider": ["shengsuanyun"], "display_name": ["My private router"]},
+        config_path=config_path,
+    )
+    saved = load_config(config_path)
+    route = resolve_provider_route(saved, preset=saved.resolve_preset())
+    assert route.provider_name == "shengsuanyun"
+    assert saved.get_api_base() == api_base
+    assert route.model_api is not None and route.model_api.preferred_api == "chat_completions"
+    assert route.spec is not None and route.spec.request_model_name(route.model) == "example-model"
+    row = next(row for row in settings_payload(config_path=config_path)["providers"] if row["name"] == "shengsuanyun")
+    assert row["label"] == "My private router"
 
 
 def test_settings_payload_resolves_provider_for_each_auto_preset(
@@ -2312,38 +2365,6 @@ def test_provider_models_payload_fetches_openai_compatible_models(
     assert payload["models"][1]["context_window"] == 65536
 
 
-def test_model_catalog_row_active_respects_openai_shutdown_date() -> None:
-    ref = date(2026, 9, 29)
-    live = {"id": "gpt-5-nano", "shutdown_date": None}
-    retired = {"id": "gpt-5-chat-latest", "shutdown_date": "2026-07-23"}
-    scheduled = {"id": "gpt-5.9-chat-latest", "shutdown_date": "2026-12-01"}
-
-    assert _model_catalog_row_active(live, on=ref)
-    assert not _model_catalog_row_active(retired, on=ref)
-    assert _model_catalog_row_active(scheduled, on=ref)
-    assert not _model_catalog_row_active(retired, on=date(2026, 7, 23))
-    assert _model_catalog_row_active(retired, on=date(2026, 7, 22))
-
-
-def test_extract_model_rows_skips_shut_down_openai_models(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "nanobot.webui.settings_models._model_catalog_row_active",
-        lambda row, *, on=None: _model_catalog_row_active(row, on=date(2026, 9, 29)),
-    )
-    body = {
-        "data": [
-            {"id": "gpt-5-nano", "shutdown_date": None},
-            {"id": "gpt-5-chat-latest", "shutdown_date": "2026-07-23"},
-            {"id": "chat-latest", "shutdown_date": None},
-        ]
-    }
-    rows = _extract_model_rows(body)
-    ids = [row["id"] for row in rows]
-    assert ids == ["gpt-5-nano", "chat-latest"]
-
-
 def test_provider_models_payload_omits_openai_models_past_shutdown_date(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2362,22 +2383,24 @@ def test_provider_models_payload_omits_openai_models_past_shutdown_date(
                 "data": [
                     {"id": "gpt-5-nano", "owned_by": "system", "shutdown_date": None},
                     {"id": "gpt-5-chat-latest", "owned_by": "system", "shutdown_date": "2026-07-23"},
+                    {"id": "ends-today", "shutdown_date": "2026-09-29"},
+                    {"id": "ends-tomorrow", "shutdown_date": "2026-09-30"},
+                    {"id": "chat-latest", "shutdown_date": None},
                 ]
             },
             request=httpx.Request("GET", url),
         )
 
     monkeypatch.setattr("nanobot.webui.settings_api.httpx.get", fake_get)
-    monkeypatch.setattr(
-        "nanobot.webui.settings_models._model_catalog_row_active",
-        lambda row, *, on=None: _model_catalog_row_active(row, on=date(2026, 9, 29)),
-    )
+    clock = Mock()
+    clock.now.return_value = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    monkeypatch.setattr("nanobot.webui.settings_models.datetime", clock)
 
     payload = provider_models_payload({"provider": ["openai"]})
 
     assert payload["status"] == "available"
-    assert payload["model_count"] == 1
-    assert payload["models"][0]["id"] == "gpt-5-nano"
+    assert payload["model_count"] == 3
+    assert [row["id"] for row in payload["models"]] == ["gpt-5-nano", "ends-tomorrow", "chat-latest"]
 
 
 def test_provider_models_payload_returns_online_openai_codex_models(
@@ -2438,8 +2461,6 @@ def test_provider_models_payload_exposes_catalog_failure_with_usable_models(
 
 
 def test_copilot_explicit_login_does_not_reuse_revoked_credentials(monkeypatch, oauth_flows):
-    from unittest.mock import Mock
-
     from nanobot.providers.github_copilot_oauth import GitHubCopilotOAuthFlow
 
     start = Mock()
@@ -2685,40 +2706,39 @@ def test_provider_models_payload_requires_gateway_key(
     assert payload["models"] == []
 
 
-def test_provider_models_payload_fetches_orcarouter_catalog(
+@pytest.mark.parametrize(("provider", "api_base", "models"), [
+    ("orcarouter", "https://api.orcarouter.ai/v1", ["orcarouter/auto", "anthropic/claude-sonnet-4.6"]),
+    ("shengsuanyun", "https://router.shengsuanyun.com/api/v1", ["deepseek/deepseek-v4-flash"]),
+])
+def test_provider_models_payload_fetches_router_catalog(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    api_base: str,
+    models: list[str],
 ) -> None:
     config_path = tmp_path / "config.json"
     config = Config()
-    config.providers.orcarouter.api_key = "sk-orca-test"
+    getattr(config.providers, provider).api_key = "router-test-key"
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
 
     def fake_get(url: str, **kwargs):
-        assert url == "https://api.orcarouter.ai/v1/models"
-        assert kwargs["headers"]["Authorization"] == "Bearer sk-orca-test"
+        assert url == f"{api_base}/models"
+        assert kwargs["headers"]["Authorization"] == "Bearer router-test-key"
         return httpx.Response(
             200,
-            json={
-                "data": [
-                    {"id": "orcarouter/auto", "owned_by": "orcarouter"},
-                    {"id": "anthropic/claude-sonnet-4.6", "owned_by": "anthropic"},
-                ]
-            },
+            json={"data": [{"id": model} for model in models]},
             request=httpx.Request("GET", url),
         )
 
     monkeypatch.setattr("nanobot.webui.settings_api.httpx.get", fake_get)
 
-    payload = provider_models_payload({"provider": ["orcarouter"]})
+    payload = provider_models_payload({"provider": [provider]})
 
     assert payload["status"] == "available"
     assert payload["catalog_kind"] == "catalog"
-    assert [model["id"] for model in payload["models"]] == [
-        "orcarouter/auto",
-        "anthropic/claude-sonnet-4.6",
-    ]
+    assert [model["id"] for model in payload["models"]] == models
 
 
 def test_model_catalog_kind_uses_provider_spec_metadata() -> None:
@@ -2956,3 +2976,6 @@ def test_preset_image_capability_persists_and_preserves_unrelated_edits(tmp_path
     assert json.loads(config_path.read_text(encoding="utf-8"))["modelPresets"]["Text"]["supportsImages"] is True
     defaulted = create_model_configuration({"name": ["Default vision"], "provider": ["openai"], "model": ["gpt-4.1"]})
     assert next(row for row in defaulted["model_presets"] if row["name"] == "Default vision")["supports_images"] is True
+    assert defaulted["image_fallback_configured"] is False
+    order = update_model_call_order({"order": [json.dumps(["Text", "Default vision"])]})
+    assert order["image_fallback_configured"] is True

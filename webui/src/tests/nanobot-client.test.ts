@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { currentLocale, setAppLanguage } from "@/i18n";
 import { NanobotClient } from "@/lib/nanobot-client";
 import type { SidebarStatePayload } from "@/lib/types";
 
@@ -70,6 +71,69 @@ afterEach(() => {
 });
 
 describe("NanobotClient", () => {
+  it.each([
+    { reasoning_effort: "high", codex_fast_mode: true },
+    { reasoning_effort: null, codex_fast_mode: false },
+    { reasoning_effort: null, codex_fast_mode: null },
+  ])("transmits the whole model option selection without dropping false or null: %j", (modelOptions) => {
+    const client = new NanobotClient({ url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    client.sendMessage("chat", "normal message", undefined, { modelOptions });
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ type: "message", model_options: modelOptions });
+    client.sendMessage("chat", "keep saved options");
+    expect(JSON.parse(socket.sent.at(-1)!)).not.toHaveProperty("model_options");
+    client.close();
+  });
+
+  it("sends the current language with each slash command on the same connection", async () => {
+    const original = currentLocale();
+    const client = new NanobotClient({ url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    try {
+      for (const locale of ["fr", "zh-CN"] as const) {
+        await setAppLanguage(locale);
+        client.sendMessage("chat", "/help");
+        expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ content: "/help", locale });
+      }
+    } finally {
+      client.close();
+      await setAppLanguage(original);
+    }
+  });
+
+  it("omits model options for Temporary Chats and shell commands", async () => {
+    const client = new NanobotClient({ url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    const created = client.newTemporaryChat();
+    socket.fakeMessage({ event: "attached", chat_id: "temporary-options", temporary: true, request_id: lastRequestId(socket) });
+    await created;
+    const modelOptions = { reasoning_effort: "high", codex_fast_mode: true };
+    client.sendMessage("temporary-options", "temporary message", undefined, { modelOptions });
+    expect(JSON.parse(socket.sent.at(-1)!)).not.toHaveProperty("model_options");
+    client.sendMessage("regular", "pwd", undefined, { modelOptions, userShell: true });
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ user_shell: true });
+    expect(JSON.parse(socket.sent.at(-1)!)).not.toHaveProperty("model_options");
+    client.close();
+  });
+
+  it("uses a stable host/path preference scope across token refresh, including custom host transports", () => {
+    const client = new NanobotClient({ url: "ws://host/ws?token=secret", reconnect: false });
+    expect(client.preferenceScope).toBe("ws://host/ws");
+    client.updateUrl("ws://host/ws?token=refreshed");
+    expect(client.preferenceScope).toBe("ws://host/ws");
+    client.updateUrl("nanobot-host://other-host/events?token=secret");
+    expect(client.preferenceScope).toBe("nanobot-host://other-host/events");
+  });
+
   const chatRequests = [
     { type: "new_chat", start: (client: NanobotClient, timeout: number) => client.newChat(timeout) },
     { type: "new_temporary_chat", start: (client: NanobotClient, timeout: number) => client.newTemporaryChat(timeout) },
@@ -297,7 +361,7 @@ describe("NanobotClient", () => {
     expect(notice).toHaveBeenCalledWith({ event, temporary: false });
     client.close();
   });
-  it("bounds regular replay tails but retains temporary events until discard", async () => {
+  it("retains a larger replay tail for temporary chats and clears it on discard", async () => {
     const client = new NanobotClient({
       url: "ws://test", reconnect: false,
       socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
@@ -313,13 +377,20 @@ describe("NanobotClient", () => {
         socket.fakeMessage({ event: "delta", chat_id: chatId, text: String(index) });
       }
     }
+    for (let index = 2_010; index < 20_010; index++) {
+      socket.fakeMessage({ event: "delta", chat_id: "temporary", text: String(index) });
+    }
     const regular = vi.fn();
-    const temporary = vi.fn();
+    const temporary: string[] = [];
     client.onTranscript("regular", regular);
-    const unsubscribe = client.onTranscript("temporary", temporary);
+    const unsubscribe = client.onTranscript("temporary", (event) => {
+      if (event.event === "delta") temporary.push(event.text);
+    });
     expect(regular).toHaveBeenCalledTimes(2_000);
     expect(regular.mock.calls[0][0].text).toBe("10");
-    expect(temporary.mock.calls.filter(([event]) => event.event === "delta")).toHaveLength(2_010);
+    expect(temporary).toHaveLength(20_000);
+    expect(temporary[0]).toBe("10");
+    expect(temporary.at(-1)).toBe("20009");
     unsubscribe();
     socket.fakeMessage({ event: "delta", chat_id: "temporary", text: "discard me" });
     client.discardTemporaryChat("temporary");
@@ -341,6 +412,8 @@ describe("NanobotClient", () => {
     socket.fakeMessage(event === "recovery_state"
       ? { event, chat_id: "chat", ...state }
       : { event, chat_id: "chat", recovery_state: state });
+    expect(client.getRunState("chat")).toMatchObject({ active: true, unsettled: false, latestTurnId: "recovery:old-recovery" });
+    client.fenceCanonicalCompletedTurns("chat", ["recovery:old-recovery"]);
     expect(client.getRunState("chat")).toMatchObject({ active: true, unsettled: false, latestTurnId: "recovery:old-recovery" });
     socket.fakeMessage({ event: "goal_status", chat_id: "chat", turn_id: "recovery:new-recovery", status: "running", started_at: 200 });
     expect(client.getRunState("chat")).toMatchObject({ active: true, unsettled: true,
@@ -389,7 +462,7 @@ describe("NanobotClient", () => {
     socket.fakeOpen();
     socket.fakeMessage({ event: "recovery_state", chat_id: "chat", status: "resuming", recovery_id: "r1", attempts: 1 });
     socket.fakeMessage({ event: "goal_status", chat_id: "chat", turn_id: "recovery:r1", status: "running", started_at: 100 });
-    client.settleFragmentRunLifecycle("chat", ["recovery:r1"]);
+    client.settleCompletedRunLifecycle("chat", ["recovery:r1"]);
     socket.fakeMessage({ event: "attached", chat_id: "chat", recovery_state: {
       status: "awaiting_user", recovery_id: "r1", reason: "loop_guard", attempts: 1,
     } });
@@ -989,6 +1062,55 @@ describe("NanobotClient", () => {
       client.reconcileCanonicalCompletion("chat-race", requestGeneration, ["turn-old"]),
     ).toBe(false);
     expect(client.getRunState("chat-race").startedAt).toBe(12_345);
+  });
+
+  it.each(["canonical", "fence"] as const)("settles an older completed turn without stopping its newer owner via %s", (source) => {
+    const client = new NanobotClient({ url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    socket.fakeMessage({ event: "goal_status", chat_id: "chat-race", turn_id: "old", status: "running", started_at: 100 });
+    const generation = client.getRunGeneration("chat-race");
+    socket.fakeMessage({ event: "goal_status", chat_id: "chat-race", turn_id: "new", status: "running", started_at: 200 });
+    const newerRun = client.getRunState("chat-race");
+    const received = vi.fn();
+    client.onChat("chat-race", received);
+
+    if (source === "canonical") {
+      expect(client.reconcileCanonicalCompletion("chat-race", generation, ["old"], {
+        observedTurnIds: ["old"], hasPendingToolCalls: false, activeTurnId: null, completionIdsProvided: true,
+      })).toBe(false);
+    } else client.fenceCanonicalCompletedTurns("chat-race", ["old"]);
+    expect(client.isRunCompleted("chat-race", "old")).toBe(true);
+    expect(client.getRunState("chat-race")).toEqual(newerRun);
+    socket.fakeMessage({ event: "turn_end", chat_id: "chat-race", turn_id: "old" });
+    expect(client.getRunState("chat-race")).toEqual(newerRun);
+    const live = { event: "delta", chat_id: "chat-race", turn_id: "new", text: "New answer" };
+    socket.fakeMessage(live);
+    expect(received).toHaveBeenCalledWith(live);
+    socket.fakeMessage({ event: "turn_end", chat_id: "chat-race", turn_id: "new" });
+    socket.fakeMessage({ event: "goal_status", chat_id: "chat-race", turn_id: "new", status: "idle" });
+    expect(client.getRunState("chat-race")).toMatchObject({ active: false, unsettled: false, startedAt: null });
+    expect(client.getUnsettledRunChatIds()).toEqual([]);
+    client.close();
+  });
+
+  it("notifies subscribers when a completion fence settles the latest run without its terminal frame", () => {
+    const client = new NanobotClient({ url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    socket.fakeMessage({ event: "goal_status", chat_id: "chat", turn_id: "done", status: "running", started_at: 100 });
+    const handler = vi.fn();
+    client.onRunStatus(handler);
+    client.fenceCanonicalCompletedTurns("chat", ["done"]);
+    expect(client.getRunState("chat")).toMatchObject({ active: false, unsettled: false, latestTurnId: "done", startedAt: null });
+    expect(handler).toHaveBeenLastCalledWith("chat", expect.objectContaining({ active: false, unsettled: false, startedAt: null }));
+    socket.fakeMessage({ event: "goal_status", chat_id: "chat", turn_id: "done", status: "running", started_at: 999 });
+    expect(client.getRunState("chat").active).toBe(false);
+    client.close();
   });
 
   it("rejects a user-only snapshot for a submitted turn that has not completed", () => {
@@ -1725,7 +1847,23 @@ describe("NanobotClient", () => {
     expect(client.hasUnsettledRun("chat-scope-control")).toBe(true);
   });
 
-  it("sends large sidebar ordering state as a correlated WebUI request", async () => {
+  it("sends an acknowledged archive command for the selected session keys", async () => {
+    const client = new NanobotClient({
+      url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    const keys = ["websocket:a", "websocket:b"];
+    const pending = client.archiveSessions(keys, true);
+    const request = JSON.parse(lastSocket().sent[0]);
+    expect(request).toEqual({ type: "webui_request", request_id: expect.any(String),
+      action: "sessions.archive", payload: { keys, archived: true } });
+    lastSocket().fakeMessage({ event: "webui_response", request_id: request.request_id, ok: true, result: { ok: true } });
+    await expect(pending).resolves.toEqual({ ok: true });
+  });
+
+  it("sends large sidebar state as a correlated request and delivers its broadcast", async () => {
     const client = new NanobotClient({
       url: "ws://test",
       reconnect: false,
@@ -1738,13 +1876,15 @@ describe("NanobotClient", () => {
     const state: SidebarStatePayload = {
       schema_version: 1,
       pinned_keys: [],
-      archived_keys: [],
       session_order: sessionOrder,
       title_overrides: {},
       project_name_overrides: {},
       tags_by_key: {},
       collapsed_groups: {},
-      workbench: { version: 1, tabs: {} },
+      workbench: { version: 1, tabs: {
+        "tab:websocket:a": { explicit: true, title: "Research", paneKeys: ["websocket:a", "websocket:b"],
+          layoutPaneKeys: ["websocket:a", "websocket:b"], splitRatios: [0.5, 0.5], layout: "columns" },
+      } },
       view: {
         density: "comfortable",
         show_archived: false,
@@ -1753,6 +1893,8 @@ describe("NanobotClient", () => {
       updated_at: null,
     };
 
+    const handler = vi.fn();
+    client.onSidebarStateUpdate(handler);
     client.connect();
     lastSocket().fakeOpen();
     const pending = client.setSidebarState(state);
@@ -1778,51 +1920,9 @@ describe("NanobotClient", () => {
       result: state,
     });
     await expect(pending).resolves.toEqual(state);
-  });
-
-  it("delivers backend sidebar state updates to every subscriber", () => {
-    const client = new NanobotClient({
-      url: "ws://test",
-      reconnect: false,
-      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
-    });
-    const handler = vi.fn();
-    const state: SidebarStatePayload = {
-      schema_version: 1,
-      pinned_keys: [],
-      archived_keys: [],
-      session_order: [],
-      title_overrides: {},
-      project_name_overrides: {},
-      tags_by_key: {},
-      collapsed_groups: {},
-      workbench: {
-        version: 1,
-        tabs: {
-          "tab:websocket:a": {
-            explicit: true,
-            title: "Research",
-            paneKeys: ["websocket:a", "websocket:b"],
-            layoutPaneKeys: ["websocket:a", "websocket:b"],
-            splitRatios: [0.5, 0.5],
-            layout: "columns",
-          },
-        },
-      },
-      view: {
-        density: "comfortable",
-        show_archived: false,
-        sort: "updated_desc",
-      },
-      updated_at: "2026-08-11T08:00:00Z",
-    };
-
-    client.onSidebarStateUpdate(handler);
-    client.connect();
-    lastSocket().fakeOpen();
-    lastSocket().fakeMessage({ event: "sidebar_state_updated", state });
-
-    expect(handler).toHaveBeenCalledWith(state);
+    const broadcast = { ...state, updated_at: "2026-08-11T08:00:00Z" };
+    lastSocket().fakeMessage({ event: "sidebar_state_updated", state: broadcast });
+    expect(handler).toHaveBeenCalledWith(broadcast);
   });
 
   it("does not correlate a new-chat scope rejection to an unrelated sent turn", async () => {
@@ -2050,9 +2150,9 @@ describe("NanobotClient", () => {
     const oldContent = { event: "message", chat_id: "chat", turn_id: "history-0", text: "Unconsumed older content" };
     socket.fakeMessage(buffered);
     socket.fakeMessage(oldContent);
-    client.settleFragmentRunLifecycle("chat", ["current"]);
+    client.settleCompletedRunLifecycle("chat", ["current"]);
     const history = Array.from({ length: 300 }, (_, index) => `history-${index}`);
-    client.settleFragmentRunLifecycle("chat", history);
+    client.settleCompletedRunLifecycle("chat", history);
 
     expect(history.filter((id) => client.isRunCompleted("chat", id))).toHaveLength(255);
     expect(client.isRunCompleted("chat", "history-0")).toBe(false);
@@ -2301,7 +2401,7 @@ describe("NanobotClient", () => {
     });
   });
 
-  it("dispatches session updates globally", () => {
+  it("distinguishes catalog changes from per-session metadata updates", () => {
     const client = new NanobotClient({
       url: "ws://test",
       reconnect: false,
@@ -2311,8 +2411,15 @@ describe("NanobotClient", () => {
     const chatHandler = vi.fn();
     client.onSessionUpdate(globalHandler);
     client.onChat("chat-title", chatHandler);
+    const changed = vi.fn();
+    const unsubscribe = client.onSessionsChanged(changed);
     client.connect();
     lastSocket().fakeOpen();
+    lastSocket().fakeMessage({ event: "sessions_changed" });
+    unsubscribe();
+    lastSocket().fakeMessage({ event: "sessions_changed" });
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(globalHandler).not.toHaveBeenCalled();
 
     lastSocket().fakeMessage({
       event: "session_updated",
@@ -2506,7 +2613,7 @@ describe("NanobotClient", () => {
       turn_id: frame.turn_id,
     });
 
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toMatchObject({ text: "Switched model preset to fast.", turn_id: frame.turn_id });
     expect(chatHandler).toHaveBeenCalledTimes(1);
     expect(chatHandler).toHaveBeenCalledWith(expect.objectContaining({
       text: "normal reply",

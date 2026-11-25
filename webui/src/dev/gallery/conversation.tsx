@@ -20,10 +20,11 @@ import { ThreadMessages } from "@/components/thread/ThreadMessages";
 import { ThreadViewport, type ThreadViewportHandle } from "@/components/thread/ThreadViewport";
 import { WorkspaceAccessMenu, WorkspaceProjectPicker } from "@/components/thread/WorkspaceControls";
 import { WebSearchRun } from "@/components/thread/activity/WebSearchRun";
+import { ThreadToastViewport } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
 import type { StreamError } from "@/lib/nanobot-client";
 import { formatToolCallTrace } from "@/lib/tool-traces";
-import type { RecoveryState, SlashCommand, ToolProgressEvent, UIContextCompaction, UIMessage, WorkspaceScopePayload, WorkspacesPayload } from "@/lib/types";
+import type { RecoveryState, SkillSummary, SlashCommand, ToolProgressEvent, UIContextCompaction, UIMessage, WorkspaceScopePayload, WorkspacesPayload } from "@/lib/types";
 import { Sample, StatePicker, type ComponentExample } from "./example";
 import { useGalleryTranslation } from "./i18n";
 
@@ -41,6 +42,11 @@ const commands: SlashCommand[] = [
   { command: "/status", title: "previews.composer.statusCommand", description: "previews.composer.statusDescription", icon: "activity", lifecycle: "side_channel", acceptsArgs: false },
   { command: "/compact", title: "previews.composer.compactCommand", description: "previews.composer.compactDescription", icon: "archive", lifecycle: "finalize_active_turn", acceptsArgs: false },
   { command: "/help", title: "previews.composer.helpCommand", description: "previews.composer.helpDescription", icon: "circle-help", lifecycle: "side_channel", acceptsArgs: false },
+];
+const gallerySkills: SkillSummary[] = [
+  { name: "frontend-design", description: "Build refined interfaces with balanced typography, motion, and responsive layout.", source: "workspace", enabled: true, available: true },
+  { name: "nanobot-document", description: "Look up nanobot configuration, architecture, and troubleshooting guides.", source: "builtin", enabled: true, available: true },
+  { name: "skill-creator", description: "Create or update reusable AgentSkills in the workspace.", source: "builtin", enabled: true, available: true },
 ];
 const projectScope: WorkspaceScopePayload = { project_path: "D:\\Projects\\nanobot", project_name: "nanobot", access_mode: "restricted" };
 const workspaceCatalog: WorkspacesPayload = {
@@ -79,6 +85,7 @@ function ComposerPreview() {
         inputAriaLabel={t("previews.composer.input")} placeholder={t("previews.composer.placeholder")}
         modelLabel={selected.name} modelDetail={selected.model} modelProvider={selected.provider} modelPreset={preset}
         modelPresets={presets} onModelPresetChange={setPreset} slashCommands={commands.map((command) => ({ ...command, title: t(command.title), description: t(command.description) }))}
+        skills={gallerySkills}
         renderContextUsage={renderContextUsage}
         workspaceScope={projectScope} workspaceControlsHidden quotedContext={quoted} onQuotedContextChange={setQuoted}
         onStop={() => { setMode("thread"); setSent({ kind: "stopped" }); }}
@@ -93,11 +100,12 @@ function ComposerPreview() {
 function GoalPreview() {
   const { t } = useGalleryTranslation();
   const [status, setStatus] = useState<"active" | "blocked">("active");
+  const [cancelled, setCancelled] = useState(false);
   return <div>
-    <StatePicker label={t("previews.goal.state")} value={status} options={["active", "blocked"]} onChange={setStatus} />
+    <StatePicker label={t("previews.goal.state")} value={status} options={["active", "blocked"]} onChange={(next) => { setStatus(next); setCancelled(false); }} />
     <div className="thread-header-container relative h-56 overflow-hidden rounded-control border bg-background">
-      <GoalIsland goal={{ active: status === "active", status, ui_summary: t("previews.goal.summary"), objective: t("previews.goal.objective"),
-        ...(status === "blocked" ? { recap: t("previews.goal.recap") } : {}) }} />
+      {!cancelled && <GoalIsland goal={{ active: status === "active", status, ui_summary: t("previews.goal.summary"), objective: t("previews.goal.objective"),
+        ...(status === "blocked" ? { recap: t("previews.goal.recap") } : {}) }} cancelDisabled={false} onCancel={async () => setCancelled(true)} />}
     </div>
   </div>;
 }
@@ -242,11 +250,11 @@ function RecoveryPreview() {
   const [action, setAction] = useState("");
   const [visible, setVisible] = useState(true);
   const state: RecoveryState = { recovery_id: `gallery-recovery-${mode}`, status: mode === "unavailable" ? "failed" : mode, can_continue: mode !== "unavailable" };
-  return <div className="space-y-4">
+  return <div className="relative space-y-4 pt-16">
     <StatePicker label={t("previews.recovery.state")} value={mode} options={["awaiting_user", "resuming", "failed", "unavailable"]}
       onChange={(value) => { setMode(value); setVisible(true); setAction(""); }} />
-    {visible ? <RecoveryNotice state={state} onContinue={() => { setVisible(false); setAction("previews.recovery.continued"); return Promise.resolve(); }}
-      onDismiss={() => { setVisible(false); setAction("previews.recovery.dismissed"); return Promise.resolve(); }} /> : null}
+    <ThreadToastViewport>{visible ? <RecoveryNotice state={state} onContinue={() => { setVisible(false); setAction("previews.recovery.continued"); return Promise.resolve(); }}
+      onDismiss={() => { setVisible(false); setAction("previews.recovery.dismissed"); return Promise.resolve(); }} /> : null}</ThreadToastViewport>
     <Button variant="outline" size="sm" onClick={() => { setVisible(true); setAction(""); }}>{t("previews.recovery.reset")}</Button>
     <p role="status" className="text-sm text-muted-foreground">{t(action || "previews.recovery.hint")}</p>
   </div>;
@@ -359,7 +367,7 @@ export const conversationExamples: ComponentExample[] = [
   { title: "previews.goal.title", files: ["thread/GoalIsland"], Preview: GoalPreview,
     description: "previews.goal.description", options: "previews.goal.options",
     code: '<GoalIsland goal={{ active: true, status: "active", ui_summary: summary, objective }} />' },
-  { title: "previews.composer.title", files: ["thread/ThreadComposer"], Preview: ComposerPreview,
+  { title: "previews.composer.title", files: ["thread/ThreadComposer", "thread/ComposerPalette"], Preview: ComposerPreview,
     description: "previews.composer.description", options: "previews.composer.options",
     code: '<ThreadComposer onSend={send} modelPresets={presets} onModelPresetChange={setPreset} slashCommands={commands} />' },
   { title: "previews.modelPreset.title", files: ["thread/ModelPresetBadge"], Preview: ModelPresetPreview,
@@ -388,7 +396,7 @@ export const conversationExamples: ComponentExample[] = [
     code: '<ThreadHistoryStatus loading={loading} error={error} onRetry={retry} />' },
   { title: "previews.recovery.title", files: ["thread/RecoveryNotice"], Preview: RecoveryPreview,
     description: "previews.recovery.description", options: "previews.recovery.options",
-    code: '<RecoveryNotice state={recoveryState} onContinue={continueTask} onDismiss={dismissRecovery} />' },
+    code: '<ThreadToastViewport><RecoveryNotice state={recoveryState} onContinue={continueTask} onDismiss={dismissRecovery} /></ThreadToastViewport>' },
   { title: "previews.fallback.title", files: ["thread/ModelFallbackNotice"], Preview: FallbackPreview,
     description: "previews.fallback.description", options: "previews.fallback.options",
     code: '<ModelFallbackNotice model="gpt-4.1" onDismiss={dismiss} onOpenSettings={openModelSettings} />' },

@@ -9,7 +9,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { StartupSkeleton } from "@/components/StartupSkeleton";
-import { MessageBubble } from "@/components/MessageBubble";
 import { ContextCompactionNotice } from "@/components/thread/ContextCompactionNotice";
 import { ThreadComposer } from "@/components/thread/ThreadComposer";
 import { resources, setAppLanguage } from "@/i18n";
@@ -21,23 +20,6 @@ import {
 
 const QUICK_ACTION_KEYS = ["plan", "analyze", "brainstorm", "code", "summarize", "more"];
 const IMAGE_QUICK_ACTION_KEYS = ["icon", "sticker", "poster", "product", "portrait", "edit"];
-const SLASH_COMMAND_KEYS = [
-  "new",
-  "compact",
-  "stop",
-  "restart",
-  "status",
-  "model",
-  "history",
-  "dream",
-  "dream_log",
-  "dream_restore",
-  "dream_prompt",
-  "goal",
-  "trigger",
-  "help",
-  "pairing",
-];
 const SETTINGS_NAV_KEYS = [
   "overview",
   "appearance",
@@ -127,7 +109,6 @@ const LOCALIZED_SETTINGS_COPY_KEYS = [
   "settings.skills.marketplaceSearchFailed",
   "settings.skills.marketplaceInstallFailed",
   "settings.skills.marketplaceSearchPlaceholder",
-  "settings.skills.marketplaceSearchLabel",
   "settings.skills.marketplaceSearching",
   "settings.skills.marketplaceProviderFilter",
   "settings.skills.marketplaceProviderAll",
@@ -212,6 +193,7 @@ const LOCALIZED_SETTINGS_COPY_KEYS = [
   "settings.help.webuiDefaultAccess",
   "settings.values.light",
   "settings.values.dark",
+  "settings.values.collapsed",
   "settings.values.expanded",
   "settings.values.enabled",
   "settings.values.disabled",
@@ -248,7 +230,7 @@ const LOCALIZED_CHANNEL_SHELL_KEYS = [
   "settings.channels.configuredInstances",
   "settings.channels.connectPreview",
   "settings.channels.copyCommand",
-  "settings.channels.filterAll",
+  "settings.channels.enabledOnly",
   "settings.channels.filterOff",
   "settings.channels.filterOn",
   "settings.channels.helperCopied",
@@ -442,13 +424,6 @@ describe("webui i18n", () => {
         expect(notice).toHaveAttribute("aria-busy", String(phase === "started"));
       }
     }
-    for (const compactReply of ["empty", "failed"] as const) {
-      rerender(<MessageBubble message={{
-        id: "reply", role: "assistant", content: "original command reply",
-        compactReply, createdAt: 1,
-      }} />);
-      expect(screen.getByText(copy[compactReply])).toBeInTheDocument();
-    }
   });
 
   it("localizes the parsed splash in document order for every registered locale", async () => {
@@ -577,9 +552,10 @@ describe("webui i18n", () => {
     });
 
     expect(screen.getByRole("listbox", { name: "斜杠命令" })).toBeInTheDocument();
-    expect(screen.getByText("压缩上下文")).toBeInTheDocument();
-    expect(screen.getByText("压缩上下文后继续对话")).toBeInTheDocument();
-    expect(screen.getByText("/compact")).toBeInTheDocument();
+    const option = screen.getByRole("option", { name: /\/compact/ });
+    expect(option).toHaveTextContent("/compact");
+    expect(option).toHaveTextContent("压缩上下文");
+    expect(option).toHaveTextContent("压缩上下文后继续对话");
   });
 
   it("keeps empty landing resources localized for every registered locale", () => {
@@ -621,20 +597,14 @@ describe("webui i18n", () => {
     }
   });
 
-  it("keeps slash commands localized for every registered locale", () => {
+  it("keeps slash menu status hints localized for every registered locale", () => {
     for (const resource of Object.values(resources)) {
       const slash = resource.common.thread.composer.slash;
       expect(slash.badges.current).toBeTruthy();
       expect(slash.badges.recent).toBeTruthy();
       expect(slash.details.goalActive).toBeTruthy();
       expect(slash.details.goalReady).toBeTruthy();
-      expect(slash.details.history).toBeTruthy();
       expect(slash.details.stopRunning).toBeTruthy();
-      for (const key of SLASH_COMMAND_KEYS) {
-        const command = slash.commands[key as keyof typeof slash.commands];
-        expect(command.title).toBeTruthy();
-        expect(command.description).toBeTruthy();
-      }
     }
   });
 
@@ -697,7 +667,7 @@ describe("webui i18n", () => {
     expect(settings.overview.webSearch).toBe("网络搜索");
     expect(settings.overview.workspace).toBe("工作目录");
     expect(settings.skills.installedTab).toBe("已安装");
-    expect(settings.skills.discoverTab).toBe("发现");
+    expect(settings.skills.discoverTab).toBe("技能市场");
     expect(settings.skills.marketplaceProviderFilter).toBe("技能来源");
     expect(settings.skills.marketplaceProviderAll).toBe("全部");
     expect(settings.skills.marketplaceSearchPlaceholder).toBe("搜索技能");

@@ -2564,6 +2564,57 @@ describe("useNanobotStream", () => {
     ]);
   });
 
+  it("ends the live waiting hint only when a request starts for that input", () => {
+    const fake = fakeClient();
+    const chat = "chat-processing";
+    const { result } = renderHook(() => useNanobotStream(chat, EMPTY_MESSAGES), { wrapper: wrap(fake.client) });
+    const peerInput = (id: string, waiting = false) => fake.emit(chat, {
+      event: "user_message", chat_id: chat, turn_id: id, input_id: `user:${id}`,
+      starts_turn: !waiting, text: "identical prompt", ...(waiting ? { waiting_for_model: true } : {}),
+    });
+    let sequence = 0;
+    const request = (id: string, phase: "started" | "completed" = "started") => fake.emit(chat, {
+      event: "model_request", chat_id: chat, turn_id: "first", request_id: id, run_id: "run",
+      sequence: ++sequence, phase, response_input_ids: [`user:${id}`],
+    });
+    const state = (id: string) => result.current.messages.find((row) => row.inputId === `user:${id}`)?.processingStatus;
+    act(() => {
+      peerInput("first");
+      peerInput("followup", true);
+      request("first");
+      request("first", "completed");
+    });
+    expect(state("first")).toBeUndefined();
+    expect(state("followup")).toBe("pending");
+    act(() => request("followup"));
+    expect(state("followup")).toBe("consumed");
+
+    act(() => {
+      request("late-echo");
+      peerInput("late-echo", true);
+    });
+    expect(state("late-echo")).toBeUndefined();
+  });
+
+  it.each(["stop", "cancelled by another tab", "disconnect"])("drops the temporary waiting hint on %s", (event) => {
+    const fake = fakeClient();
+    const chat = "chat-processing";
+    const { result } = renderHook(() => useNanobotStream(chat, EMPTY_MESSAGES), { wrapper: wrap(fake.client) });
+    let turnId = "";
+    act(() => { turnId = result.current.send("follow-up")!.turnId; });
+    act(() => fake.emit(chat, {
+      event: "message_accepted", chat_id: chat, turn_id: turnId, active_turn_id: "active", waiting_for_model: true,
+    }));
+    expect(result.current.messages[0]).toMatchObject({ processingStatus: "pending", deliveryStatus: "accepted" });
+    act(() => {
+      if (event === "stop") result.current.stop();
+      else if (event === "disconnect") fake.emitStatus("reconnecting");
+      else fake.emit(chat, { event: "turn_end", chat_id: chat, turn_id: "active", outcome: "cancelled" });
+    });
+    expect(result.current.messages[0]).toMatchObject({ content: "follow-up", deliveryStatus: "accepted" });
+    expect(result.current.messages[0].processingStatus).toBeUndefined();
+  });
+
   it("projects a user turn submitted from another attached client exactly once", () => {
     const fake = fakeClient();
     const { result } = renderHook(
@@ -3105,7 +3156,7 @@ describe("useNanobotStream", () => {
     ]);
   });
 
-  it("suppresses redundant stream confirmation after assistant media", () => {
+  it("keeps a streamed confirmation as a separate answer after assistant media", () => {
     const fake = fakeClient();
     const { result } = renderHook(() => useNanobotStream("chat-img-result", EMPTY_MESSAGES), {
       wrapper: wrap(fake.client),
@@ -3117,12 +3168,6 @@ describe("useNanobotStream", () => {
         chat_id: "chat-img-result",
         text: "image ready",
         media_urls: [{ url: "/api/media/sig/image", name: "generated.png" }],
-      });
-      fake.emit("chat-img-result", {
-        event: "message",
-        chat_id: "chat-img-result",
-        text: "message()",
-        kind: "tool_hint",
       });
       fake.emit("chat-img-result", {
         event: "delta",
@@ -3139,8 +3184,7 @@ describe("useNanobotStream", () => {
       });
     });
 
-    expect(result.current.messages).toHaveLength(1);
-    expect(result.current.messages[0].content).toBe("image ready");
+    expect(result.current.messages.map((row) => row.content)).toEqual(["image ready", "发送成功"]);
     expect(result.current.messages[0].media).toHaveLength(1);
   });
 
@@ -3346,6 +3390,43 @@ describe("useNanobotStream", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps streaming when a deferred Dream reply arrives after its command has ended", async () => {
+    const fake = fakeClient();
+    const chatId = "chat-dream";
+    const { result } = renderHook(() => useNanobotStream(chatId, EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+
+    act(() => { result.current.send("/dream", undefined, { sideChannel: true }); });
+    const dreamTurnId = fake.client.sendMessage.mock.calls.at(-1)![3]?.turnId;
+    act(() => {
+      fake.emit(chatId, { event: "message", chat_id: chatId, text: "Dreaming...",
+        turn_id: dreamTurnId, turn_seq: 1, side_channel: true });
+      fake.emit(chatId, { event: "turn_end", chat_id: chatId, turn_id: dreamTurnId, turn_seq: 2 });
+    });
+    act(() => { result.current.send("write normally"); });
+    const answerTurnId = fake.client.sendMessage.mock.calls.at(-1)![3]?.turnId;
+    act(() => {
+      fake.emit(chatId, { event: "delta", chat_id: chatId, text: "First half",
+        turn_id: answerTurnId, turn_seq: 1, stream_id: "answer-1" });
+    });
+    await flushStreamFrame();
+    const answerId = result.current.messages.find((message) => message.content === "First half")?.id;
+    expect(answerId).toBeDefined();
+
+    act(() => {
+      fake.emit(chatId, { event: "message", chat_id: chatId, text: "Dream completed.",
+        turn_id: "command-result:completion", turn_seq: 1, side_channel: true });
+      fake.emit(chatId, { event: "delta", chat_id: chatId, text: " and second half",
+        turn_id: answerTurnId, turn_seq: 2, stream_id: "answer-1" });
+    });
+    await flushStreamFrame();
+
+    expect(result.current.messages.find((message) => message.id === answerId)?.content)
+      .toBe("First half and second half");
+    expect(result.current.messages.map((message) => message.content)).toContain("Dream completed.");
   });
 
   it("keeps guided output in place while the active turn resumes", async () => {
